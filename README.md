@@ -1,6 +1,31 @@
-# `codex-collab-mcp` — Gemini 4 Argon ↔ OpenAI Codex Heterarchy MCP Bridge
+# `codex-collab-mcp` — Gemini 4 Argon ↔ Claude Sonnet/Opus 5.5 ↔ OpenAI Codex Heterarchy MCP Bridge
 
-Production MCP server enabling multi-polar **Heterarchy collaboration** between **Gemini 4 Argon (Antigravity)** and **OpenAI Codex (`codex-cli`)**, engineered under the **Heterarchy Alexandria Python Engineering Harness (`.agents/python_dev_harness`)**.
+Production MCP server enabling multi-polar **Heterarchy collaboration** between **Gemini 4 Argon (Antigravity)**, **Claude Sonnet 5.5 / Opus 5.5 Medium**, and **OpenAI Codex (`codex-cli`)**, engineered with receipt-verified routing and evidence scope tracking.
+
+> **📖 한글 상세 사용 가이드 및 에이전트 스킬**: [`skills/codex-heterarchy/SKILL.md`](./skills/codex-heterarchy/SKILL.md)
+
+---
+
+## Quick Start (설치 및 스킬·MCP 원클릭 등록)
+
+```bash
+# 1. 저장소 클론 및 가상환경 설치 (uv 필요)
+git clone https://github.com/limhaneul12/casoas.git
+cd casoas
+uv sync
+
+# 2. Antigravity & Codex 글로벌 스킬(codex-heterarchy) 및 MCP 서버 자동 등록
+uv run hcodex on
+
+# 3. 런타임, 플러그인, 스킬, 활성 PID 및 핸드오프 인박스 상태 확인
+uv run hcodex status
+```
+
+`uv run hcodex on` 실행 시 현재 클론된 경로를 기준으로 다음 항목이 자동 설정됩니다:
+- **Antigravity 글로벌 스킬**: `~/.gemini/config/skills/codex-heterarchy/SKILL.md`
+- **Codex 글로벌 스킬**: `~/.codex/skills/codex-heterarchy/SKILL.md`
+- **Antigravity MCP 플러그인**: `~/.gemini/config/plugins/heterarchy-codex/mcp_config.json`
+- **Codex MCP 설정**: `~/.codex/config.toml` (`[mcp_servers.heterarchy_codex]`)
 
 ---
 
@@ -8,22 +33,26 @@ Production MCP server enabling multi-polar **Heterarchy collaboration** between 
 
 | Node | Role | Core Strengths |
 | :--- | :--- | :--- |
-| **Gemini 4 Argon (Antigravity)** | Macro-Architect & Orchestrator | Full-repository long-context awareness, cross-file invariants, terminal test execution, Alexandria memory stewardship |
+| **Gemini 4 Argon (Antigravity)** | Macro-Architect & Orchestrator | Full-repository long-context awareness, cross-file invariants, terminal test execution, consensus adjudication |
+| **Claude Sonnet 5.5 / Opus 5.5 Medium** | Surgical Code Craftsman | Clean module implementation, deep architectural refactoring, ergonomic API/UI design (`claude_code_craft`) |
 | **OpenAI Codex (`codex-collab-mcp`)** | Adversarial Auditor & High-Speed Synthesizer | Zero-fluff pin-point code generation, red-team boundary auditing, multi-axis algorithm exploration, isolated rescue debugging |
 
 ---
 
-## Exposed MCP Tools
+## Exposed MCP Tools (15 Tools)
 
-1. **`codex_adversarial_audit`**: Red-team critique of code/diffs against Gemini 4 Argon's design rationale; returns structured `verdict` (`PASS` / `WARN` / `BLOCK`), `risk_score`, `findings`, executable `failing_test_cases`, and an `alexandria_decision_note`.
-2. **`codex_targeted_synthesize`**: High-precision, zero-fluff code and boundary unit test synthesis from a distilled signature and contract.
-3. **`codex_differential_implementations`**: Generates multiple distinct candidate implementations across orthogonal optimization axes (`latency_and_throughput`, `memory_footprint`, `maintainability_and_clarity`) with an `argon_selection_guide`.
-4. **`codex_rescue_sandbox`**: Isolated root-cause analysis and patch generation for stubborn bugs or test failures (supports `async_background=True`).
-5. **`codex_git_review`**: Native wrapper around `codex review` (`--uncommitted`, `--base`, `--commit`).
-6. **`codex_session_followup`**: Multi-turn continuation (`resume`) or branching (`fork`) of an existing Codex session (`session_id`).
-7. **`codex_job_status` / `codex_job_list`**: Status and result retrieval for asynchronous background Codex tasks (`cdx-...`).
-8. **`codex_alexandria_decision_pack`**: Packages a decision record with a full-content SHA-256 `idempotency_key`. Optional `collaboration_id` resolves a stored single triad run; only verified agreement receives a Consensus title. Calls without evidence remain neutral.
-9. **`codex_bridge_health`**: Diagnostics for local `codex` CLI binary, version, and background job store.
+1. **`heterarchy_triad_orchestrate`**: End-to-end 3-pole orchestration (`mode="pipeline"` or `"council"`) with checkpoint resume (`resume_collaboration_id`), multi-round auto-repair (`max_rounds=1..3`), and bridge-executed verification gates (`run_verification_gates=True`).
+2. **`claude_code_craft`**: Invokes Claude Sonnet 5.5 or Opus 5.5 Medium via local Antigravity RPC with strict tier policy enforcement (`CLAUDE_TIER_POLICY_VIOLATION` on non-Medium tiers).
+3. **`codex_adversarial_audit`**: Red-team critique of code/diffs against Gemini 4 Argon's design rationale; returns structured `verdict` (`PASS` / `WARN` / `BLOCK`), `risk_score`, `findings`, executable `failing_test_cases`, and an `alexandria_decision_note`.
+4. **`codex_targeted_synthesize`**: High-precision, zero-fluff code and boundary unit test synthesis from a distilled signature and contract.
+5. **`codex_differential_implementations`**: Generates multiple distinct candidate implementations across orthogonal optimization axes (`latency_and_throughput`, `memory_footprint`, `maintainability_and_clarity`) with an `argon_selection_guide`.
+6. **`codex_rescue_sandbox`**: Isolated root-cause analysis and patch generation for stubborn bugs or test failures (supports `async_background=True`).
+7. **`codex_git_review`**: Native wrapper around `codex review` (`--uncommitted`, `--base`, `--commit`).
+8. **`codex_session_followup`**: Multi-turn continuation (`resume`) or branching (`fork`) of an existing Codex session (`session_id`).
+9. **`codex_job_status` / `codex_job_list`**: Status, receipt lookup, and safe cancellation (`cancel=True`) for asynchronous background and `timed_out_unknown` Codex tasks (`cdx-...`).
+10. **`heterarchy_handoff_create` / `heterarchy_handoff_inbox` / `heterarchy_handoff_resolve`**: Shared blackboard ticket system across `argon`, `sonnet`, `opus`, and `codex`.
+11. **`codex_alexandria_decision_pack`**: Packages a decision record with a full-content SHA-256 `idempotency_key`. Optional `collaboration_id` resolves a stored single triad run; only verified agreement receives a Consensus title. Calls without evidence remain neutral.
+12. **`codex_bridge_health`**: Diagnostics for local `codex` CLI binary, Antigravity RPC routability (`routable_*`), authentication boundaries, and background job store.
 
 ---
 

@@ -196,6 +196,7 @@ class CtlRelativePath(StrEnum):
 
     PLUGIN_SRC = "plugin/heterarchy-codex"
     SKILL_SRC = "plugin/heterarchy-codex/skills/codex-heterarchy"
+    REPO_SKILL_SRC = "skills/codex-heterarchy"
     AGY_PLUGIN_ACTIVE = ".gemini/config/plugins/heterarchy-codex"
     AGY_PLUGIN_DISABLED = ".gemini/config/plugins-disabled/heterarchy-codex"
     AGY_GLOBAL_SKILL = ".gemini/config/skills/codex-heterarchy"

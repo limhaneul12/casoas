@@ -47,6 +47,7 @@ class _PluginEnvironmentManager:
         if rel_path in (
             CtlRelativePath.PLUGIN_SRC,
             CtlRelativePath.SKILL_SRC,
+            CtlRelativePath.REPO_SKILL_SRC,
             CtlRelativePath.VENV_DIR,
         ):
             return self.repo_root / str(rel_path)
@@ -103,8 +104,12 @@ class _PluginEnvironmentManager:
         """
         cfg_path = self.resolve_path(CtlRelativePath.CODEX_CONFIG_PATH)
         if not cfg_path.is_file():
-            return
-        content = cfg_path.read_text(encoding="utf-8")
+            if not enable:
+                return
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            content = ""
+        else:
+            content = cfg_path.read_text(encoding="utf-8")
         section_pattern = re.compile(
             r"(\[mcp_servers\.heterarchy_codex\]\n(?:(?!\[).*\n)*)",
             re.MULTILINE,
@@ -113,6 +118,7 @@ class _PluginEnvironmentManager:
         if not match:
             if not enable:
                 return
+            codex_bin = shutil.which("codex") or "/opt/homebrew/bin/codex"
             block = (
                 "\n[mcp_servers.heterarchy_codex]\n"
                 f'command = "{self.repo_root}/.venv/bin/python3"\n'
@@ -120,9 +126,10 @@ class _PluginEnvironmentManager:
                 "enabled = true\n"
                 "\n[mcp_servers.heterarchy_codex.env]\n"
                 f'PYTHONPATH = "{self.repo_root}/src"\n'
-                'CODEX_CLI_BIN = "/opt/homebrew/bin/codex"\n'
+                f'CODEX_CLI_BIN = "{codex_bin}"\n'
             )
-            cfg_path.write_text(content.rstrip() + "\n" + block, encoding="utf-8")
+            prefix = (content.rstrip() + "\n") if content.strip() else ""
+            cfg_path.write_text(prefix + block.lstrip("\n"), encoding="utf-8")
             return
 
         section_text = match.group(1)
@@ -142,6 +149,10 @@ class _PluginEnvironmentManager:
     def sync_skills(self) -> None:
         """Synchronize `codex-heterarchy` skills across Antigravity and Codex global roots."""
         skill_src = self.resolve_path(CtlRelativePath.SKILL_SRC)
+        if not skill_src.is_dir():
+            skill_src = self.resolve_path(CtlRelativePath.REPO_SKILL_SRC)
+        if not skill_src.is_dir():
+            return
         agy_skill = self.resolve_path(CtlRelativePath.AGY_GLOBAL_SKILL)
         agy_active = self.resolve_path(CtlRelativePath.AGY_PLUGIN_ACTIVE)
         codex_skill = self.resolve_path(CtlRelativePath.CODEX_GLOBAL_SKILL)
@@ -189,7 +200,43 @@ class _PluginEnvironmentManager:
             agy_active.parent.mkdir(parents=True, exist_ok=True)
             if agy_active.exists():
                 shutil.rmtree(agy_active)
-            shutil.copytree(plugin_src, agy_active)
+            if plugin_src.is_dir():
+                shutil.copytree(plugin_src, agy_active)
+            else:
+                agy_active.mkdir(parents=True, exist_ok=True)
+                repo_skill = self.resolve_path(CtlRelativePath.REPO_SKILL_SRC)
+                if repo_skill.is_dir():
+                    shutil.copytree(repo_skill, agy_active / "skills" / "codex-heterarchy")
+            codex_bin = shutil.which("codex") or "/opt/homebrew/bin/codex"
+            mcp_cfg_text = (
+                "{\n"
+                '  "mcpServers": {\n'
+                '    "heterarchy-codex": {\n'
+                f'      "command": "{self.repo_root}/.venv/bin/python3",\n'
+                '      "args": [\n'
+                '        "-m",\n'
+                '        "codex_collab_mcp.server"\n'
+                "      ],\n"
+                '      "env": {\n'
+                f'        "PYTHONPATH": "{self.repo_root}/src",\n'
+                f'        "CODEX_CLI_BIN": "{codex_bin}"\n'
+                "      }\n"
+                "    }\n"
+                "  }\n"
+                "}\n"
+            )
+            (agy_active / "mcp_config.json").write_text(mcp_cfg_text, encoding="utf-8")
+            plugin_manifest = agy_active / "plugin.json"
+            if not plugin_manifest.is_file():
+                plugin_manifest.write_text(
+                    "{\n"
+                    '  "name": "heterarchy-codex",\n'
+                    '  "displayName": "Heterarchy Tri-Polar Bridge (Argon <-> Claude <-> Codex)",\n'
+                    '  "version": "0.2.0",\n'
+                    '  "description": "Receipt-verified Tri-Polar Heterarchy collaboration bridge."\n'
+                    "}\n",
+                    encoding="utf-8",
+                )
             if agy_disabled.exists():
                 shutil.rmtree(agy_disabled)
             self.sync_skills()
