@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -152,10 +153,10 @@ class CodegraphContextSlicer:
         if not db_path.is_file():
             return []
 
-        slices: list[CodegraphSymbolSlice] = []
         seen_ids: set[str] = set()
         remaining_bytes = max(0, max_bytes)
         per_symbol_cap = max(8_000, max_bytes // max(1, len(symbols)))
+        raw_nodes: list[tuple[str, str, str, str, int, int, list[str], list[str]]] = []
         try:
             with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
                 for raw_sym in symbols:
@@ -174,36 +175,74 @@ class CodegraphContextSlicer:
                         if node_id in seen_ids:
                             continue
                         seen_ids.add(node_id)
-                        kind = str(row[1])
-                        name = str(row[2])
-                        qualified_name = str(row[3])
-                        file_path = str(row[4])
-                        start_line = int(row[5])
-                        end_line = int(row[6])
                         callers, callees = self._query_neighbors(conn, node_id)
-                        excerpt = self._read_excerpt(
-                            ws_path,
-                            file_path,
-                            start_line,
-                            end_line,
-                            min(remaining_bytes, per_symbol_cap),
-                        )
-                        remaining_bytes = max(0, remaining_bytes - len(excerpt.encode("utf-8")))
-                        slices.append(
-                            CodegraphSymbolSlice(
-                                name=name,
-                                qualified_name=qualified_name,
-                                kind=kind,
-                                file_path=file_path,
-                                start_line=start_line,
-                                end_line=end_line,
-                                callers=callers,
-                                callees=callees,
-                                source_excerpt=excerpt,
+                        raw_nodes.append(
+                            (
+                                str(row[1]),
+                                str(row[2]),
+                                str(row[3]),
+                                str(row[4]),
+                                int(row[5]),
+                                int(row[6]),
+                                callers,
+                                callees,
                             )
                         )
         except sqlite3.Error:
             return []
+
+        if not raw_nodes:
+            return []
+
+        def _load_node_excerpt(
+            item: tuple[str, str, str, str, int, int, list[str], list[str]],
+        ) -> str:
+            """Read a single node's source excerpt bounded by `per_symbol_cap`.
+
+            Args:
+                item: Tuple of node metadata and caller/callee lists.
+
+            Returns:
+                Extracted UTF-8 source excerpt string.
+            """
+            return self._read_excerpt(ws_path, item[3], item[4], item[5], per_symbol_cap)
+
+        if len(raw_nodes) == 1:
+            excerpts = [_load_node_excerpt(raw_nodes[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=min(8, len(raw_nodes))) as pool:
+                excerpts = list(pool.map(_load_node_excerpt, raw_nodes))
+
+        slices: list[CodegraphSymbolSlice] = []
+        for (
+            kind,
+            name,
+            qualified_name,
+            file_path,
+            start_line,
+            end_line,
+            callers,
+            callees,
+        ), raw_ex in zip(raw_nodes, excerpts, strict=True):
+            encoded = raw_ex.encode("utf-8")
+            if len(encoded) > remaining_bytes:
+                excerpt = encoded[:remaining_bytes].decode("utf-8", errors="ignore")
+            else:
+                excerpt = raw_ex
+            remaining_bytes = max(0, remaining_bytes - len(excerpt.encode("utf-8")))
+            slices.append(
+                CodegraphSymbolSlice(
+                    name=name,
+                    qualified_name=qualified_name,
+                    kind=kind,
+                    file_path=file_path,
+                    start_line=start_line,
+                    end_line=end_line,
+                    callers=callers,
+                    callees=callees,
+                    source_excerpt=excerpt,
+                )
+            )
         return slices
 
     def format_context_block(

@@ -150,18 +150,26 @@ class BridgeVerificationGateRunner:
                 and role_snap.get("review_artifact_present") is True
                 and isinstance(verdict, str)
             ):
+                restored_struct: JsonObject = {
+                    "verdict": verdict,
+                    "summary": (
+                        f"Resumed verified {role} artifact "
+                        f"({role_snap.get('review_artifact_digest')}) from {cid}."
+                    ),
+                }
+                role_jid = role_snap.get("job_id") or role_snap.get("request_id")
+                if isinstance(role_jid, str) and role_jid.strip():
+                    role_rec = job_store.get_job(role_jid.strip())
+                    if role_rec is not None and isinstance(role_rec.result, dict):
+                        orig_struct = role_rec.result.get("structured_output")
+                        if isinstance(orig_struct, dict):
+                            restored_struct = dict(orig_struct)
                 resumed[role] = {
                     "ok": True,
                     "status": str(JobStatusKind.SUCCEEDED),
                     "outcome_state": str(OutcomeStateKind.CONFIRMED_SUCCESS),
                     "resumed_from_collaboration_id": cid,
-                    "structured_output": {
-                        "verdict": verdict,
-                        "summary": (
-                            f"Resumed verified {role} artifact "
-                            f"({role_snap.get('review_artifact_digest')}) from {cid}."
-                        ),
-                    },
+                    "structured_output": restored_struct,
                 }
         return resumed
 

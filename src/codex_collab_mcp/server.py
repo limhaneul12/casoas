@@ -708,7 +708,9 @@ async def codex_bridge_health() -> str:
 
 
 def main() -> None:
-    """Entry point for running the FastMCP stdio server."""
+    """Entry point for running the FastMCP stdio server and initializing SQLite stores."""
+    job_store.ensure_db_initialized()
+    handoff_store.ensure_db_initialized()
     mcp.run(transport="stdio")
 
 

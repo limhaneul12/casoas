@@ -1,9 +1,10 @@
-"""Shared disk-backed blackboard store for bidirectional Argon <-> Codex task handoffs."""
+"""SQLite-backed (WAL) shared blackboard store for Argon <-> Claude <-> Codex handoffs."""
 
 from __future__ import annotations
 
+import contextlib
 import json
-import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -17,6 +18,27 @@ from codex_collab_mcp.collab_enums import (
     TriadRole,
 )
 from codex_collab_mcp.domain.contract_dicts import HandoffTicketDict
+
+_HANDOFFS_SCHEMA_SQL = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA busy_timeout=5000;
+CREATE TABLE IF NOT EXISTS handoffs (
+    ticket_id TEXT PRIMARY KEY,
+    sender TEXT NOT NULL,
+    recipient TEXT NOT NULL,
+    status TEXT NOT NULL,
+    priority TEXT NOT NULL,
+    workspace_dir TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    ticket_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_handoffs_recipient_status
+    ON handoffs(recipient, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_handoffs_updated_at
+    ON handoffs(updated_at DESC);
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +94,7 @@ class HandoffTicket:
 
 
 class _HandoffStorageBase:
-    """Low-level atomic disk storage helpers for HandoffTicket files."""
+    """Low-level SQLite (WAL) storage helpers for HandoffTicket records."""
 
     def __init__(
         self,
@@ -82,61 +104,76 @@ class _HandoffStorageBase:
         """Initialize the handoff storage base without eagerly creating directories.
 
         Args:
-            state_dir: Optional directory path for persisted handoff ticket JSON files.
+            state_dir: Optional directory path for the SQLite `handoffs.db` file.
             lock: Optional shared reentrant lock from a subclass.
         """
         self.state_dir: Path = state_dir or (
             Path.home() / ".cache" / "codex-collab-mcp" / "handoffs"
         )
+        self.db_path: Path = self.state_dir / "handoffs.db"
         self._lock: threading.RLock = lock if lock is not None else threading.RLock()
+        self._schema_ready: bool = False
 
-    def _ensure_state_dir(self) -> Path:
-        """Lazily create and return the backing directory for handoff tickets.
-
-        Returns:
-            Ensured filesystem Path for ticket storage.
-        """
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        return self.state_dir
-
-    def _ticket_path(self, ticket_id: str) -> Path:
-        """Build the canonical JSON file path for a handoff ticket ID.
-
-        Args:
-            ticket_id: Unique handoff ticket identifier.
+    def ensure_db_initialized(self) -> Path:
+        """Lazily create the backing directory and initialize the SQLite WAL schema.
 
         Returns:
-            Filesystem Path to the ticket's JSON file.
+            Ensured filesystem Path to the initialized `handoffs.db` SQLite database.
         """
-        return self._ensure_state_dir() / f"{ticket_id}.json"
+        with self._lock:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            if not self._schema_ready or not self.db_path.is_file():
+                with contextlib.closing(sqlite3.connect(self.db_path, timeout=10.0)) as conn:
+                    conn.executescript(_HANDOFFS_SCHEMA_SQL)
+                self._schema_ready = True
+            return self.db_path
 
     def _persist(self, ticket: HandoffTicket) -> None:
-        """Atomically write a handoff ticket to disk via temporary file replacement.
+        """Atomically upsert a handoff ticket into the SQLite WAL database.
 
         Args:
             ticket: HandoffTicket instance to serialize and persist.
         """
         with self._lock:
-            state_dir = self._ensure_state_dir()
-            target_path = state_dir / f"{ticket.ticket_id}.json"
-            tmp_path = state_dir / f".{ticket.ticket_id}.{uuid.uuid4().hex[:6]}.tmp"
-            tmp_path.write_text(
-                json.dumps(ticket.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            os.replace(tmp_path, target_path)
+            db_path = self.ensure_db_initialized()
+            ticket_json = json.dumps(ticket.to_dict(), ensure_ascii=False)
+            try:
+                with (
+                    contextlib.closing(sqlite3.connect(db_path, timeout=10.0)) as conn,
+                    conn,
+                ):
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    conn.execute(
+                        "INSERT OR REPLACE INTO handoffs ("
+                        "ticket_id, sender, recipient, status, priority, "
+                        "workspace_dir, created_at, updated_at, ticket_json"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            ticket.ticket_id,
+                            ticket.sender,
+                            ticket.recipient,
+                            ticket.status,
+                            ticket.priority,
+                            ticket.workspace_dir,
+                            ticket.created_at,
+                            ticket.updated_at,
+                            ticket_json,
+                        ),
+                    )
+            except sqlite3.Error as exc:
+                raise OSError(f"SQLite handoff persistence failed: {exc}") from exc
 
-    def _read_ticket_file(self, path: Path) -> HandoffTicket | None:
-        """Deserialize a handoff ticket from a JSON file on disk.
+    def _deserialize_ticket(self, raw_json: str) -> HandoffTicket | None:
+        """Deserialize a HandoffTicket from a stored JSON string.
 
         Args:
-            path: Filesystem path to the persisted ticket JSON file.
+            raw_json: Serialized JSON string from the `ticket_json` column.
 
         Returns:
-            Reconstructed HandoffTicket if valid and readable, otherwise None.
+            Reconstructed HandoffTicket if valid, otherwise None.
         """
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(raw_json)
             if not isinstance(raw, dict):
                 return None
             raw_res = raw.get("resolution_note")
@@ -155,7 +192,7 @@ class _HandoffStorageBase:
                 resolution_note=raw_res if isinstance(raw_res, str) else None,
                 alexandria_ref=raw_alex if isinstance(raw_alex, str) else None,
             )
-        except OSError, json.JSONDecodeError, KeyError, TypeError, ValueError:
+        except json.JSONDecodeError, KeyError, TypeError, ValueError:
             return None
 
     @staticmethod
@@ -177,13 +214,13 @@ class _HandoffStorageBase:
 
 
 class HandoffStore(_HandoffStorageBase):
-    """Thread-safe atomic disk-backed blackboard for Argon, Sonnet/Opus, and Codex handoffs."""
+    """Thread-safe SQLite-backed blackboard for Argon, Sonnet/Opus, and Codex handoffs."""
 
     def __init__(self, state_dir: Path | None = None) -> None:
         """Initialize the handoff store with an explicit reentrant lock.
 
         Args:
-            state_dir: Optional directory path for persisted handoff ticket JSON files.
+            state_dir: Optional directory path for the SQLite `handoffs.db` file.
         """
         super().__init__(state_dir=state_dir, lock=threading.RLock())
 
@@ -229,19 +266,27 @@ class HandoffStore(_HandoffStorageBase):
             return ticket
 
     def get_ticket(self, ticket_id: str) -> HandoffTicket | None:
-        """Load a handoff ticket by its identifier from disk.
+        """Load a handoff ticket by its identifier from SQLite.
 
         Args:
             ticket_id: Unique handoff ticket identifier.
 
         Returns:
-            Matching HandoffTicket if found on disk, otherwise None.
+            Matching HandoffTicket if found in SQLite, otherwise None.
         """
         with self._lock:
-            path = self._ticket_path(ticket_id)
-            if not path.is_file():
+            db_path = self.ensure_db_initialized()
+            try:
+                with contextlib.closing(sqlite3.connect(db_path, timeout=10.0)) as conn:
+                    row = conn.execute(
+                        "SELECT ticket_json FROM handoffs WHERE ticket_id = ?",
+                        (ticket_id,),
+                    ).fetchone()
+            except sqlite3.Error:
                 return None
-            return self._read_ticket_file(path)
+            if row is None or not isinstance(row[0], str):
+                return None
+            return self._deserialize_ticket(row[0])
 
     def update_ticket_status(
         self,
@@ -304,24 +349,34 @@ class HandoffStore(_HandoffStorageBase):
             if workspace_dir and workspace_dir.strip()
             else None
         )
+        bounded_limit = max(1, limit)
 
         with self._lock:
-            state_dir = self._ensure_state_dir()
+            db_path = self.ensure_db_initialized()
+            query_sql = (
+                "SELECT ticket_json FROM handoffs "
+                "WHERE (? IS NULL OR recipient = ?) AND (? IS NULL OR status = ?) "
+                "ORDER BY updated_at DESC"
+            )
+            query_params = (recipient_filter, recipient_filter, status_filter, status_filter)
             tickets: list[HandoffTicket] = []
-            for path in state_dir.glob("hnd-*.json"):
-                ticket = self._read_ticket_file(path)
-                if ticket is None:
-                    continue
-                if recipient_filter and ticket.recipient != recipient_filter:
-                    continue
-                if status_filter and ticket.status != status_filter:
-                    continue
-                if ws_filter and not self._matches_workspace(ticket.workspace_dir, ws_filter):
-                    continue
-                tickets.append(ticket)
-
-            tickets.sort(key=lambda t: t.updated_at, reverse=True)
-            return [t.to_dict() for t in tickets[:limit]]
+            try:
+                with contextlib.closing(sqlite3.connect(db_path, timeout=10.0)) as conn:
+                    rows = conn.execute(query_sql, query_params).fetchall()
+                for row in rows:
+                    if not isinstance(row[0], str):
+                        continue
+                    ticket = self._deserialize_ticket(row[0])
+                    if ticket is None:
+                        continue
+                    if ws_filter and not self._matches_workspace(ticket.workspace_dir, ws_filter):
+                        continue
+                    tickets.append(ticket)
+                    if len(tickets) >= bounded_limit:
+                        break
+            except sqlite3.Error:
+                return []
+            return [t.to_dict() for t in tickets[:bounded_limit]]
 
     def count_pending_by_recipient(
         self,
@@ -332,7 +387,7 @@ class HandoffStore(_HandoffStorageBase):
             TriadRole.CODEX,
         ),
     ) -> dict[str, int]:
-        """Count pending tickets per recipient in a single directory scan.
+        """Count pending tickets per recipient via an indexed SQLite GROUP BY query.
 
         Args:
             recipients: Tuple of recipient role names to tally.
@@ -345,11 +400,18 @@ class HandoffStore(_HandoffStorageBase):
         if not counts:
             return counts
         with self._lock:
-            state_dir = self._ensure_state_dir()
-            for path in state_dir.glob("hnd-*.json"):
-                ticket = self._read_ticket_file(path)
-                if ticket is None or ticket.status != HandoffStatusKind.PENDING:
-                    continue
-                if ticket.recipient in counts:
-                    counts[ticket.recipient] += 1
+            db_path = self.ensure_db_initialized()
+            try:
+                with contextlib.closing(sqlite3.connect(db_path, timeout=10.0)) as conn:
+                    rows = conn.execute(
+                        "SELECT recipient, COUNT(*) FROM handoffs "
+                        "WHERE status = ? GROUP BY recipient",
+                        (str(HandoffStatusKind.PENDING),),
+                    ).fetchall()
+                for row in rows:
+                    rec_name = str(row[0])
+                    if rec_name in counts and isinstance(row[1], int):
+                        counts[rec_name] = row[1]
+            except sqlite3.Error:
+                return counts
         return counts

@@ -1,9 +1,10 @@
-"""Background task, durable request receipt, and idempotency tracker for Heterarchy jobs."""
+"""SQLite-backed (WAL) background task, durable receipt, and idempotency tracker."""
 
 from __future__ import annotations
 
+import contextlib
 import json
-import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -14,6 +15,18 @@ from pathlib import Path
 from codex_collab_mcp.collab_enums import JobStatusKind, OutcomeStateKind
 from codex_collab_mcp.domain.contract_dicts import CodexJobRecordDict
 from codex_collab_mcp.schemas import JsonObject, JsonValue
+
+_JOBS_SCHEMA_SQL = (
+    "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;"
+    "CREATE TABLE IF NOT EXISTS jobs ("
+    "job_id TEXT PRIMARY KEY, task_type TEXT NOT NULL, status TEXT NOT NULL, "
+    "outcome_state TEXT NOT NULL, idempotency_key TEXT, workspace_dir TEXT NOT NULL, "
+    "created_at REAL NOT NULL, updated_at REAL NOT NULL, record_json TEXT NOT NULL);"
+    "CREATE INDEX IF NOT EXISTS idx_jobs_idempotency_key "
+    "ON jobs(idempotency_key) WHERE idempotency_key IS NOT NULL;"
+    "CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);"
+    "CREATE INDEX IF NOT EXISTS idx_jobs_workspace_created ON jobs(workspace_dir, created_at DESC);"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,7 +86,7 @@ class CodexJobRecord:
 
 
 class _JobStorageEngine:
-    """Low-level LRU cache and atomic disk persistence engine for CodexJobRecord items."""
+    """Low-level LRU cache and SQLite (WAL) persistence engine for CodexJobRecord items."""
 
     def __init__(
         self,
@@ -84,151 +97,130 @@ class _JobStorageEngine:
         """Initialize the storage engine without eagerly creating directories on disk.
 
         Args:
-            state_dir: Optional directory path for persisted job JSON files.
+            state_dir: Optional directory path for the SQLite database file.
             max_cached_jobs: Maximum number of records retained in the in-memory LRU cache.
             lock: Optional shared reentrant lock from a subclass.
         """
         self.state_dir: Path = state_dir or (Path.home() / ".cache" / "codex-collab-mcp" / "jobs")
+        self.db_path: Path = self.state_dir / "jobs.db"
         self.max_cached_jobs: int = max(1, max_cached_jobs)
         self._lock: threading.RLock = lock if lock is not None else threading.RLock()
         self._jobs: OrderedDict[str, CodexJobRecord] = OrderedDict()
-        self._idempotency_index: dict[str, str] = {}
-        self._index_loaded: bool = False
+        self._schema_ready: bool = False
 
-    def _ensure_state_dir(self) -> Path:
-        """Lazily create and return the backing directory for job persistence.
+    def ensure_db_initialized(self) -> Path:
+        """Lazily create the backing directory and initialize the SQLite WAL schema.
 
         Returns:
-            Ensured filesystem Path for job record storage.
+            Ensured filesystem Path to the initialized `jobs.db` SQLite database.
         """
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        return self.state_dir
-
-    def _ensure_index_loaded(self) -> None:
-        """Lazily load the persisted `.idempotency_index.json` map from disk into memory."""
-        if self._index_loaded:
-            return
-        self._index_loaded = True
-        idx_path = self.state_dir / ".idempotency_index.json"
-        if not idx_path.is_file():
-            return
-        try:
-            raw = json.loads(idx_path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                for k, v in raw.items():
-                    if (
-                        isinstance(k, str)
-                        and isinstance(v, str)
-                        and k not in self._idempotency_index
-                    ):
-                        self._idempotency_index[k] = v
-        except OSError, json.JSONDecodeError, TypeError, ValueError:
-            return
+        with self._lock:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            if not self._schema_ready or not self.db_path.is_file():
+                with contextlib.closing(sqlite3.connect(self.db_path, timeout=10.0)) as conn:
+                    conn.executescript(_JOBS_SCHEMA_SQL)
+                self._schema_ready = True
+            return self.db_path
 
     def _cache_put(self, record: CodexJobRecord) -> None:
         """Insert or refresh a job record in the bounded in-memory LRU cache.
 
         Args:
-            record: Job record to cache and index by idempotency key.
+            record: Job record to cache.
         """
         self._jobs[record.job_id] = record
         self._jobs.move_to_end(record.job_id)
-        if record.idempotency_key and record.idempotency_key.strip():
-            self._idempotency_index[record.idempotency_key.strip()] = record.job_id
         while len(self._jobs) > self.max_cached_jobs:
             self._jobs.popitem(last=False)
 
     def _persist(self, record: CodexJobRecord) -> None:
-        """Atomically write a job record and its idempotency index entry to disk.
+        """Atomically upsert a job record into the SQLite WAL database.
 
         Args:
             record: Job record to serialize and persist.
         """
         with self._lock:
-            state_dir = self._ensure_state_dir()
-            self._ensure_index_loaded()
-            uid = uuid.uuid4().hex[:6]
-            tmp_path = state_dir / f".{record.job_id}.{uid}.tmp"
-            tmp_path.write_text(
-                json.dumps(record.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            os.replace(tmp_path, state_dir / f"{record.job_id}.json")
-            if record.idempotency_key and (ikey := record.idempotency_key.strip()):
-                self._idempotency_index[ikey] = record.job_id
-                idx_tmp = state_dir / f".idempotency_index.{uid}.tmp"
-                idx_tmp.write_text(
-                    json.dumps(self._idempotency_index, ensure_ascii=False, sort_keys=True),
-                    encoding="utf-8",
-                )
-                os.replace(idx_tmp, state_dir / ".idempotency_index.json")
+            db_path = self.ensure_db_initialized()
+            r, ik = record, (record.idempotency_key or "").strip() or None
+            rj = json.dumps(r.to_dict(), ensure_ascii=False)
+            ua = r.completed_at or r.cancelled_at or time.time()
+            p1 = (r.job_id, r.task_type, r.status, r.outcome_state, ik)
+            p2 = (r.workspace_dir, r.created_at, ua, rj)
+            try:
+                with contextlib.closing(sqlite3.connect(db_path, timeout=10.0)) as conn, conn:
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    conn.execute("INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?,?,?)", p1 + p2)
+            except sqlite3.Error as exc:
+                raise OSError(f"SQLite job persistence failed: {exc}") from exc
 
-    def _load_from_disk(self, path: Path) -> CodexJobRecord | None:
-        """Deserialize a job record from a JSON file on disk.
+    def _deserialize_record(self, raw_json: str) -> CodexJobRecord | None:
+        """Deserialize a CodexJobRecord from a stored JSON string.
 
         Args:
-            path: Filesystem path to the persisted JSON file.
+            raw_json: Serialized JSON string from the `record_json` column.
 
         Returns:
-            Reconstructed CodexJobRecord if valid and readable, otherwise None.
+            Reconstructed CodexJobRecord if valid, otherwise None.
         """
-        if not path.exists():
-            return None
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(raw_json)
             if not isinstance(raw, dict):
                 return None
-            metadata: dict[str, str] = (
-                {k: v for k, v in m.items() if isinstance(k, str) and isinstance(v, str)}
-                if isinstance(m := raw.get("metadata"), dict)
-                else {}
+            m = raw.get("metadata")
+            md = m if isinstance(m, dict) else {}
+            meta = {k: v for k, v in md.items() if isinstance(k, str) and isinstance(v, str)}
+            c0, x0, o0 = raw.get("completed_at"), raw.get("cancelled_at"), raw.get("outcome_state")
+            ca = float(c0) if isinstance(c0, (int, float)) else None
+            xa = float(x0) if isinstance(x0, (int, float)) else None
+            ost = o0 if isinstance(o0, str) else OutcomeStateKind.IN_FLIGHT
+            m0, s0, e0 = raw.get("model"), raw.get("session_id"), raw.get("error")
+            k0, p0, g0 = raw.get("idempotency_key"), raw.get("provider"), raw.get("engine")
+            a0, r0 = raw.get("attempt_count"), raw.get("receipt")
+            mod = m0 if isinstance(m0, str) else None
+            sid = s0 if isinstance(s0, str) else None
+            err, ik = (e0 if isinstance(e0, str) else None), (k0 if isinstance(k0, str) else None)
+            prv, eng = (p0 if isinstance(p0, str) else None), (g0 if isinstance(g0, str) else None)
+            att, rcp = (a0 if isinstance(a0, int) else 1), (r0 if isinstance(r0, dict) else None)
+            j, t, s = str(raw["job_id"]), str(raw["task_type"]), str(raw["status"])
+            b = CodexJobRecord(j, t, s, float(raw["created_at"]), str(raw["workspace_dir"]), mod)
+            b = replace(b, session_id=sid, completed_at=ca, result=raw.get("result"), error=err)
+            b = replace(b, metadata=meta, outcome_state=ost, idempotency_key=ik, provider=prv)
+            cr = bool(raw.get("cancel_requested"))
+            return replace(
+                b, engine=eng, attempt_count=att, cancel_requested=cr, cancelled_at=xa, receipt=rcp
             )
-            comp, canc = raw.get("completed_at"), raw.get("cancelled_at")
-            return CodexJobRecord(
-                job_id=str(raw["job_id"]),
-                task_type=str(raw["task_type"]),
-                status=str(raw["status"]),
-                created_at=float(raw["created_at"]),
-                workspace_dir=str(raw["workspace_dir"]),
-                model=v if isinstance(v := raw.get("model"), str) else None,
-                session_id=v if isinstance(v := raw.get("session_id"), str) else None,
-                completed_at=float(comp) if isinstance(comp, (int, float)) else None,
-                result=raw.get("result"),
-                error=v if isinstance(v := raw.get("error"), str) else None,
-                metadata=metadata,
-                outcome_state=(
-                    v
-                    if isinstance(v := raw.get("outcome_state"), str)
-                    else OutcomeStateKind.IN_FLIGHT
-                ),
-                idempotency_key=v if isinstance(v := raw.get("idempotency_key"), str) else None,
-                provider=v if isinstance(v := raw.get("provider"), str) else None,
-                engine=v if isinstance(v := raw.get("engine"), str) else None,
-                attempt_count=v if isinstance(v := raw.get("attempt_count"), int) else 1,
-                cancel_requested=bool(raw.get("cancel_requested")),
-                cancelled_at=float(canc) if isinstance(canc, (int, float)) else None,
-                receipt=v if isinstance(v := raw.get("receipt"), dict) else None,
-            )
-        except OSError, json.JSONDecodeError, KeyError, TypeError, ValueError:
+        except json.JSONDecodeError, KeyError, TypeError, ValueError:
             return None
 
     def get_persisted_job(self, job_id: str) -> CodexJobRecord | None:
-        """Read a job record directly from disk without consulting or mutating the cache.
+        """Read a job record directly from SQLite without consulting or mutating the cache.
 
         Args:
-            job_id: Unique job identifier to load from disk.
+            job_id: Unique job identifier to load from SQLite.
 
         Returns:
-            Persisted CodexJobRecord if present on disk, otherwise None.
+            Persisted CodexJobRecord if present in SQLite, otherwise None.
         """
         with self._lock:
-            return self._load_from_disk(self._ensure_state_dir() / f"{job_id}.json")
+            db_path = self.ensure_db_initialized()
+            try:
+                with contextlib.closing(sqlite3.connect(db_path, timeout=10.0)) as conn:
+                    row = conn.execute(
+                        "SELECT record_json FROM jobs WHERE job_id = ?",
+                        (job_id,),
+                    ).fetchone()
+            except sqlite3.Error:
+                return None
+            if row is None or not isinstance(row[0], str):
+                return None
+            return self._deserialize_record(row[0])
 
 
 class _JobQueryStore(_JobStorageEngine):
-    """Read and lookup operations across cached and persisted job records."""
+    """Read and lookup operations across cached and SQLite-persisted job records."""
 
     def _save_job(self, record: CodexJobRecord) -> CodexJobRecord:
-        """Persist a job record to disk and update the in-memory LRU cache.
+        """Persist a job record to SQLite and update the in-memory LRU cache.
 
         Args:
             record: Job record to persist and cache.
@@ -241,7 +233,7 @@ class _JobQueryStore(_JobStorageEngine):
         return record
 
     def get_job(self, job_id: str) -> CodexJobRecord | None:
-        """Retrieve a job record by ID from the LRU cache or disk fallback.
+        """Retrieve a job record by ID from the LRU cache or SQLite fallback.
 
         Args:
             job_id: Unique job identifier.
@@ -253,14 +245,12 @@ class _JobQueryStore(_JobStorageEngine):
             if (cached := self._jobs.get(job_id)) is not None:
                 self._jobs.move_to_end(job_id)
                 return cached
-            if (
-                record := self._load_from_disk(self._ensure_state_dir() / f"{job_id}.json")
-            ) is not None:
+            if (record := self.get_persisted_job(job_id)) is not None:
                 self._cache_put(record)
             return record
 
     def find_by_idempotency_key(self, idempotency_key: str) -> CodexJobRecord | None:
-        """Find an existing job record by its idempotency_key across memory and disk.
+        """Find an existing job record by its idempotency_key via indexed SQLite lookup.
 
         Args:
             idempotency_key: Caller-supplied idempotency key string.
@@ -271,18 +261,25 @@ class _JobQueryStore(_JobStorageEngine):
         if not (key := idempotency_key.strip()):
             return None
         with self._lock:
-            self._ensure_index_loaded()
-            if (mapped_id := self._idempotency_index.get(key)) is not None:
-                if (rec := self.get_job(mapped_id)) is not None and rec.idempotency_key == key:
-                    return rec
-            paths = (
-                p for p in self._ensure_state_dir().glob("*.json") if not p.name.startswith(".")
-            )
-            for path in sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True):
-                if path.stem not in self._jobs and (rec := self.get_job(path.stem)) is not None:
-                    if rec.idempotency_key == key:
-                        self._idempotency_index[key] = rec.job_id
-                        return rec
+            db_path = self.ensure_db_initialized()
+            try:
+                with contextlib.closing(sqlite3.connect(db_path, timeout=10.0)) as conn:
+                    row = conn.execute(
+                        "SELECT job_id, record_json FROM jobs "
+                        "WHERE idempotency_key = ? ORDER BY created_at DESC LIMIT 1",
+                        (key,),
+                    ).fetchone()
+            except sqlite3.Error:
+                return None
+            if row is None:
+                return None
+            job_id = str(row[0])
+            if (cached := self._jobs.get(job_id)) is not None and cached.idempotency_key == key:
+                self._jobs.move_to_end(job_id)
+                return cached
+            if isinstance(row[1], str) and (rec := self._deserialize_record(row[1])) is not None:
+                self._cache_put(rec)
+                return rec
             return None
 
     def list_jobs(
@@ -298,18 +295,27 @@ class _JobQueryStore(_JobStorageEngine):
             List of serialized CodexJobRecordDict items.
         """
         ws = str(Path(w).expanduser().resolve()) if (w := (workspace_dir or "").strip()) else None
+        bounded_limit = max(1, limit)
         with self._lock:
+            db_path = self.ensure_db_initialized()
             seen: dict[str, CodexJobRecord] = dict(self._jobs)
-            paths = (
-                p for p in self._ensure_state_dir().glob("*.json") if not p.name.startswith(".")
-            )
-            for path in sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)[: limit * 2]:
-                if path.stem not in seen and (rec := self.get_job(path.stem)) is not None:
-                    seen[path.stem] = rec
+            try:
+                with contextlib.closing(sqlite3.connect(db_path, timeout=10.0)) as conn:
+                    rows = conn.execute(
+                        "SELECT job_id, record_json FROM jobs ORDER BY created_at DESC LIMIT ?",
+                        (bounded_limit * 4 if ws else bounded_limit * 2,),
+                    ).fetchall()
+                for row in rows:
+                    jid = str(row[0])
+                    if jid not in seen and isinstance(row[1], str):
+                        if (rec := self._deserialize_record(row[1])) is not None:
+                            seen[jid] = rec
+            except sqlite3.Error:
+                pass
             records = sorted(seen.values(), key=lambda r: r.created_at, reverse=True)
             if ws:
                 records = [r for r in records if self._matches_workspace(r.workspace_dir, ws)]
-            return [r.to_dict() for r in records[:limit]]
+            return [r.to_dict() for r in records[:bounded_limit]]
 
     @staticmethod
     def _matches_workspace(record_ws: str, ws_filter: str) -> bool:
@@ -330,13 +336,13 @@ class _JobQueryStore(_JobStorageEngine):
 
 
 class JobStore(_JobQueryStore):
-    """Thread-safe in-memory and disk-backed job store for durable requests and timeouts."""
+    """Thread-safe in-memory and SQLite-backed job store for durable requests and timeouts."""
 
     def __init__(self, state_dir: Path | None = None, max_cached_jobs: int = 512) -> None:
         """Initialize the job store with an explicit reentrant lock and LRU cache limit.
 
         Args:
-            state_dir: Optional directory path for persisted job JSON files.
+            state_dir: Optional directory path for the SQLite `jobs.db` file.
             max_cached_jobs: Maximum number of records retained in the in-memory LRU cache.
         """
         super().__init__(state_dir, max_cached_jobs, lock=threading.RLock())
@@ -371,27 +377,13 @@ class JobStore(_JobQueryStore):
             Newly created and persisted CodexJobRecord.
         """
         with self._lock:
-            resolved_id = (job_id or "").strip() or f"cdx-{uuid.uuid4().hex[:10]}"
-            ws = (
-                str(Path(w).expanduser().resolve())
-                if (w := workspace_dir.strip())
-                else workspace_dir
-            )
-            return self._save_job(
-                CodexJobRecord(
-                    job_id=resolved_id,
-                    task_type=task_type,
-                    status=JobStatusKind.RUNNING,
-                    created_at=created_at if created_at is not None else time.time(),
-                    workspace_dir=ws,
-                    model=model,
-                    metadata=metadata or {},
-                    outcome_state=OutcomeStateKind.IN_FLIGHT,
-                    idempotency_key=idempotency_key,
-                    provider=provider,
-                    engine=engine,
-                )
-            )
+            rid = (job_id or "").strip() or f"cdx-{uuid.uuid4().hex[:10]}"
+            ws = str(Path(w).expanduser().resolve()) if (w := workspace_dir.strip()) else ""
+            ts, st = (created_at if created_at is not None else time.time()), JobStatusKind.RUNNING
+            b = CodexJobRecord(rid, task_type, st, ts, ws or workspace_dir, model)
+            md, ik = metadata or {}, idempotency_key
+            rec = replace(b, metadata=md, idempotency_key=ik, provider=provider, engine=engine)
+            return self._save_job(rec)
 
     def resolve_or_register_request(
         self,
@@ -429,21 +421,14 @@ class JobStore(_JobQueryStore):
             if existing is not None:
                 if existing.status == JobStatusKind.RUNNING or existing.cancel_requested:
                     return (existing, False)
-                if not retry_same_request and existing.status in (
-                    JobStatusKind.TIMED_OUT_UNKNOWN,
-                    JobStatusKind.COMPLETED,
-                ):
+                done = (JobStatusKind.TIMED_OUT_UNKNOWN, JobStatusKind.COMPLETED)
+                if not retry_same_request and existing.status in done:
                     return (existing, False)
-                updated = replace(
-                    existing,
-                    attempt_count=existing.attempt_count + 1,
-                    status=JobStatusKind.RUNNING,
-                    outcome_state=OutcomeStateKind.IN_FLIGHT,
-                    error=None,
-                    completed_at=None,
-                )
-                return (self._save_job(updated), True)
-            record = self.create_job(
+                att = existing.attempt_count + 1
+                st, ost = JobStatusKind.RUNNING, OutcomeStateKind.IN_FLIGHT
+                u = replace(existing, attempt_count=att, status=st, outcome_state=ost)
+                return (self._save_job(replace(u, error=None, completed_at=None)), True)
+            rec = self.create_job(
                 task_type,
                 workspace_dir,
                 model,
@@ -453,7 +438,7 @@ class JobStore(_JobQueryStore):
                 provider=provider,
                 engine=engine,
             )
-            return (record, True)
+            return (rec, True)
 
     def complete_job(
         self,
@@ -476,17 +461,11 @@ class JobStore(_JobQueryStore):
         with self._lock:
             if (rec := self.get_job(job_id)) is None:
                 return None
-            return self._save_job(
-                replace(
-                    rec,
-                    status=JobStatusKind.COMPLETED,
-                    outcome_state=OutcomeStateKind.CONFIRMED_SUCCESS,
-                    completed_at=time.time(),
-                    result=result,
-                    session_id=session_id or rec.session_id,
-                    receipt=receipt if receipt is not None else rec.receipt,
-                )
-            )
+            sid = session_id or rec.session_id
+            rcpt = receipt if receipt is not None else rec.receipt
+            st, ost = JobStatusKind.COMPLETED, OutcomeStateKind.CONFIRMED_SUCCESS
+            r1 = replace(rec, status=st, outcome_state=ost, completed_at=time.time())
+            return self._save_job(replace(r1, result=result, session_id=sid, receipt=rcpt))
 
     def fail_job(
         self,
@@ -509,17 +488,11 @@ class JobStore(_JobQueryStore):
         with self._lock:
             if (rec := self.get_job(job_id)) is None:
                 return None
-            return self._save_job(
-                replace(
-                    rec,
-                    status=JobStatusKind.FAILED,
-                    outcome_state=OutcomeStateKind.CONFIRMED_FAILURE,
-                    completed_at=time.time(),
-                    error=error,
-                    session_id=session_id or rec.session_id,
-                    receipt=receipt if receipt is not None else rec.receipt,
-                )
-            )
+            sid = session_id or rec.session_id
+            rcpt = receipt if receipt is not None else rec.receipt
+            st, ost = JobStatusKind.FAILED, OutcomeStateKind.CONFIRMED_FAILURE
+            r1 = replace(rec, status=st, outcome_state=ost, completed_at=time.time())
+            return self._save_job(replace(r1, error=error, session_id=sid, receipt=rcpt))
 
     def mark_timed_out_unknown(
         self,
@@ -544,17 +517,13 @@ class JobStore(_JobQueryStore):
         with self._lock:
             if (rec := self.get_job(job_id)) is None:
                 return None
+            sid = session_id or rec.session_id
+            rcpt = receipt if receipt is not None else rec.receipt
+            res_val = partial_result if partial_result is not None else rec.result
+            st, ost = JobStatusKind.TIMED_OUT_UNKNOWN, OutcomeStateKind.OUTCOME_UNKNOWN
+            r1 = replace(rec, status=st, outcome_state=ost, completed_at=time.time())
             return self._save_job(
-                replace(
-                    rec,
-                    status=JobStatusKind.TIMED_OUT_UNKNOWN,
-                    outcome_state=OutcomeStateKind.OUTCOME_UNKNOWN,
-                    completed_at=time.time(),
-                    error=error,
-                    result=partial_result if partial_result is not None else rec.result,
-                    session_id=session_id or rec.session_id,
-                    receipt=receipt if receipt is not None else rec.receipt,
-                )
+                replace(r1, error=error, result=res_val, session_id=sid, receipt=rcpt)
             )
 
     def cancel_job(
@@ -574,17 +543,11 @@ class JobStore(_JobQueryStore):
         with self._lock:
             if (record := self.get_job(job_id)) is None:
                 return None
-            cancelled_at = time.time()
+            ts = time.time()
+            updated = replace(record, cancel_requested=True, cancelled_at=ts)
             if record.status in (JobStatusKind.RUNNING, JobStatusKind.TIMED_OUT_UNKNOWN):
+                st, ost = JobStatusKind.CANCELLED, OutcomeStateKind.CANCELLED
                 updated = replace(
-                    record,
-                    cancel_requested=True,
-                    cancelled_at=cancelled_at,
-                    status=JobStatusKind.CANCELLED,
-                    outcome_state=OutcomeStateKind.CANCELLED,
-                    completed_at=cancelled_at,
-                    error=reason,
+                    updated, status=st, outcome_state=ost, completed_at=ts, error=reason
                 )
-            else:
-                updated = replace(record, cancel_requested=True, cancelled_at=cancelled_at)
             return self._save_job(updated)

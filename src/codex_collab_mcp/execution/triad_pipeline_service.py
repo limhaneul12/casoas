@@ -448,9 +448,16 @@ class TriadOrchestrationService:
                 sonnet_summary = str(rep_struct.get("summary", sonnet_summary))
                 audit_target = str(rep_struct.get("crafted_code", "")) or audit_target
 
+        codex_critique = ""
+        if isinstance(c_struct := codex_res.get("structured_output"), dict):
+            codex_critique = str(
+                c_struct.get("executive_critique") or c_struct.get("summary") or ""
+            )
         extra_ctx = (
             f"[Claude Sonnet Summary]:\n{sonnet_summary}\n\n"
-            f"[Codex Red-Team Verdict]: {codex_verdict}"
+            f"[Crafted / Audited Target Code]:\n{audit_target}\n\n"
+            f"[Codex Red-Team Verdict]: {codex_verdict}\n"
+            f"[Codex Red-Team Critique]: {codex_critique}"
         )
         argon_res = (
             resumed["argon"]

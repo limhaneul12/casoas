@@ -1391,14 +1391,59 @@ async def test_bridge_executed_verification_gates_promote_test_execution(
     assert str(ev_scope["executed_test_commands"][0]["stdout_digest"]).startswith("sha256:")
 
 
+def _seed_test_codegraph_db(ws: Path) -> None:
+    """Create a self-contained `.codegraph/codegraph.db` fixture in `ws` for CI and local tests."""
+    import contextlib
+    import sqlite3
+
+    src_file = ws / "src" / "codex_collab_mcp" / "domain" / "routing_policy.py"
+    src_file.parent.mkdir(parents=True, exist_ok=True)
+    src_file.write_text(
+        "class RoutingPolicyEngine:\n    def validate(self) -> bool:\n        return True\n",
+        encoding="utf-8",
+    )
+    cg_dir = ws / ".codegraph"
+    cg_dir.mkdir(parents=True, exist_ok=True)
+    db_path = cg_dir / "codegraph.db"
+    with contextlib.closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.executescript(
+            """
+            CREATE TABLE nodes (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                name TEXT NOT NULL,
+                qualified_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL
+            );
+            CREATE TABLE edges (
+                source TEXT NOT NULL,
+                target TEXT NOT NULL
+            );
+            INSERT INTO nodes VALUES (
+                'n1', 'class', 'RoutingPolicyEngine',
+                'codex_collab_mcp.domain.routing_policy.RoutingPolicyEngine',
+                'src/codex_collab_mcp/domain/routing_policy.py', 1, 3
+            );
+            INSERT INTO nodes VALUES (
+                'n2', 'function', 'validate_and_resolve_route',
+                'codex_collab_mcp.domain.routing_policy.validate_and_resolve_route',
+                'src/codex_collab_mcp/domain/routing_policy.py', 1, 3
+            );
+            INSERT INTO edges VALUES ('n2', 'n1');
+            """
+        )
+
+
 def test_codegraph_context_slicer_and_persisted_idempotency_index(
     tmp_path: Path,
 ) -> None:
-    """Verify CodeGraph symbol slicing and O(1) persisted `.idempotency_index.json` lookup."""
+    """Verify CodeGraph symbol slicing and SQLite WAL `jobs.db` indexed idempotency lookup."""
     from codex_collab_mcp.domain.codegraph_slicer import slice_codegraph_symbols
 
-    repo_root = str(Path(__file__).resolve().parents[1])
-    sliced_md = slice_codegraph_symbols(repo_root, ["RoutingPolicyEngine"])
+    _seed_test_codegraph_db(tmp_path)
+    sliced_md = slice_codegraph_symbols(str(tmp_path), ["RoutingPolicyEngine"])
     assert "### CodeGraph Symbol Slices" in sliced_md
     assert "RoutingPolicyEngine" in sliced_md
     assert "src/codex_collab_mcp/domain/routing_policy.py" in sliced_md
@@ -1413,11 +1458,7 @@ def test_codegraph_context_slicer_and_persisted_idempotency_index(
         idempotency_key="persisted-idem-key-001",
     )
     store1.complete_job(created.job_id, result={"verdict": "PASS"})
-    index_file = jobs_dir / ".idempotency_index.json"
-    assert index_file.is_file()
-
-    # Write a decoy corrupt/unindexed JSON file that would fail if scanned first
-    (jobs_dir / "cdx-zzzzzzzzzz.json").write_text("{corrupt", encoding="utf-8")
+    assert (jobs_dir / "jobs.db").is_file()
 
     fresh_store = JobStore(state_dir=jobs_dir)
     resolved = fresh_store.find_by_idempotency_key("persisted-idem-key-001")
@@ -1509,11 +1550,11 @@ async def test_http_fallback_job_store_registration_and_gateway_codegraph_slicin
         }
 
     monkeypatch.setattr(server_mod, "run_agy_model_prompt", fake_agy)
-    repo_root = str(Path(__file__).parents[1])
+    _seed_test_codegraph_db(tmp_path)
     craft_raw = await claude_code_craft(
         task_spec="Check symbol slicing",
         target_code_or_context="def f(): pass",
-        workspace_dir=repo_root,
+        workspace_dir=str(tmp_path),
         symbols_inspected=["RoutingPolicyEngine"],
     )
     craft_res = json.loads(craft_raw)
