@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -158,7 +159,7 @@ class WorkspaceDigestCalculator:
         workspace_dir: str,
         files_inspected: list[str] | None = None,
     ) -> tuple[JsonObject, list[JsonValue]]:
-        """Compute SHA-256 digests for inspected workspace files and report missing paths.
+        """Compute SHA-256 digests for inspected workspace files in parallel on 3.14t.
 
         Args:
             workspace_dir: Base workspace directory path.
@@ -167,20 +168,43 @@ class WorkspaceDigestCalculator:
         Returns:
             Tuple of `(file_hashes_dict, missing_files_list)`.
         """
+        items = list(files_inspected or [])
+        if not items:
+            return {}, []
         ws_path = Path(self.resolve_dir(workspace_dir or ".") or ".")
-        file_hashes: JsonObject = {}
-        missing_files: list[JsonValue] = []
-        for rel_or_abs in files_inspected or []:
+
+        def _hash_one(rel_or_abs: str) -> tuple[str, str | None]:
+            """Read and hash a single file path.
+
+            Args:
+                rel_or_abs: Relative or absolute path string to inspect.
+
+            Returns:
+                Tuple of `(rel_or_abs, sha256_digest_or_none)`.
+            """
             candidate = Path(rel_or_abs)
             full_path = candidate if candidate.is_absolute() else (ws_path / candidate)
-            if full_path.is_file():
-                try:
-                    digest = hashlib.sha256(full_path.read_bytes()).hexdigest()
-                    file_hashes[rel_or_abs] = f"sha256:{digest}"
-                except OSError:
-                    missing_files.append(rel_or_abs)
+            if not full_path.is_file():
+                return rel_or_abs, None
+            try:
+                digest = hashlib.sha256(full_path.read_bytes()).hexdigest()
+                return rel_or_abs, f"sha256:{digest}"
+            except OSError:
+                return rel_or_abs, None
+
+        file_hashes: JsonObject = {}
+        missing_files: list[JsonValue] = []
+        if len(items) == 1:
+            results = [_hash_one(items[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=min(8, len(items))) as pool:
+                results = list(pool.map(_hash_one, items))
+
+        for path_str, digest_val in results:
+            if digest_val is not None:
+                file_hashes[path_str] = digest_val
             else:
-                missing_files.append(rel_or_abs)
+                missing_files.append(path_str)
         return file_hashes, missing_files
 
 

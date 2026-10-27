@@ -1,5 +1,10 @@
 # `codex-collab-mcp` — Gemini 4 Argon ↔ Claude Sonnet/Opus 5.5 ↔ OpenAI Codex Heterarchy MCP Bridge
 
+[![CI](https://github.com/limhaneul12/casoas/actions/workflows/ci.yml/badge.svg)](https://github.com/limhaneul12/casoas/actions/workflows/ci.yml)
+![Python 3.14t Free-Threading](https://img.shields.io/badge/python-3.14t%20(No--GIL)-blue)
+![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)
+![Type Checker: Pyrefly](https://img.shields.io/badge/type%20checker-pyrefly%20strict-purple)
+
 Production MCP server enabling multi-polar **Heterarchy collaboration** between **Gemini 4 Argon (Antigravity)**, **Claude Sonnet 5.5 / Opus 5.5 Medium**, and **OpenAI Codex (`codex-cli`)**, engineered with receipt-verified routing and evidence scope tracking.
 
 > **📖 한글 상세 사용 가이드 및 에이전트 스킬**: [`skills/codex-heterarchy/SKILL.md`](./skills/codex-heterarchy/SKILL.md)
