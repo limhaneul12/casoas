@@ -1,0 +1,84 @@
+[project]
+name = "codex-collab-mcp"
+version = "0.1.0"
+description = "Heterarchy MCP bridge enabling Gemini 4 Argon (Antigravity), Claude Sonnet/Opus 5.5, and OpenAI Codex collaboration (adversarial audit, targeted synthesis, differential candidates, and async rescue)."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "mcp>=1.6.0",
+    "pydantic>=2.7.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+codex-collab-mcp = "codex_collab_mcp.server:main"
+hcodex = "codex_collab_mcp.ctl:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_collab_mcp"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.9.0",
+    "pyrefly>=0.15.0",
+]
+
+[tool.uv]
+package = true
+python-preference = "only-managed"
+
+[tool.ruff]
+target-version = "py314"
+preview = false
+unsafe-fixes = false
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = [".agents", "node_modules", "frontend", "dist"]
+
+[tool.ruff.lint]
+# Correctness, explicit imports/types, async safety, and modern Python syntax.
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "ASYNC", "FAST", "S", "ANN", "RUF", "TID251"]
+# FastAPI Depends/Body/Query defaults are declarative framework metadata.
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Body", "fastapi.Query", "fastapi.Path", "fastapi.Header", "fastapi.Cookie", "fastapi.Security"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["codex_collab_mcp"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"builtins.getattr".msg = "Use explicit typed attributes or a typed adapter."
+"builtins.hasattr".msg = "Use an explicit typed contract instead of runtime attribute probing."
+"builtins.setattr".msg = "Use explicit typed assignments instead of dynamic attribute mutation."
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.pyrefly]
+preset = "strict"
+python-version = "3.14.7"
+project-includes = ["src/**/*.py", "tests/**/*.py"]
+project-excludes = [".agents/**", ".venv/**", "node_modules/**"]
+search-path = ["src", ".agents/python_dev_harness"]
+min-severity = "warn"
+
+[tool.pyrefly.errors]
+explicit-any = true
+untyped-function-decorator = true
+untyped-class-decorator = true
+implicit-import = true
+deprecated = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
