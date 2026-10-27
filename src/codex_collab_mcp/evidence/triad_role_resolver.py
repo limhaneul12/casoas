@@ -14,19 +14,27 @@ from codex_collab_mcp.collab_enums import (
     RoleExecutionState,
     TriadRole,
 )
-from codex_collab_mcp.contracts import (
-    TRIAD_REQUIRED_ROLES,
-    TRIAD_RESULT_SCHEMA_VERSION,
+from codex_collab_mcp.evidence.evidence_dicts import (
+    EvidenceDimensionsDict,
+    TriadAdjudicationDict,
+)
+from codex_collab_mcp.evidence.scope_builder import (
     attach_evidence_scope,
-    canonical_sha256,
     compact_evidence_scope,
     prepare_triad_role_evidence,
-    redact_sensitive_text,
+)
+from codex_collab_mcp.evidence.triad_adjudicator import (
+    TRIAD_REQUIRED_ROLES,
+    TRIAD_RESULT_SCHEMA_VERSION,
+)
+from codex_collab_mcp.evidence.workspace_digests import (
+    canonical_sha256,
     resolve_workspace_dir,
 )
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
-from codex_collab_mcp.schemas import JsonObject
+from codex_collab_mcp.routing.auth_redaction import redact_sensitive_text
+from codex_collab_mcp.schemas import JsonObject, as_json_object
 
 type AsyncEngineCallable = Callable[..., Coroutine[object, object, JsonObject]]
 
@@ -49,8 +57,8 @@ class TriadRoleResolver:
         orchestration_mode: str,
         source_task_digest: str,
         role_snapshots: dict[str, JsonObject],
-        role_evidence_dimensions: dict[str, JsonObject],
-        adjudication: JsonObject,
+        role_evidence_dimensions: dict[str, EvidenceDimensionsDict],
+        adjudication: TriadAdjudicationDict,
         job_store: JobStore,
         started_at: float | None = None,
     ) -> None:
@@ -68,7 +76,7 @@ class TriadRoleResolver:
             source_task_digest: SHA-256 digest of the canonical task inputs.
             role_snapshots: Compact per-role execution snapshots.
             role_evidence_dimensions: Per-role static review and test generation dimensions.
-            adjudication: Adjudication summary dictionary.
+            adjudication: Typed TriadAdjudicationDict summary.
             job_store: Active JobStore instance used to persist the triad aggregate.
             started_at: Optional orchestration start timestamp for accurate duration tracking.
         """
@@ -89,7 +97,7 @@ class TriadRoleResolver:
         successful_reviews = sum(
             1
             for role in TRIAD_REQUIRED_ROLES
-            if role_evidence_dimensions[role].get("static_code_review") == "verified"
+            if role_evidence_dimensions[role]["static_code_review"] == "verified"
         )
         aggregate_review = (
             "verified"
@@ -101,7 +109,7 @@ class TriadRoleResolver:
         aggregate_test_generation = (
             "verified"
             if any(
-                role_evidence_dimensions[role].get("test_generation") == "verified"
+                role_evidence_dimensions[role]["test_generation"] == "verified"
                 for role in TRIAD_REQUIRED_ROLES
             )
             else not_run
@@ -117,9 +125,9 @@ class TriadRoleResolver:
         evidence_dimensions["runtime_confirmation"] = not_run
 
         payload["role_evidence_dimensions"] = {
-            role: role_evidence_dimensions[role] for role in TRIAD_REQUIRED_ROLES
+            role: as_json_object(role_evidence_dimensions[role]) for role in TRIAD_REQUIRED_ROLES
         }
-        payload["review_approved"] = adjudication.get("review_approved") is True
+        payload["review_approved"] = adjudication["review_approved"] is True
         payload["source_task_digest"] = source_task_digest
         payload["workspace_dir"] = resolved_workspace
 
@@ -164,7 +172,7 @@ class TriadRoleResolver:
             "workspace_dir": resolved_workspace,
             "evidence_scope": compact_scope,
             "roles": role_snapshots_json,
-            "adjudication": adjudication,
+            "adjudication": as_json_object(adjudication),
         }
         snapshot["snapshot_digest"] = canonical_sha256(snapshot)
         try:
@@ -223,11 +231,6 @@ class TriadRoleResolver:
             t_dict = ticket.to_dict()
             role_state = t_dict["collaboration_role_state"] or str(RoleExecutionState.QUEUED)
             is_done = t_dict["execution_completed"] is True
-            t_json: JsonObject = {
-                k: v
-                for k, v in t_dict.items()
-                if isinstance(v, (str, int, float, bool)) or v is None
-            }
             return {
                 "ok": is_done,
                 "status": str(JobStatusKind.SUCCEEDED) if is_done else role_state,
@@ -236,7 +239,7 @@ class TriadRoleResolver:
                     if is_done
                     else str(OutcomeStateKind.IN_FLIGHT)
                 ),
-                "handoff_ticket": t_json,
+                "handoff_ticket": as_json_object(t_dict),
             }
         if not invoke_argon_rpc:
             return None
@@ -288,13 +291,13 @@ class TriadRoleResolver:
         )
         fail_payload: JsonObject = {
             "ok": False,
-            "collaboration_status": adjudication.get("collaboration_status"),
-            "consensus_status": adjudication.get("consensus_status"),
+            "collaboration_status": adjudication["collaboration_status"],
+            "consensus_status": adjudication["consensus_status"],
             "consensus_reached": False,
             "triad_consensus_ready": False,
             "orchestration_mode": OrchestrationMode.PIPELINE,
             "failed_stage": "sonnet_craft",
-            "adjudication": adjudication,
+            "adjudication": as_json_object(adjudication),
             "sonnet_craft": sonnet_res,
         }
         self.attach_triad_evidence_and_persist(

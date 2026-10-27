@@ -2,12 +2,55 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, cast
+
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from codex_collab_mcp.collab_enums import AuditSeverity, AuditVerdict, SchemaName
 
+if TYPE_CHECKING:
+    from codex_collab_mcp.evidence.evidence_dicts import (
+        EvidenceDimensionsDict,
+        EvidenceScopeDict,
+        TriadAdjudicationDict,
+    )
+    from codex_collab_mcp.routing.contract_dicts import (
+        BudgetEnvelopeDict,
+        ExecutionReceiptDict,
+        HandoffTicketDict,
+        StderrAuthClassificationDict,
+    )
+    from codex_collab_mcp.transports.transport_dicts import (
+        AgyAuthBoundaryDict,
+        CodexCliAuthBoundaryDict,
+    )
+
 type JsonValue = str | int | float | bool | list[JsonValue] | dict[str, JsonValue] | None
 type JsonObject = dict[str, JsonValue]
+type TypedRecordDict = (
+    ExecutionReceiptDict
+    | BudgetEnvelopeDict
+    | StderrAuthClassificationDict
+    | AgyAuthBoundaryDict
+    | CodexCliAuthBoundaryDict
+    | EvidenceScopeDict
+    | EvidenceDimensionsDict
+    | TriadAdjudicationDict
+    | HandoffTicketDict
+    | dict[str, EvidenceDimensionsDict]
+)
+
+
+def as_json_object(record: TypedRecordDict | JsonObject) -> JsonObject:
+    """Coerce a closed TypedDict record to JsonObject at dynamic payload boundaries without copying.
+
+    Args:
+        record: Validated TypedDict instance or JsonObject mapping.
+
+    Returns:
+        The same runtime dictionary typed as JsonObject for open payload assembly.
+    """
+    return cast(JsonObject, record)  # type-contract: allow-cast
 
 
 class StrictSchemaModel(BaseModel):

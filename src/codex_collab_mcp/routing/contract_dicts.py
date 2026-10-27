@@ -46,7 +46,7 @@ class ExecutionReceiptDict(TypedDict):
     actual_model: str
     model_mismatch: bool
     call_path: str
-    routing_decision: JsonObject
+    routing_decision: RoutingValidationDict
     started_at: str
     ended_at: str
     duration_seconds: float
@@ -94,8 +94,8 @@ class CodexJobRecordDict(TypedDict):
     completed_at: float | None
     result: JsonValue
     error: str | None
-    receipt: JsonObject | None
-    metadata: JsonObject
+    receipt: ExecutionReceiptDict | JsonObject | None
+    metadata: dict[str, str]
     elapsed_seconds: float
 
 
@@ -129,10 +129,21 @@ class PythonRuntimeInfoDict(TypedDict):
     gil_enabled: bool
 
 
+class ExternalMcpOAuthWarningDict(TypedDict):
+    """Isolated downstream MCP OAuth invalid_grant warning record."""
+
+    external_mcp_server: str
+    error_type: str
+    message: str
+    affects_antigravity_rpc: bool
+    affects_codex_model_routing: bool
+    auto_reauth_triggered: bool
+
+
 class StderrAuthClassificationDict(TypedDict):
     """Serialized representation of a StderrAuthClassification dataclass."""
 
     sanitized_stderr: str
-    isolated_external_mcp_oauth_warnings: list[JsonValue]
+    isolated_external_mcp_oauth_warnings: list[ExternalMcpOAuthWarningDict]
     antigravity_rpc_affected: bool
     auto_credential_refresh_performed: bool

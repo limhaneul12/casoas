@@ -15,9 +15,9 @@ from pathlib import Path
 
 from codex_collab_mcp.collab_enums import CtlCommand, CtlRelativePath, TriadRole
 from codex_collab_mcp.contracts import get_python_runtime_info
-from codex_collab_mcp.execution.agy_rpc_transport import AntigravityRpcClient
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.transports.agy_rpc_transport import AntigravityRpcClient
 
 REPO_ROOT: Path = Path(__file__).resolve().parents[2]
 

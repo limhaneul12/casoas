@@ -13,7 +13,7 @@ from codex_collab_mcp.collab_enums import (
     RoleExecutionState,
     TriadRole,
 )
-from codex_collab_mcp.domain.evidence_dicts import (
+from codex_collab_mcp.evidence.evidence_dicts import (
     EvidenceDimensionsDict,
     RoleAdjudicationSummaryDict,
     TriadAdjudicationDict,
@@ -168,7 +168,7 @@ class TriadConsensusAdjudicator:
         role_verdicts: dict[str, str | None],
         role_outputs: dict[str, JsonValue],
         decision_authority: str = "requires_caller_or_argon_adjudication",
-    ) -> JsonObject:
+    ) -> TriadAdjudicationDict:
         """Separate per-role execution state from multi-role consensus state.
 
         Args:
@@ -179,7 +179,7 @@ class TriadConsensusAdjudicator:
             decision_authority: Authority responsible for final adjudication.
 
         Returns:
-            JSON object detailing collaboration status, consensus status, and role breakdown.
+            Typed TriadAdjudicationDict detailing collaboration, consensus, and role breakdown.
         """
         normalized_states: dict[str, str] = {}
         for role in required_roles:
@@ -266,21 +266,16 @@ class TriadConsensusAdjudicator:
         review_approved = consensus_status == ConsensusState.CONSENSUS_VERIFIED and all(
             active_verdicts.get(role) == AuditVerdict.PASS for role in required_roles
         )
-        roles_detail: JsonObject = {}
-        for role in required_roles:
-            summary = RoleAdjudicationSummaryDict(
+        roles_detail: dict[str, RoleAdjudicationSummaryDict] = {
+            role: RoleAdjudicationSummaryDict(
                 state=normalized_states[role],
                 verdict=normalized_verdicts.get(role),
                 has_artifact=role not in missing_artifact_roles,
                 has_valid_review=role not in missing_review_roles,
             )
-            roles_detail[role] = {
-                "state": summary["state"],
-                "verdict": summary["verdict"],
-                "has_artifact": summary["has_artifact"],
-                "has_valid_review": summary["has_valid_review"],
-            }
-        adjudication = TriadAdjudicationDict(
+            for role in required_roles
+        }
+        return TriadAdjudicationDict(
             collaboration_status=collab_status,
             consensus_status=consensus_status,
             consensus_reached=consensus_reached,
@@ -296,31 +291,15 @@ class TriadConsensusAdjudicator:
             decision_authority=decision_authority,
             review_approved=review_approved,
         )
-        return {
-            "collaboration_status": adjudication["collaboration_status"],
-            "consensus_status": adjudication["consensus_status"],
-            "consensus_reached": adjudication["consensus_reached"],
-            "required_roles": list(adjudication["required_roles"]),
-            "succeeded_roles": list(adjudication["succeeded_roles"]),
-            "incomplete_roles": list(adjudication["incomplete_roles"]),
-            "role_states": adjudication["role_states"],
-            "missing_artifact_roles": list(adjudication["missing_artifact_roles"]),
-            "missing_verdict_roles": list(adjudication["missing_verdict_roles"]),
-            "missing_review_roles": list(adjudication["missing_review_roles"]),
-            "conflict_detected": adjudication["conflict_detected"],
-            "conflict_basis": adjudication["conflict_basis"],
-            "decision_authority": adjudication["decision_authority"],
-            "review_approved": adjudication["review_approved"],
-        }
 
-    def recompute(self, snapshot: JsonObject) -> JsonObject | None:
+    def recompute(self, snapshot: JsonObject) -> TriadAdjudicationDict | None:
         """Recompute consensus only from the role evidence stored in one aggregate snapshot.
 
         Args:
             snapshot: Saved triad collaboration snapshot dictionary.
 
         Returns:
-            Recomputed adjudication dictionary if consistent and uncorrupted, else None.
+            Recomputed TriadAdjudicationDict if consistent and uncorrupted, else None.
         """
         raw_roles = snapshot.get("roles")
         saved_adjudication = snapshot.get("adjudication")

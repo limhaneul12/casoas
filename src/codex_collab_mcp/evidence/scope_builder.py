@@ -1,22 +1,18 @@
-"""Evidence scope, CodeGraph snapshot provenance, file digests, and triad role evidence."""
+"""Evidence scope construction, compaction, and triad role evidence preparation."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from datetime import UTC, datetime
-from pathlib import Path
 
 from codex_collab_mcp.collab_enums import EvidenceDimensionState, RoleExecutionState, TriadRole
-from codex_collab_mcp.domain.evidence_dicts import (
-    CodegraphIndexSnapshotDict,
+from codex_collab_mcp.evidence.evidence_dicts import (
     EvidenceDimensionsDict,
     EvidenceScopeDict,
+    InlineScopeDigestPayloadDict,
+    TriadAdjudicationDict,
 )
-from codex_collab_mcp.domain.routing_catalog import compute_sha256_hex
-from codex_collab_mcp.domain.triad_adjudicator import (
+from codex_collab_mcp.evidence.triad_adjudicator import (
     TRIAD_REQUIRED_ROLES,
     TRIAD_VERDICTS,
     adjudicate_collaboration_and_consensus,
@@ -27,188 +23,15 @@ from codex_collab_mcp.domain.triad_adjudicator import (
     structured_review_artifact,
     verdict_from_artifact,
 )
-from codex_collab_mcp.schemas import JsonObject, JsonValue
+from codex_collab_mcp.evidence.workspace_digests import (
+    DIGEST_CALCULATOR,
+    canonical_sha256,
+    compute_task_digest,
+    resolve_workspace_dir,
+)
+from codex_collab_mcp.routing.receipt_budget import compute_sha256_hex
+from codex_collab_mcp.schemas import JsonObject, JsonValue, as_json_object
 
-
-@dataclass(frozen=True, slots=True)
-class CodegraphIndexSnapshot:
-    """Snapshot metadata for the workspace `.codegraph/codegraph.db` index."""
-
-    status: str
-    snapshot_id: str | None
-    workspace_dir: str
-    db_mtime_utc: str | None
-    db_size_bytes: int | None = None
-    note: str | None = None
-
-    def to_dict(self) -> CodegraphIndexSnapshotDict:
-        """Serialize the CodeGraph snapshot metadata to a TypedDict.
-
-        Returns:
-            Serialized CodegraphIndexSnapshotDict mapping.
-        """
-        return CodegraphIndexSnapshotDict(
-            status=self.status,
-            snapshot_id=self.snapshot_id,
-            workspace_dir=self.workspace_dir,
-            db_mtime_utc=self.db_mtime_utc,
-            db_size_bytes=self.db_size_bytes,
-            note=self.note,
-        )
-
-
-class WorkspaceDigestCalculator:
-    """Cohesive calculator for workspace paths, CodeGraph index state, and file SHA-256 digests."""
-
-    def resolve_dir(self, workspace_dir: str) -> str | None:
-        """Normalize a workspace path for exact source-run attribution.
-
-        Args:
-            workspace_dir: Raw workspace directory path string.
-
-        Returns:
-            Resolved absolute directory path string, or None if invalid or empty.
-        """
-        if not workspace_dir.strip():
-            return None
-        try:
-            return str(Path(workspace_dir).expanduser().resolve())
-        except OSError, RuntimeError, ValueError:
-            return None
-
-    def canonical_hash(self, value: JsonValue) -> str:
-        """Hash a JSON value using a stable compact representation.
-
-        Args:
-            value: Arbitrary JSON-serializable value to hash.
-
-        Returns:
-            Prefixed `sha256:...` digest string.
-        """
-        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return f"sha256:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
-
-    def compute_task_hash(
-        self,
-        *,
-        task_spec: str,
-        target_code_or_context: str,
-        invariants_and_rules: str,
-        language: str,
-        mode: str,
-    ) -> str:
-        """Identify the exact triad input without persisting task or source text.
-
-        Args:
-            task_spec: Task specification text.
-            target_code_or_context: Supplied target code or context text.
-            invariants_and_rules: Invariants and engineering rules text.
-            language: Target language name.
-            mode: Orchestration mode (`pipeline` or `council`).
-
-        Returns:
-            Canonical `sha256:...` digest of the task input tuple.
-        """
-        payload: JsonObject = {
-            "task_spec": task_spec,
-            "target_code_or_context": target_code_or_context,
-            "invariants_and_rules": invariants_and_rules,
-            "language": language,
-            "mode": mode,
-        }
-        return self.canonical_hash(payload)
-
-    def inspect_codegraph(self, workspace_dir: str) -> JsonObject:
-        """Inspect `.codegraph` index state in `workspace_dir` without fabricating freshness.
-
-        Args:
-            workspace_dir: Workspace directory path to inspect.
-
-        Returns:
-            JSON object describing CodeGraph index presence, mtime, and snapshot ID.
-        """
-        ws_path = Path(self.resolve_dir(workspace_dir or ".") or ".")
-        db_path = ws_path / ".codegraph" / "codegraph.db"
-        if not db_path.is_file():
-            note = "No .codegraph/codegraph.db found in workspace; static graph unindexed."
-            m = CodegraphIndexSnapshot("unindexed", None, str(ws_path), None, None, note).to_dict()
-            return {
-                "status": m["status"],
-                "snapshot_id": m["snapshot_id"],
-                "workspace_dir": m["workspace_dir"],
-                "db_mtime_utc": m["db_mtime_utc"],
-                "note": m["note"],
-            }
-        stat = db_path.stat()
-        mtime_iso = datetime.fromtimestamp(stat.st_mtime, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        seed = f"{ws_path}::{stat.st_size}::{int(stat.st_mtime)}"
-        snap_id = f"cg-{compute_sha256_hex(seed)[:12]}"
-        ready = CodegraphIndexSnapshot(
-            "indexed", snap_id, str(ws_path), mtime_iso, stat.st_size, None
-        ).to_dict()
-        return {
-            "status": ready["status"],
-            "snapshot_id": ready["snapshot_id"],
-            "workspace_dir": ready["workspace_dir"],
-            "db_mtime_utc": ready["db_mtime_utc"],
-            "db_size_bytes": ready["db_size_bytes"],
-        }
-
-    def hash_files(
-        self,
-        workspace_dir: str,
-        files_inspected: list[str] | None = None,
-    ) -> tuple[JsonObject, list[JsonValue]]:
-        """Compute SHA-256 digests for inspected workspace files in parallel on 3.14t.
-
-        Args:
-            workspace_dir: Base workspace directory path.
-            files_inspected: Optional list of relative or absolute file paths to hash.
-
-        Returns:
-            Tuple of `(file_hashes_dict, missing_files_list)`.
-        """
-        items = list(files_inspected or [])
-        if not items:
-            return {}, []
-        ws_path = Path(self.resolve_dir(workspace_dir or ".") or ".")
-
-        def _hash_one(rel_or_abs: str) -> tuple[str, str | None]:
-            """Read and hash a single file path.
-
-            Args:
-                rel_or_abs: Relative or absolute path string to inspect.
-
-            Returns:
-                Tuple of `(rel_or_abs, sha256_digest_or_none)`.
-            """
-            candidate = Path(rel_or_abs)
-            full_path = candidate if candidate.is_absolute() else (ws_path / candidate)
-            if not full_path.is_file():
-                return rel_or_abs, None
-            try:
-                digest = hashlib.sha256(full_path.read_bytes()).hexdigest()
-                return rel_or_abs, f"sha256:{digest}"
-            except OSError:
-                return rel_or_abs, None
-
-        file_hashes: JsonObject = {}
-        missing_files: list[JsonValue] = []
-        if len(items) == 1:
-            results = [_hash_one(items[0])]
-        else:
-            with ThreadPoolExecutor(max_workers=min(8, len(items))) as pool:
-                results = list(pool.map(_hash_one, items))
-
-        for path_str, digest_val in results:
-            if digest_val is not None:
-                file_hashes[path_str] = digest_val
-            else:
-                missing_files.append(path_str)
-        return file_hashes, missing_files
-
-
-_DIGEST_CALCULATOR = WorkspaceDigestCalculator()
 _NOT_RUN = str(EvidenceDimensionState.NOT_RUN)
 
 
@@ -218,8 +41,8 @@ def _build_dimensions(
     test_execution: str = _NOT_RUN,
     integration_verification: str = _NOT_RUN,
     runtime_confirmation: str = _NOT_RUN,
-) -> JsonObject:
-    """Build a serialized evidence dimensions JSON object via EvidenceDimensionsDict.
+) -> EvidenceDimensionsDict:
+    """Build a typed EvidenceDimensionsDict mapping each dimension to its verification state.
 
     Args:
         static_code_review: Verification status for static code review.
@@ -229,22 +52,15 @@ def _build_dimensions(
         runtime_confirmation: Verification status for runtime confirmation.
 
     Returns:
-        JSON object mapping each evidence dimension to its verification state.
+        Typed EvidenceDimensionsDict mapping each evidence dimension to its state.
     """
-    dims = EvidenceDimensionsDict(
+    return EvidenceDimensionsDict(
         static_code_review=static_code_review,
         test_generation=test_generation,
         test_execution=test_execution,
         integration_verification=integration_verification,
         runtime_confirmation=runtime_confirmation,
     )
-    return {
-        "static_code_review": dims["static_code_review"],
-        "test_generation": dims["test_generation"],
-        "test_execution": dims["test_execution"],
-        "integration_verification": dims["integration_verification"],
-        "runtime_confirmation": dims["runtime_confirmation"],
-    }
 
 
 class EvidenceScopeBuilder:
@@ -280,7 +96,7 @@ class EvidenceScopeBuilder:
         integration_verification: str = _NOT_RUN,
         runtime_confirmation: str = _NOT_RUN,
         executed_test_commands: list[JsonObject] | None = None,
-    ) -> JsonObject:
+    ) -> EvidenceScopeDict:
         """Anchor review and synthesis claims to explicit digests and verification dimensions.
 
         Args:
@@ -296,46 +112,39 @@ class EvidenceScopeBuilder:
             executed_test_commands: Optional list of executed test command records.
 
         Returns:
-            JSON object representing the verified evidence scope and digests.
+            Typed EvidenceScopeDict representing the verified evidence scope and digests.
         """
-        ws_dir = _DIGEST_CALCULATOR.resolve_dir(workspace_dir or ".") or "."
-        file_hashes, missing_files = _DIGEST_CALCULATOR.hash_files(ws_dir, files_inspected)
+        ws_dir = DIGEST_CALCULATOR.resolve_dir(workspace_dir or ".") or "."
+        file_hashes, missing_files = DIGEST_CALCULATOR.hash_files(ws_dir, files_inspected)
         context_bytes = provided_context_or_code.encode("utf-8")
         inline_sha = hashlib.sha256(context_bytes).hexdigest()
         syms = sorted(symbols_inspected or [])
-        scope_obj = {
-            "inline_context_sha256": inline_sha,
-            "file_hashes": file_hashes,
-            "symbols": syms,
-        }
+        scope_obj = InlineScopeDigestPayloadDict(
+            inline_context_sha256=inline_sha,
+            file_hashes=file_hashes,
+            symbols=syms,
+        )
         scope_payload = json.dumps(scope_obj, sort_keys=True)
-        executed_cmds: list[JsonValue] = [dict(c) for c in (executed_test_commands or [])]
+        executed_cmds: list[JsonObject] = [dict(c) for c in (executed_test_commands or [])]
         eff_exec = _NOT_RUN if not executed_cmds else test_execution
-        integ, runtime = integration_verification, runtime_confirmation
-        dims_json = _build_dimensions(static_code_review, test_generation, eff_exec, integ, runtime)
-        symbols_json: list[JsonValue] = list(symbols_inspected or [])
-        scope = EvidenceScopeDict(
-            codegraph=_DIGEST_CALCULATOR.inspect_codegraph(ws_dir),
+        dims = _build_dimensions(
+            static_code_review,
+            test_generation,
+            eff_exec,
+            integration_verification,
+            runtime_confirmation,
+        )
+        return EvidenceScopeDict(
+            codegraph=DIGEST_CALCULATOR.inspect_codegraph(ws_dir),
             scope_digest=f"sha256:{compute_sha256_hex(scope_payload)}",
             inline_context_bytes=len(context_bytes),
             inline_context_digest=f"sha256:{inline_sha}",
             files_inspected_digests=file_hashes,
             unverified_or_missing_files=missing_files,
-            symbols_inspected=symbols_json,
-            evidence_dimensions=dims_json,
+            symbols_inspected=list(symbols_inspected or []),
+            evidence_dimensions=dims,
             executed_test_commands=executed_cmds,
         )
-        return {
-            "codegraph": scope["codegraph"],
-            "scope_digest": scope["scope_digest"],
-            "inline_context_bytes": scope["inline_context_bytes"],
-            "inline_context_digest": scope["inline_context_digest"],
-            "files_inspected_digests": scope["files_inspected_digests"],
-            "unverified_or_missing_files": scope["unverified_or_missing_files"],
-            "symbols_inspected": scope["symbols_inspected"],
-            "evidence_dimensions": scope["evidence_dimensions"],
-            "executed_test_commands": scope["executed_test_commands"],
-        }
 
     def attach_scope(
         self,
@@ -386,7 +195,7 @@ class EvidenceScopeBuilder:
         )
         if origin is not None:
             evidence_scope["test_execution_evidence_origin"] = origin
-        result["evidence_scope"] = evidence_scope
+        result["evidence_scope"] = as_json_object(evidence_scope)
         return result
 
     def extract_references(self, res: JsonObject | None) -> JsonObject:
@@ -427,7 +236,7 @@ class EvidenceScopeBuilder:
         self,
         role_responses: dict[str, JsonObject | None],
         decision_authority: str | None = None,
-    ) -> tuple[JsonObject, dict[str, JsonObject], dict[str, JsonObject]]:
+    ) -> tuple[TriadAdjudicationDict, dict[str, JsonObject], dict[str, EvidenceDimensionsDict]]:
         """Build same-call role states, review evidence, and compact artifact references.
 
         Args:
@@ -441,7 +250,7 @@ class EvidenceScopeBuilder:
         role_verdicts: dict[str, str | None] = {}
         role_outputs: dict[str, JsonValue] = {}
         role_snapshots: dict[str, JsonObject] = {}
-        role_evidence_dimensions: dict[str, JsonObject] = {}
+        role_evidence_dimensions: dict[str, EvidenceDimensionsDict] = {}
 
         for role in TRIAD_REQUIRED_ROLES:
             response = role_responses.get(role)
@@ -449,7 +258,7 @@ class EvidenceScopeBuilder:
             artifact = structured_review_artifact(response)
             verdict = verdict_from_artifact(artifact)
             artifact_has_narrative = has_review_narrative(artifact)
-            artifact_digest = _DIGEST_CALCULATOR.canonical_hash(artifact) if artifact else None
+            artifact_digest = DIGEST_CALCULATOR.canonical_hash(artifact) if artifact else None
             ok_succ = (
                 is_successful_role_response(response) and state == RoleExecutionState.SUCCEEDED
             )
@@ -478,7 +287,7 @@ class EvidenceScopeBuilder:
                 "review_artifact_has_narrative": artifact_has_narrative,
                 "review_artifact_digest": artifact_digest,
                 "generated_tests_present": generated_tests,
-                "evidence_dimensions": evidence_dimensions,
+                "evidence_dimensions": as_json_object(evidence_dimensions),
             }
             role_snapshot.update(self.extract_references(response))
             role_states[role] = state
@@ -501,35 +310,36 @@ class EvidenceScopeBuilder:
         )
         return adjudication, role_snapshots, role_evidence_dimensions
 
-    def compact_scope(self, evidence_scope: JsonObject) -> JsonObject:
+    def compact_scope(self, evidence_scope: EvidenceScopeDict | JsonObject) -> JsonObject:
         """Persist digest-oriented scope details without command text or model output.
 
         Args:
-            evidence_scope: Full evidence scope dictionary to compact.
+            evidence_scope: Full evidence scope TypedDict or JSON dictionary to compact.
 
         Returns:
             Compacted evidence scope dictionary suitable for durable storage.
         """
-        compact: JsonObject = {
-            k: v
-            for k in (
-                "codegraph",
-                "scope_digest",
-                "inline_context_bytes",
-                "inline_context_digest",
-                "files_inspected_digests",
-                "unverified_or_missing_files",
-                "symbols_inspected",
-                "evidence_dimensions",
-                "test_execution_evidence_origin",
-            )
-            if (v := evidence_scope.get(k)) is not None
-        }
-        raw_commands = evidence_scope.get("executed_test_commands")
+        raw_scope = dict(evidence_scope)
+        compact: JsonObject = {}
+        for k in (
+            "codegraph",
+            "scope_digest",
+            "inline_context_bytes",
+            "inline_context_digest",
+            "files_inspected_digests",
+            "unverified_or_missing_files",
+            "symbols_inspected",
+            "evidence_dimensions",
+            "test_execution_evidence_origin",
+        ):
+            val = raw_scope.get(k)
+            if isinstance(val, (str, int, float, bool, list, dict)):
+                compact[k] = val
+        raw_commands = raw_scope.get("executed_test_commands")
         if isinstance(raw_commands, list):
             command_evidence: list[JsonValue] = []
             for raw_cmd in raw_commands:
-                digest = _DIGEST_CALCULATOR.canonical_hash(raw_cmd)
+                digest = DIGEST_CALCULATOR.canonical_hash(raw_cmd)
                 if not isinstance(raw_cmd, dict):
                     command_evidence.append({"item_digest": digest})
                     continue
@@ -547,10 +357,16 @@ class EvidenceScopeBuilder:
 
 
 _SCOPE_BUILDER = EvidenceScopeBuilder()
-
-canonical_sha256 = _DIGEST_CALCULATOR.canonical_hash
-resolve_workspace_dir = _DIGEST_CALCULATOR.resolve_dir
-compute_task_digest = _DIGEST_CALCULATOR.compute_task_hash
 attach_evidence_scope = _SCOPE_BUILDER.attach_scope
 prepare_triad_role_evidence = _SCOPE_BUILDER.prepare_triad_evidence
 compact_evidence_scope = _SCOPE_BUILDER.compact_scope
+
+__all__ = [
+    "EvidenceScopeBuilder",
+    "attach_evidence_scope",
+    "canonical_sha256",
+    "compact_evidence_scope",
+    "compute_task_digest",
+    "prepare_triad_role_evidence",
+    "resolve_workspace_dir",
+]

@@ -13,19 +13,19 @@ from codex_collab_mcp.agy_bridge import (
     list_agy_models,
     run_agy_model_prompt,
 )
-from codex_collab_mcp.domain.service_dicts import (
+from codex_collab_mcp.handoff_store import HandoffStore
+from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.orchestration.decision_pack_service import AlexandriaDecisionPackService
+from codex_collab_mcp.orchestration.mcp_gateway_service import McpExecutionGateway
+from codex_collab_mcp.orchestration.mcp_tool_handlers import McpToolDispatcher
+from codex_collab_mcp.orchestration.service_dicts import (
     ClaudeCraftRequest,
     CodexSchemaToolRequest,
     DecisionPackRequest,
     EngineDispatchRequest,
     ServerGatewayBindings,
 )
-from codex_collab_mcp.execution.decision_pack_service import AlexandriaDecisionPackService
-from codex_collab_mcp.execution.mcp_gateway_service import McpExecutionGateway
-from codex_collab_mcp.execution.mcp_tool_handlers import McpToolDispatcher
-from codex_collab_mcp.execution.triad_pipeline_service import TriadOrchestrationService
-from codex_collab_mcp.handoff_store import HandoffStore
-from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.orchestration.triad_pipeline_service import TriadOrchestrationService
 from codex_collab_mcp.prompts import (
     build_adversarial_audit_prompt,
     build_differential_candidates_prompt,

@@ -16,18 +16,18 @@ from codex_collab_mcp.collab_enums import (
     OutcomeStateKind,
     ProviderKind,
 )
-from codex_collab_mcp.contracts import (
+from codex_collab_mcp.evidence.workspace_digests import resolve_workspace_dir
+from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.routing.auth_redaction import redact_sensitive_text
+from codex_collab_mcp.routing.policy_engine import (
     build_execution_receipt,
     build_input_budget_exceeded_response,
     build_rejected_pre_dispatch_response,
-    evaluate_budget_envelope,
-    redact_sensitive_text,
-    resolve_workspace_dir,
     validate_and_resolve_route,
 )
-from codex_collab_mcp.execution.codex_output_parser import CodexCommandBuilder, CodexOutputParser
-from codex_collab_mcp.job_store import JobStore
-from codex_collab_mcp.schemas import JsonObject, JsonValue
+from codex_collab_mcp.routing.receipt_budget import evaluate_budget_envelope
+from codex_collab_mcp.schemas import JsonObject, JsonValue, as_json_object
+from codex_collab_mcp.transports.codex_output_parser import CodexCommandBuilder, CodexOutputParser
 
 
 class CodexHttpFallbackRunner:
@@ -108,7 +108,7 @@ class CodexHttpFallbackRunner:
             elapsed_seconds=0.0,
             termination_reason="completed",
         )
-        if bool(pre_budget.get("input_budget_exceeded")):
+        if pre_budget["input_budget_exceeded"]:
             ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             return build_input_budget_exceeded_response(
                 req_id=req_id,
@@ -218,8 +218,8 @@ class CodexHttpFallbackRunner:
                 "engine": EngineKind.HTTP,
                 "model": resolved_model,
                 "error": err_msg,
-                "receipt": receipt,
-                "budget": budget,
+                "receipt": as_json_object(receipt),
+                "budget": as_json_object(budget),
             }
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
             ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -259,8 +259,8 @@ class CodexHttpFallbackRunner:
                 "engine": EngineKind.HTTP,
                 "model": resolved_model,
                 "error": err_msg,
-                "receipt": receipt,
-                "budget": budget,
+                "receipt": as_json_object(receipt),
+                "budget": as_json_object(budget),
             }
 
         ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -285,7 +285,7 @@ class CodexHttpFallbackRunner:
             output_text=content,
             result_ref=f"job://{req_id}",
         )
-        model_mismatch = bool(receipt.get("model_mismatch"))
+        model_mismatch = receipt["model_mismatch"]
         budget = evaluate_budget_envelope(
             prompt_text=prompt,
             max_input_bytes=max_input_bytes,
@@ -308,11 +308,11 @@ class CodexHttpFallbackRunner:
             "model": reported_model,
             "data": parsed,
             "structured_output": structured_obj,
-            "receipt": receipt,
-            "budget": budget,
+            "receipt": as_json_object(receipt),
+            "budget": as_json_object(budget),
         }
         if model_mismatch:
-            err_text = str(receipt.get("failure_reason") or "Model mismatch detected.")
+            err_text = receipt["failure_reason"] or "Model mismatch detected."
             response_payload["error"] = err_text
             response_payload["error_code"] = "ACTUAL_MODEL_MISMATCH"
             if job_store is not None:

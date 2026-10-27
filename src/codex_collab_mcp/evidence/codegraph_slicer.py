@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from codex_collab_mcp.domain.evidence_dicts import CodegraphSymbolSliceDict
+from codex_collab_mcp.evidence.evidence_dicts import CodegraphSymbolSliceDict
 
 
 @dataclass(frozen=True, slots=True)

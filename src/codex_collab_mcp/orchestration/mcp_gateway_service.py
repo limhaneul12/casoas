@@ -9,28 +9,29 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 
 from codex_collab_mcp.collab_enums import EngineKind, JobStatusKind, SchemaName
-from codex_collab_mcp.contracts import (
-    attach_evidence_scope,
-    build_rejected_pre_dispatch_response,
-    redact_sensitive_text,
-    validate_and_resolve_route,
-)
-from codex_collab_mcp.domain.codegraph_slicer import slice_codegraph_symbols
-from codex_collab_mcp.domain.service_dicts import (
+from codex_collab_mcp.evidence.codegraph_slicer import slice_codegraph_symbols
+from codex_collab_mcp.evidence.scope_builder import attach_evidence_scope
+from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.orchestration.service_dicts import (
     BackgroundJobDispatchRequest,
     ClaudeCraftRequest,
     CodexSchemaToolRequest,
     EngineDispatchRequest,
     ServerGatewayBindings,
 )
-from codex_collab_mcp.job_store import JobStore
 from codex_collab_mcp.prompts import build_claude_craft_prompt
+from codex_collab_mcp.routing.auth_redaction import redact_sensitive_text
+from codex_collab_mcp.routing.policy_engine import (
+    build_rejected_pre_dispatch_response,
+    validate_and_resolve_route,
+)
 from codex_collab_mcp.schemas import (
     ADVERSARIAL_AUDIT_SCHEMA,
     DIFFERENTIAL_CANDIDATES_SCHEMA,
     RESCUE_DIAGNOSIS_SCHEMA,
     TARGETED_SYNTHESIS_SCHEMA,
     JsonObject,
+    as_json_object,
     validate_structured_output,
 )
 
@@ -233,7 +234,7 @@ class McpExecutionGateway:
                 "outcome_state": record.outcome_state,
                 "attempt_count": record.attempt_count,
                 "task_type": req.task_type,
-                "receipt": record.receipt,
+                "receipt": as_json_object(record.receipt) if record.receipt else None,
             }
 
         async def _runner() -> None:

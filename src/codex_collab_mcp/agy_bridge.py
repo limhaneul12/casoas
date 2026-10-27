@@ -22,14 +22,15 @@ from codex_collab_mcp.contracts import (
     redact_sensitive_text,
     validate_and_resolve_route,
 )
-from codex_collab_mcp.execution.agy_rpc_transport import (
+from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.schemas import JsonObject, as_json_object
+from codex_collab_mcp.transports.agy_rpc_transport import (
     AgyEndpoint,
     AntigravityModelCatalog,
     AntigravityRpcClient,
     RpcTransportFn,
 )
-from codex_collab_mcp.job_store import JobStore
-from codex_collab_mcp.schemas import JsonObject
+from codex_collab_mcp.transports.transport_dicts import AgyModelConfigEntryDict
 
 DEFAULT_CLAUDE_MODEL: str = CanonicalModelId.CLAUDE_SONNET_5_5_MEDIUM
 
@@ -57,7 +58,7 @@ async def discover_agy_endpoint() -> AgyEndpoint | None:
 async def list_agy_models(
     endpoint: AgyEndpoint | None = None,
     rpc_transport: RpcTransportFn | None = None,
-) -> list[JsonObject]:
+) -> list[AgyModelConfigEntryDict]:
     """Return available models and quotas from the local Antigravity LanguageServer.
 
     Args:
@@ -135,7 +136,7 @@ async def run_agy_model_prompt(
             timeout_seconds=timeout_seconds,
             extra_fields={
                 "model_requested": model,
-                "auth_boundary": AntigravityModelCatalog.build_auth_boundary(False),
+                "auth_boundary": as_json_object(AntigravityModelCatalog.build_auth_boundary(False)),
             },
         )
 
@@ -146,7 +147,7 @@ async def run_agy_model_prompt(
         elapsed_seconds=0.0,
         termination_reason="completed",
     )
-    if bool(pre_budget.get("input_budget_exceeded")):
+    if pre_budget["input_budget_exceeded"]:
         ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         req_id = (request_id or "").strip() or f"cdx-{uuid.uuid4().hex[:10]}"
         return build_input_budget_exceeded_response(
@@ -190,7 +191,7 @@ async def run_agy_model_prompt(
                 "model_id": route.resolved_model,
                 "result": record.result,
                 "error": record.error,
-                "receipt": record.receipt,
+                "receipt": as_json_object(record.receipt) if record.receipt else None,
             }
     else:
         req_id = (request_id or "").strip() or f"cdx-{uuid.uuid4().hex[:10]}"
@@ -231,15 +232,17 @@ async def run_agy_model_prompt(
             "model_requested": model,
             "model_id": route.resolved_model,
             "error": err_msg,
-            "receipt": receipt,
-            "budget": evaluate_budget_envelope(
-                prompt_text=prompt,
-                max_input_bytes=max_input_bytes,
-                timeout_seconds=timeout_seconds,
-                elapsed_seconds=duration,
-                termination_reason="endpoint_unavailable",
+            "receipt": as_json_object(receipt),
+            "budget": as_json_object(
+                evaluate_budget_envelope(
+                    prompt_text=prompt,
+                    max_input_bytes=max_input_bytes,
+                    timeout_seconds=timeout_seconds,
+                    elapsed_seconds=duration,
+                    termination_reason="endpoint_unavailable",
+                )
             ),
-            "auth_boundary": AntigravityModelCatalog.build_auth_boundary(False),
+            "auth_boundary": as_json_object(AntigravityModelCatalog.build_auth_boundary(False)),
         }
 
     resolved_model_id, placeholder = await AntigravityModelCatalog.resolve_model_placeholder(
@@ -337,9 +340,9 @@ async def run_agy_model_prompt(
             "placeholder": placeholder,
             "duration_seconds": duration,
             "error": err_msg,
-            "receipt": receipt,
-            "budget": budget,
-            "auth_boundary": AntigravityModelCatalog.build_auth_boundary(True),
+            "receipt": as_json_object(receipt),
+            "budget": as_json_object(budget),
+            "auth_boundary": as_json_object(AntigravityModelCatalog.build_auth_boundary(True)),
         }
 
     ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -368,7 +371,7 @@ async def run_agy_model_prompt(
         output_text=raw_response,
         result_ref=f"job://{req_id}",
     )
-    model_mismatch = bool(receipt.get("model_mismatch"))
+    model_mismatch = receipt["model_mismatch"]
     budget = evaluate_budget_envelope(
         prompt_text=prompt,
         max_input_bytes=max_input_bytes,
@@ -395,12 +398,12 @@ async def run_agy_model_prompt(
         "duration_seconds": duration,
         "structured_output": structured,
         "raw_output": raw_response,
-        "receipt": receipt,
-        "budget": budget,
-        "auth_boundary": AntigravityModelCatalog.build_auth_boundary(True),
+        "receipt": as_json_object(receipt),
+        "budget": as_json_object(budget),
+        "auth_boundary": as_json_object(AntigravityModelCatalog.build_auth_boundary(True)),
     }
     if model_mismatch:
-        err_text = str(receipt.get("failure_reason") or "Model mismatch detected.")
+        err_text = receipt["failure_reason"] or "Model mismatch detected."
         response_payload["error"] = err_text
         response_payload["error_code"] = "ACTUAL_MODEL_MISMATCH"
         if job_store is not None:

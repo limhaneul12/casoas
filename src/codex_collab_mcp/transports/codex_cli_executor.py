@@ -9,23 +9,25 @@ import time
 import uuid
 from datetime import UTC, datetime
 
-from codex_collab_mcp.contracts import (
+from codex_collab_mcp.evidence.workspace_digests import resolve_workspace_dir
+from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.routing.auth_redaction import (
+    classify_stderr_and_auth_boundaries,
+    redact_sensitive_text,
+)
+from codex_collab_mcp.routing.policy_engine import (
     build_execution_receipt,
     build_input_budget_exceeded_response,
     build_rejected_pre_dispatch_response,
-    classify_stderr_and_auth_boundaries,
-    evaluate_budget_envelope,
-    redact_sensitive_text,
-    resolve_workspace_dir,
     validate_and_resolve_route,
 )
-from codex_collab_mcp.execution.codex_output_parser import (
+from codex_collab_mcp.routing.receipt_budget import evaluate_budget_envelope
+from codex_collab_mcp.schemas import JsonObject, JsonValue, as_json_object
+from codex_collab_mcp.transports.codex_output_parser import (
     CodexCommandBuilder,
     CodexOutputParser,
     ResolveBinaryFn,
 )
-from codex_collab_mcp.job_store import JobStore
-from codex_collab_mcp.schemas import JsonObject, JsonValue
 
 __all__ = [
     "CodexCliProcessRunner",
@@ -128,7 +130,7 @@ class CodexCliProcessRunner:
                 extra_fields={
                     "workspace_dir": resolved_cwd,
                     "model": model or "codex-default",
-                    "auth_boundary": default_auth,
+                    "auth_boundary": as_json_object(default_auth),
                 },
             )
 
@@ -139,7 +141,7 @@ class CodexCliProcessRunner:
             elapsed_seconds=0.0,
             termination_reason="completed",
         )
-        if bool(pre_budget.get("input_budget_exceeded")):
+        if pre_budget["input_budget_exceeded"]:
             ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             req_id = (request_id or "").strip() or f"cdx-{uuid.uuid4().hex[:10]}"
             return build_input_budget_exceeded_response(
@@ -268,9 +270,9 @@ class CodexCliProcessRunner:
                     "model": route.resolved_model,
                     "duration_seconds": duration,
                     "error": timeout_msg,
-                    "receipt": receipt,
-                    "budget": budget,
-                    "auth_boundary": default_auth,
+                    "receipt": as_json_object(receipt),
+                    "budget": as_json_object(budget),
+                    "auth_boundary": as_json_object(default_auth),
                 }
 
             stdout_text = stdout_bytes.decode("utf-8", errors="replace")
@@ -279,7 +281,7 @@ class CodexCliProcessRunner:
                 CodexOutputParser.parse_jsonl_events_with_model(stdout_text)
             )
             auth_diag = classify_stderr_and_auth_boundaries(stderr_text)
-            sanitized_stderr = str(auth_diag.get("sanitized_stderr", ""))
+            sanitized_stderr = auth_diag["sanitized_stderr"]
             raw_response = CodexOutputParser.resolve_raw_response(
                 output_file,
                 event_messages,
@@ -314,7 +316,7 @@ class CodexCliProcessRunner:
                 result_ref=f"job://{req_id}",
                 failure_reason=failure_reason,
             )
-            model_mismatch = bool(receipt.get("model_mismatch"))
+            model_mismatch = receipt["model_mismatch"]
             final_ok = exit_ok and not model_mismatch
 
             parsed_data: JsonValue = (
@@ -355,16 +357,16 @@ class CodexCliProcessRunner:
                 "data": parsed_data,
                 "structured_output": structured_obj,
                 "stderr": sanitized_stderr if not final_ok else "",
-                "receipt": receipt,
-                "budget": budget,
-                "auth_boundary": CodexCommandBuilder.build_auth_boundary(
-                    auth_diag.get("isolated_external_mcp_oauth_warnings", [])
+                "receipt": as_json_object(receipt),
+                "budget": as_json_object(budget),
+                "auth_boundary": as_json_object(
+                    CodexCommandBuilder.build_auth_boundary(
+                        auth_diag["isolated_external_mcp_oauth_warnings"]
+                    )
                 ),
             }
             if not final_ok:
-                err_str = str(
-                    receipt.get("failure_reason") or failure_reason or "Codex CLI failed."
-                )
+                err_str = receipt["failure_reason"] or failure_reason or "Codex CLI failed."
                 payload["error"] = err_str
                 if model_mismatch:
                     payload["error_code"] = "ACTUAL_MODEL_MISMATCH"

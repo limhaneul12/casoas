@@ -1,6 +1,6 @@
 # `codex-collab-mcp` (CASOAS)
 
-[![Github-Action CI](https://github.com/limhaneul12/casoas/actions/workflows/ci.yml/badge.svg)](https://github.com/limhaneul12/casoas/actions/workflows/ci.yml)
+[![github action](https://github.com/limhaneul12/casoas/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/limhaneul12/casoas/actions/workflows/ci.yml)
 ![Python 3.14t](https://img.shields.io/badge/python-3.14t-blue)
 ![Pydantic v2.14.1](https://img.shields.io/badge/pydantic-v2.14.1-e92063)
 ![SQLite WAL](https://img.shields.io/badge/sqlite-WAL-003B57)
@@ -35,6 +35,20 @@
 - **SQLite (WAL 모드) 자동 영속화**
   - MCP 서버 시작 시 `~/.cache/codex-collab-mcp/` 하위에 `jobs.db`와 `handoffs.db`(`WAL` 모드)를 자동 생성·초기화합니다.
   - 실행 영수증(Receipt), 멱등성 키(`idempotency_key`), 타임아웃 복구 상태(`timed_out_unknown`), 체크포인트 이어달리기(`resume_collaboration_id`)를 안전하게 보존합니다.
+
+### 기능별 패키지 구조 (`src/codex_collab_mcp/`)
+
+```text
+src/codex_collab_mcp/
+├── routing/         # 모델 스펙/별칭, 사전 라우팅 검증, 실행 영수증(Receipt), 예산(Budget), 시크릿 마스킹
+├── storage/         # SQLite(WAL) 작업(Job) 및 핸드오프(Handoff) 엔진 & 불변 레코드 DTO
+├── evidence/        # 병렬 SHA-256 파일 해싱, CodeGraph 심볼 슬라이싱, 증거 범위 및 3극 합의 판정
+├── transports/      # Antigravity 로컬 RPC, Codex CLI 서브프로세스/JSONL 파서, Git 리뷰, HTTP 폴백
+├── orchestration/   # MCP 실행 게이트웨이, 3극 Pipeline/Council 오케스트레이터, 검증 게이트, Alexandria 패키징
+├── server.py        # FastMCP 도구 엔트리포인트 (15 Tools)
+├── schemas.py       # Pydantic v2 StrictSchemaModel 입출력 경계 스키마
+└── ctl.py           # `hcodex` 원클릭 CLI 컨트롤러
+```
 
 ---
 

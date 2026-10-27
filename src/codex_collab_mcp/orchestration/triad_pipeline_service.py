@@ -10,20 +10,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from codex_collab_mcp.collab_enums import OrchestrationMode, TriadRole
-from codex_collab_mcp.contracts import (
+from codex_collab_mcp.evidence.codegraph_slicer import slice_codegraph_symbols
+from codex_collab_mcp.evidence.scope_builder import (
     compute_task_digest,
-    extract_verdict,
-    map_response_to_role_state,
     prepare_triad_role_evidence,
     resolve_workspace_dir,
 )
-from codex_collab_mcp.domain.codegraph_slicer import slice_codegraph_symbols
-from codex_collab_mcp.domain.triad_role_resolver import TriadRoleResolver
-from codex_collab_mcp.execution.verification_gate_runner import BridgeVerificationGateRunner
+from codex_collab_mcp.evidence.triad_adjudicator import extract_verdict, map_response_to_role_state
+from codex_collab_mcp.evidence.triad_role_resolver import TriadRoleResolver
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.orchestration.verification_gate_runner import BridgeVerificationGateRunner
 from codex_collab_mcp.prompts import build_adversarial_audit_prompt, build_claude_craft_prompt
-from codex_collab_mcp.schemas import ADVERSARIAL_AUDIT_SCHEMA, JsonObject
+from codex_collab_mcp.schemas import ADVERSARIAL_AUDIT_SCHEMA, JsonObject, as_json_object
 
 type AsyncEngineCallable = Callable[..., Coroutine[object, object, JsonObject]]
 type TriadTaskSpec = tuple[str, str, str, str, str, str]
@@ -277,8 +276,8 @@ class TriadOrchestrationService:
         adjudication, role_snapshots, role_evidence_dimensions = prepare_triad_role_evidence(
             {TriadRole.ARGON: argon_res, TriadRole.SONNET: sonnet_res, TriadRole.CODEX: codex_res}
         )
-        consensus_reached = bool(adjudication.get("consensus_reached"))
-        collab_status = str(adjudication.get("collaboration_status"))
+        consensus_reached = adjudication["consensus_reached"]
+        collab_status = adjudication["collaboration_status"]
         participants: JsonObject = {
             "macro_architect": ctx.argon_model,
             "code_craftsman": sonnet_res.get("model_id", ctx.claude_model),
@@ -287,12 +286,12 @@ class TriadOrchestrationService:
         payload: JsonObject = {
             "ok": collab_status == "complete" and consensus_reached,
             "collaboration_status": collab_status,
-            "consensus_status": adjudication.get("consensus_status"),
+            "consensus_status": adjudication["consensus_status"],
             "consensus_reached": consensus_reached,
             "triad_consensus_ready": consensus_reached,
             "orchestration_mode": mode,
             "participants": participants,
-            "adjudication": adjudication,
+            "adjudication": as_json_object(adjudication),
             "argon_review": argon_res,
             "sonnet_craft": sonnet_res,
             "codex_audit": codex_res,
@@ -510,16 +509,9 @@ class TriadOrchestrationService:
         """
         t_spec, target_code, invariants, language, mode, workspace_dir = spec
         normalized_mode = mode.strip().lower()
-        normalized_spec = (
-            t_spec,
-            target_code,
-            invariants,
-            language,
-            normalized_mode,
-            workspace_dir,
-        )
+        norm_spec = (t_spec, target_code, invariants, language, normalized_mode, workspace_dir)
         ctx = _TriadExecutionContext.from_inputs(
-            normalized_spec, models, opts, ev_opts, stores, fns, cont_opts
+            norm_spec, models, opts, ev_opts, stores, fns, cont_opts
         )
         if normalized_mode == OrchestrationMode.COUNCIL:
             return await self._execute_council_roles(ctx)

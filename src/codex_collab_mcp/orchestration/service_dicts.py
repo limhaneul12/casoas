@@ -7,13 +7,15 @@ from dataclasses import dataclass
 from typing import TypedDict
 
 from codex_collab_mcp.collab_enums import CanonicalModelId
-from codex_collab_mcp.domain.contract_dicts import (
+from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.routing.contract_dicts import (
     CodexJobRecordDict,
     HandoffTicketDict,
     ModelSpecDict,
+    PythonRuntimeInfoDict,
 )
-from codex_collab_mcp.job_store import JobStore
 from codex_collab_mcp.schemas import JsonObject, JsonValue
+from codex_collab_mcp.transports.transport_dicts import AgyModelConfigEntryDict
 
 type AsyncEngineCallable = Callable[..., Coroutine[object, object, JsonObject]]
 
@@ -227,12 +229,12 @@ class BridgeHealthResponseDict(TypedDict):
 
     ok: bool
     verified_at_utc: str
-    python_runtime: JsonObject
+    python_runtime: PythonRuntimeInfoDict
     codex_binary: str
     codex_version: str
     agy_bridge_ready: bool
     agy_endpoint: str | None
-    antigravity_models: list[JsonObject]
+    antigravity_models: list[AgyModelConfigEntryDict]
     routing_contract: RoutingContractHealthDict
     auth_boundaries: AuthBoundariesHealthDict
     active_background_jobs: int

@@ -12,21 +12,21 @@ from codex_collab_mcp.collab_enums import (
     OrchestrationMode,
     OutcomeStateKind,
 )
-from codex_collab_mcp.contracts import (
+from codex_collab_mcp.evidence.evidence_dicts import TriadAdjudicationDict
+from codex_collab_mcp.evidence.scope_builder import canonical_sha256, resolve_workspace_dir
+from codex_collab_mcp.evidence.triad_adjudicator import (
     TRIAD_REQUIRED_ROLES,
     TRIAD_RESULT_SCHEMA_VERSION,
-    canonical_sha256,
     recompute_saved_triad_adjudication,
-    resolve_workspace_dir,
 )
-from codex_collab_mcp.domain.service_dicts import (
+from codex_collab_mcp.job_store import CodexJobRecord, JobStore
+from codex_collab_mcp.orchestration.service_dicts import (
     DecisionAuthoritativeEvidenceDict,
     DecisionCallerContentDict,
     DecisionDigestPayloadDict,
     DecisionPackRequest,
     DecisionPackResponseDict,
 )
-from codex_collab_mcp.job_store import CodexJobRecord, JobStore
 from codex_collab_mcp.schemas import JsonObject
 
 _COLLABORATION_ID_PATTERN = re.compile(r"cdx-[0-9a-f]{10}\Z")
@@ -42,7 +42,7 @@ class AlexandriaDecisionPackService:
         self,
         fences: DecisionFencesTuple,
         job_store: JobStore,
-    ) -> tuple[JsonObject, JsonObject] | None:
+    ) -> tuple[JsonObject, TriadAdjudicationDict] | None:
         """Load one completed triad aggregate after validating its ID and scope fence.
 
         Args:
@@ -100,7 +100,7 @@ class AlexandriaDecisionPackService:
         collaboration_id: str,
         expected_workspace: str,
         expected_scope_digest: str,
-    ) -> tuple[JsonObject, JsonObject] | None:
+    ) -> tuple[JsonObject, TriadAdjudicationDict] | None:
         """Verify cryptographic digests, scope fences, and recomputed adjudication.
 
         Args:
@@ -307,7 +307,7 @@ Caller-provided resolution; it has not been verified against the cited run.
             (req.collaboration_id, expected_ws, req.expected_scope_digest), job_store
         )
         source_snapshot: JsonObject | None = None
-        adjudication: JsonObject | None = None
+        adjudication: TriadAdjudicationDict | None = None
         if validated_source is not None:
             source_snapshot, adjudication = validated_source
 
@@ -340,22 +340,14 @@ Caller-provided resolution; it has not been verified against the cited run.
         )
         snapshot_digest = snapshot_digest_value if isinstance(snapshot_digest_value, str) else None
         evidence_status = "verified" if source_snapshot is not None else "unverified"
-        collaboration_status_value = (
-            adjudication.get("collaboration_status") if adjudication is not None else None
-        )
         collaboration_status = (
-            collaboration_status_value
-            if isinstance(collaboration_status_value, str)
-            else "unverified"
+            adjudication["collaboration_status"] if adjudication is not None else "unverified"
         )
-        consensus_status_value = adjudication.get("consensus_status") if adjudication else None
         consensus_status = (
-            consensus_status_value if isinstance(consensus_status_value, str) else "unverified"
+            adjudication["consensus_status"] if adjudication is not None else "unverified"
         )
-        consensus_reached = (
-            adjudication is not None and adjudication.get("consensus_reached") is True
-        )
-        review_approved = adjudication is not None and adjudication.get("review_approved") is True
+        consensus_reached = adjudication is not None and adjudication["consensus_reached"]
+        review_approved = adjudication is not None and adjudication["review_approved"]
         resolution_verified = False
 
         role_dimensions, role_lines = self._reconcile_live_role_evidence(source_roles)

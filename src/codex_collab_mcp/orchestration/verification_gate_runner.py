@@ -16,7 +16,7 @@ from codex_collab_mcp.collab_enums import (
     OutcomeStateKind,
     RoleExecutionState,
 )
-from codex_collab_mcp.contracts import (
+from codex_collab_mcp.evidence.triad_adjudicator import (
     TRIAD_REQUIRED_ROLES,
     extract_verdict,
     map_response_to_role_state,

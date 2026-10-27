@@ -10,20 +10,20 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from codex_collab_mcp.contracts import (
+from codex_collab_mcp.evidence.workspace_digests import resolve_workspace_dir
+from codex_collab_mcp.routing.auth_redaction import classify_stderr_and_auth_boundaries
+from codex_collab_mcp.routing.policy_engine import (
     build_execution_receipt,
     build_rejected_pre_dispatch_response,
-    classify_stderr_and_auth_boundaries,
-    resolve_workspace_dir,
     validate_and_resolve_route,
 )
-from codex_collab_mcp.execution.codex_cli_executor import (
+from codex_collab_mcp.schemas import JsonObject, as_json_object
+from codex_collab_mcp.transports.codex_cli_executor import (
     CodexCliProcessRunner,
     CodexCommandBuilder,
     CodexOutputParser,
     ResolveBinaryFn,
 )
-from codex_collab_mcp.schemas import JsonObject
 
 
 class CodexAuxiliaryRunner:
@@ -128,13 +128,13 @@ class CodexAuxiliaryRunner:
                 "request_id": req_id,
                 "workspace_dir": resolved_cwd,
                 "error": timeout_msg,
-                "receipt": receipt,
+                "receipt": as_json_object(receipt),
             }
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
         auth_diag = classify_stderr_and_auth_boundaries(stderr_text)
-        sanitized_stderr = str(auth_diag.get("sanitized_stderr", ""))
+        sanitized_stderr = auth_diag["sanitized_stderr"]
         ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         duration = round(time.monotonic() - started_mono, 2)
         exit_ok = proc.returncode == 0
@@ -164,8 +164,8 @@ class CodexAuxiliaryRunner:
             "workspace_dir": resolved_cwd,
             "review_output": review_out,
             "stderr": sanitized_stderr if not exit_ok else "",
-            "receipt": receipt,
-            "auth_boundary": auth_diag,
+            "receipt": as_json_object(receipt),
+            "auth_boundary": as_json_object(auth_diag),
         }
 
     @classmethod
@@ -280,7 +280,7 @@ class CodexAuxiliaryRunner:
                     "mode": subcmd,
                     "parent_session_id": session_id,
                     "error": timeout_msg,
-                    "receipt": receipt,
+                    "receipt": as_json_object(receipt),
                 }
 
             stdout_text = stdout_bytes.decode("utf-8", errors="replace")
@@ -289,7 +289,7 @@ class CodexAuxiliaryRunner:
                 CodexOutputParser.parse_jsonl_events_with_model(stdout_text)
             )
             auth_diag = classify_stderr_and_auth_boundaries(stderr_text)
-            sanitized_stderr = str(auth_diag.get("sanitized_stderr", ""))
+            sanitized_stderr = auth_diag["sanitized_stderr"]
             raw_response = CodexOutputParser.resolve_raw_response(
                 output_file,
                 event_messages,
@@ -326,6 +326,6 @@ class CodexAuxiliaryRunner:
                 "session_id": new_session_id or session_id,
                 "response": raw_response,
                 "stderr": sanitized_stderr if not exit_ok else "",
-                "receipt": receipt,
-                "auth_boundary": auth_diag,
+                "receipt": as_json_object(receipt),
+                "auth_boundary": as_json_object(auth_diag),
             }

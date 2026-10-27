@@ -8,10 +8,14 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
-from codex_collab_mcp.domain.transport_dicts import CodexCliAuthBoundary
-from codex_collab_mcp.execution.agy_rpc_transport import AntigravityModelCatalog
 from codex_collab_mcp.job_store import CodexJobRecord
-from codex_collab_mcp.schemas import JsonObject, JsonValue
+from codex_collab_mcp.routing.contract_dicts import ExternalMcpOAuthWarningDict
+from codex_collab_mcp.schemas import JsonObject, JsonValue, as_json_object
+from codex_collab_mcp.transports.agy_rpc_transport import AntigravityModelCatalog
+from codex_collab_mcp.transports.transport_dicts import (
+    CodexCliAuthBoundary,
+    CodexCliAuthBoundaryDict,
+)
 
 ResolveBinaryFn = Callable[[], str | None]
 
@@ -245,8 +249,7 @@ class CodexCommandBuilder:
             has_custom_prompt: Whether custom instructions will be piped via stdin (`-`).
 
         Returns:
-            Command argument list for `codex review` (note: top-level `codex review` does not
-            accept `--ignore-user-config`, so MCP isolation is enforced via `-c mcp_servers={}`).
+            Command argument list for `codex review`.
         """
         cmd: list[str] = [codex_bin, "review"]
         if commit_sha and (sha_s := commit_sha.strip()):
@@ -275,18 +278,20 @@ class CodexCommandBuilder:
         return cmd
 
     @staticmethod
-    def build_auth_boundary(warnings: JsonValue = None) -> JsonObject:
-        """Build the Codex CLI authentication boundary metadata dictionary.
+    def build_auth_boundary(
+        warnings: list[ExternalMcpOAuthWarningDict] | JsonValue = None,
+    ) -> CodexCliAuthBoundaryDict:
+        """Build the Codex CLI authentication boundary TypedDict.
 
         Args:
             warnings: Optional list of isolated external MCP OAuth warnings.
 
         Returns:
-            Authentication boundary dictionary for Codex CLI responses.
+            Typed CodexCliAuthBoundaryDict for Codex CLI responses.
         """
         return CodexCliAuthBoundary(
             isolated_external_mcp_oauth_warnings=[] if warnings is None else warnings,
-        ).to_json_object()
+        ).to_dict()
 
     @staticmethod
     def build_deduplicated_response(
@@ -322,5 +327,5 @@ class CodexCommandBuilder:
             "model": resolved_model,
             "result": record.result,
             "error": record.error,
-            "receipt": record.receipt,
+            "receipt": as_json_object(record.receipt) if record.receipt else None,
         }

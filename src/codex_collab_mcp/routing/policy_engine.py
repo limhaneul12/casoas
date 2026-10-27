@@ -11,18 +11,21 @@ from codex_collab_mcp.collab_enums import (
     ProviderKind,
     ReasoningTier,
 )
-from codex_collab_mcp.domain.routing_catalog import (
+from codex_collab_mcp.routing.auth_redaction import redact_sensitive_text
+from codex_collab_mcp.routing.contract_dicts import BudgetEnvelopeDict, ExecutionReceiptDict
+from codex_collab_mcp.routing.model_specs import (
     ANTIGRAVITY_MODEL_SPECS,
     CODEX_SUPPORTED_MODELS,
     EXPLICIT_MODEL_ALIASES,
     VALID_REASONING_TIERS,
+)
+from codex_collab_mcp.routing.receipt_budget import (
     ExecutionReceipt,
     RoutingValidationResult,
     compute_output_digest,
     evaluate_budget_envelope,
-    redact_sensitive_text,
 )
-from codex_collab_mcp.schemas import JsonObject
+from codex_collab_mcp.schemas import JsonObject, as_json_object
 
 
 class RoutingPolicyEngine:
@@ -110,10 +113,8 @@ class RoutingPolicyEngine:
                 norm_p or "unknown", eng, raw_m or "default", tier, "UNSUPPORTED_ENGINE", msg
             )
         if eng == EngineKind.CODEX_CLI:
-            codex_p, oauth = (
-                str(ProviderKind.OPENAI_CODEX),
-                str(AuthContextKind.CODEX_CHATGPT_OAUTH),
-            )
+            codex_p = str(ProviderKind.OPENAI_CODEX)
+            oauth = str(AuthContextKind.CODEX_CHATGPT_OAUTH)
             eff = norm_m or str(CanonicalModelId.CODEX_DEFAULT)
             if norm_p and norm_p not in ("openai", codex_p, "codex"):
                 msg = f"Provider '{provider}' mismatch."
@@ -201,8 +202,8 @@ class RoutingPolicyEngine:
         output_text: str | None = None,
         result_ref: str | None = None,
         failure_reason: str | None = None,
-    ) -> JsonObject:
-        """Build a verifiable, credential-free execution receipt for any collaboration call.
+    ) -> ExecutionReceiptDict:
+        """Build a verifiable, credential-free execution receipt TypedDict.
 
         Args:
             request_id: Unique request identifier.
@@ -221,7 +222,7 @@ class RoutingPolicyEngine:
             failure_reason: Optional error description if execution failed.
 
         Returns:
-            Serialized execution receipt JSON object.
+            Serialized ExecutionReceiptDict TypedDict.
         """
         req_norm = EXPLICIT_MODEL_ALIASES.get(
             route.requested_model.lower(), route.requested_model.lower()
@@ -239,20 +240,7 @@ class RoutingPolicyEngine:
             if mismatch
             else (redact_sensitive_text(failure_reason) if failure_reason else None)
         )
-        rd = route.to_dict()
-        routing_decision: JsonObject = {
-            "valid": rd["valid"],
-            "provider": rd["provider"],
-            "engine": rd["engine"],
-            "requested_model": rd["requested_model"],
-            "resolved_model": rd["resolved_model"],
-            "auth_context": rd["auth_context"],
-            "reasoning_tier": rd["reasoning_tier"],
-            "placeholder": rd["placeholder"],
-            "error_code": rd["error_code"],
-            "error_message": rd["error_message"],
-        }
-        receipt = ExecutionReceipt(
+        return ExecutionReceipt(
             request_id=request_id,
             idempotency_key=idempotency_key,
             provider=route.provider,
@@ -262,7 +250,7 @@ class RoutingPolicyEngine:
             actual_model=actual_model,
             model_mismatch=mismatch,
             call_path=call_path,
-            routing_decision=routing_decision,
+            routing_decision=route.to_dict(),
             started_at=started_at_iso,
             ended_at=ended_at_iso,
             duration_seconds=round(duration_seconds, 2),
@@ -274,28 +262,6 @@ class RoutingPolicyEngine:
             failure_reason=err,
             credentials_redacted=True,
         ).to_dict()
-        return {
-            "request_id": receipt["request_id"],
-            "idempotency_key": receipt["idempotency_key"],
-            "provider": receipt["provider"],
-            "engine": receipt["engine"],
-            "requested_model": receipt["requested_model"],
-            "resolved_model": receipt["resolved_model"],
-            "actual_model": receipt["actual_model"],
-            "model_mismatch": receipt["model_mismatch"],
-            "call_path": receipt["call_path"],
-            "routing_decision": receipt["routing_decision"],
-            "started_at": receipt["started_at"],
-            "ended_at": receipt["ended_at"],
-            "duration_seconds": receipt["duration_seconds"],
-            "status": receipt["status"],
-            "outcome_state": receipt["outcome_state"],
-            "attempt_count": receipt["attempt_count"],
-            "output_digest": receipt["output_digest"],
-            "result_ref": receipt["result_ref"],
-            "failure_reason": receipt["failure_reason"],
-            "credentials_redacted": receipt["credentials_redacted"],
-        }
 
     def build_rejected_response(
         self,
@@ -352,15 +318,17 @@ class RoutingPolicyEngine:
             "requested_model": route.requested_model,
             "error_code": route.error_code,
             "error": route.error_message,
-            "receipt": receipt,
+            "receipt": as_json_object(receipt),
         }
         if prompt_text is not None:
-            payload["budget"] = evaluate_budget_envelope(
-                prompt_text=prompt_text,
-                max_input_bytes=max_input_bytes,
-                timeout_seconds=timeout_seconds,
-                elapsed_seconds=0.0,
-                termination_reason=str(JobStatusKind.REJECTED_PRE_DISPATCH),
+            payload["budget"] = as_json_object(
+                evaluate_budget_envelope(
+                    prompt_text=prompt_text,
+                    max_input_bytes=max_input_bytes,
+                    timeout_seconds=timeout_seconds,
+                    elapsed_seconds=0.0,
+                    termination_reason=str(JobStatusKind.REJECTED_PRE_DISPATCH),
+                )
             )
         if extra_fields:
             payload.update(extra_fields)
@@ -375,7 +343,7 @@ class RoutingPolicyEngine:
         call_path: str,
         started_iso: str,
         ended_iso: str,
-        pre_budget: JsonObject,
+        pre_budget: BudgetEnvelopeDict | JsonObject,
         max_input_bytes: int,
         extra_fields: JsonObject | None = None,
     ) -> JsonObject:
@@ -388,7 +356,7 @@ class RoutingPolicyEngine:
             call_path: String describing the call path where budget rejection occurred.
             started_iso: UTC ISO-8601 start timestamp.
             ended_iso: UTC ISO-8601 end timestamp.
-            pre_budget: Computed budget envelope dictionary.
+            pre_budget: Computed budget envelope TypedDict or JSON dictionary.
             max_input_bytes: Maximum allowed input bytes.
             extra_fields: Optional extra key-value fields to merge into response.
 
@@ -422,8 +390,8 @@ class RoutingPolicyEngine:
             "engine": route.engine,
             "error_code": "INPUT_BUDGET_EXCEEDED",
             "error": err_msg,
-            "receipt": receipt,
-            "budget": pre_budget,
+            "receipt": as_json_object(receipt),
+            "budget": as_json_object(pre_budget),
         }
         if extra_fields:
             payload.update(extra_fields)

@@ -8,13 +8,9 @@ from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 
 from codex_collab_mcp.agy_bridge import AgyEndpoint
-from codex_collab_mcp.contracts import (
-    ANTIGRAVITY_MODEL_SPECS,
-    CODEX_SUPPORTED_MODELS,
-    get_python_runtime_info,
-    redact_sensitive_text,
-)
-from codex_collab_mcp.domain.service_dicts import (
+from codex_collab_mcp.handoff_store import HandoffStore
+from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.orchestration.service_dicts import (
     AgyRpcBoundaryHealthDict,
     AuthBoundariesHealthDict,
     BridgeHealthResponseDict,
@@ -27,12 +23,20 @@ from codex_collab_mcp.domain.service_dicts import (
     RoutingContractHealthDict,
     ToolErrorResponseDict,
 )
-from codex_collab_mcp.handoff_store import HandoffStore
-from codex_collab_mcp.job_store import JobStore
-from codex_collab_mcp.schemas import JsonObject
+from codex_collab_mcp.routing.auth_redaction import (
+    get_python_runtime_info,
+    redact_sensitive_text,
+)
+from codex_collab_mcp.routing.model_specs import (
+    ANTIGRAVITY_MODEL_SPECS,
+    CODEX_SUPPORTED_MODELS,
+)
+from codex_collab_mcp.transports.transport_dicts import AgyModelConfigEntryDict
 
 type AsyncEndpointProbeCallable = Callable[[], Coroutine[object, object, AgyEndpoint | None]]
-type AsyncModelListCallable = Callable[..., Coroutine[object, object, list[JsonObject]]]
+type AsyncModelListCallable = Callable[
+    ..., Coroutine[object, object, list[AgyModelConfigEntryDict]]
+]
 type BridgeHealthProbes = tuple[
     Callable[[], str], AsyncEndpointProbeCallable, AsyncModelListCallable
 ]
@@ -256,9 +260,7 @@ class McpToolDispatcher:
         agy_ep = await discover_agy_fn()
         agy_models = await list_agy_models_fn(endpoint=agy_ep) if agy_ep else []
         routable_agy_models: list[str] = [
-            mid
-            for m in agy_models
-            if bool(m.get("routable")) and isinstance((mid := m.get("model_id")), str)
+            mid for m in agy_models if m["routable"] and (mid := m["model_id"])
         ]
         advertised_agy_specs = [spec.to_dict() for spec in ANTIGRAVITY_MODEL_SPECS.values()]
         routable_codex_models: list[str] = sorted(CODEX_SUPPORTED_MODELS) if cli_ready else []

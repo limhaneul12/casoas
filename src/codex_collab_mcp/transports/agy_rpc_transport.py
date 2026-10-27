@@ -15,15 +15,15 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final
 
-from codex_collab_mcp.contracts import (
-    ANTIGRAVITY_MODEL_SPECS,
-    validate_and_resolve_route,
-)
-from codex_collab_mcp.domain.transport_dicts import (
-    AgyAuthBoundary,
-    AgyModelConfigEntry,
-)
+from codex_collab_mcp.routing.model_specs import ANTIGRAVITY_MODEL_SPECS
+from codex_collab_mcp.routing.policy_engine import validate_and_resolve_route
 from codex_collab_mcp.schemas import JsonObject, JsonValue
+from codex_collab_mcp.transports.transport_dicts import (
+    AgyAuthBoundary,
+    AgyAuthBoundaryDict,
+    AgyModelConfigEntry,
+    AgyModelConfigEntryDict,
+)
 
 RpcTransportFn = Callable[[str, str, str, JsonObject, float], JsonObject]
 
@@ -92,7 +92,6 @@ class AntigravityRpcClient:
         req = urllib.request.Request(  # noqa: S310
             url,
             data=body_bytes,
-            # type-contract: allow-raw-dict
             headers={
                 "Content-Type": "application/json",
                 "x-codeium-csrf-token": csrf_token,
@@ -270,26 +269,26 @@ class AntigravityModelCatalog:
     """Model catalog parser, placeholder resolver, and JSON extractor for Antigravity RPC."""
 
     @staticmethod
-    def build_auth_boundary(connected: bool) -> JsonObject:
-        """Build the Antigravity local CSRF authentication boundary metadata dictionary.
+    def build_auth_boundary(connected: bool) -> AgyAuthBoundaryDict:
+        """Build the Antigravity local CSRF authentication boundary TypedDict.
 
         Args:
             connected: Whether the local Antigravity LanguageServer RPC connection was established.
 
         Returns:
-            Authentication boundary dictionary for Antigravity RPC responses.
+            Typed AgyAuthBoundaryDict for Antigravity RPC responses.
         """
-        return AgyAuthBoundary(antigravity_rpc_connected=connected).to_json_object()
+        return AgyAuthBoundary(antigravity_rpc_connected=connected).to_dict()
 
     @staticmethod
-    def parse_model_config_entry(item: JsonObject) -> JsonObject:
+    def parse_model_config_entry(item: JsonObject) -> AgyModelConfigEntryDict:
         """Normalize a single `clientModelConfigs` dictionary entry from LanguageServer.
 
         Args:
             item: Raw model configuration dictionary from `GetCascadeModelConfigData`.
 
         Returns:
-            Normalized model metadata dictionary with routability and quota fields.
+            Typed AgyModelConfigEntryDict with routability and quota fields.
         """
         label = item.get("label")
         model_id = str(item.get("modelId") or "")
@@ -315,7 +314,7 @@ class AntigravityModelCatalog:
             placeholder=placeholder,
             remaining_quota=remaining_val,
             routable=routable,
-        ).to_json_object()
+        ).to_dict()
 
     @classmethod
     async def list_models(
@@ -323,7 +322,7 @@ class AntigravityModelCatalog:
         endpoint: AgyEndpoint | None = None,
         rpc_transport: RpcTransportFn | None = None,
         discover_fn: DiscoverEndpointFn | None = None,
-    ) -> list[JsonObject]:
+    ) -> list[AgyModelConfigEntryDict]:
         """Return available models and quotas from the local Antigravity LanguageServer.
 
         Args:
@@ -332,7 +331,7 @@ class AntigravityModelCatalog:
             discover_fn: Optional async endpoint discovery callable override.
 
         Returns:
-            List of normalized model catalog dictionaries.
+            List of normalized AgyModelConfigEntryDict items.
         """
         discover = discover_fn or AntigravityRpcClient.discover_endpoint
         resolved = endpoint or await discover()
@@ -356,7 +355,7 @@ class AntigravityModelCatalog:
         if not isinstance(raw_configs, list):
             return []
 
-        models: list[JsonObject] = []
+        models: list[AgyModelConfigEntryDict] = []
         for item in raw_configs:
             if isinstance(item, dict):
                 models.append(cls.parse_model_config_entry(item))
@@ -403,8 +402,8 @@ class AntigravityModelCatalog:
             discover_fn=discover_fn,
         )
         for entry in catalog:
-            mid = str(entry.get("model_id", "")).lower()
-            ph = str(entry.get("placeholder", ""))
+            mid = entry["model_id"].lower()
+            ph = entry["placeholder"]
             if mid == target_id and ph:
                 return (mid, ph)
 

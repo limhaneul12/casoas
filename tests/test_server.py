@@ -973,7 +973,7 @@ def test_python_314t_free_threading_runtime_and_lazy_store_init(tmp_path: Path) 
     rt = get_python_runtime_info()
     assert rt["free_threading_build"] is True
     assert rt["gil_enabled"] is False
-    assert "t" in str(rt["abiflags"])
+    assert "t" in rt["abiflags"]
     assert sys._is_gil_enabled() is False
 
     # Lazy initialization: constructing stores must NOT create directories on disk
@@ -1440,7 +1440,7 @@ def test_codegraph_context_slicer_and_persisted_idempotency_index(
     tmp_path: Path,
 ) -> None:
     """Verify CodeGraph symbol slicing and SQLite WAL `jobs.db` indexed idempotency lookup."""
-    from codex_collab_mcp.domain.codegraph_slicer import slice_codegraph_symbols
+    from codex_collab_mcp.evidence.codegraph_slicer import slice_codegraph_symbols
 
     _seed_test_codegraph_db(tmp_path)
     sliced_md = slice_codegraph_symbols(str(tmp_path), ["RoutingPolicyEngine"])
@@ -1661,7 +1661,7 @@ async def test_triad_role_snapshot_model_ids_and_job_telemetry(
     assert sonnet_snap["model_id"] == "claude-opus-5-5-medium"
     assert codex_snap["model_id"] == "gpt-6.1-sol"
 
-    from codex_collab_mcp.execution.codex_aux_runners import CodexAuxiliaryRunner
+    from codex_collab_mcp.transports.codex_aux_runners import CodexAuxiliaryRunner
 
     for bad_val in ("--help", "-c", " --dangerously-bypass-approvals-and-sandbox "):
         with pytest.raises(ValueError, match="must not start with '-'"):
