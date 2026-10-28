@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import contextlib
+import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Final
 
 from codex_collab_mcp.evidence.workspace_digests import resolve_workspace_dir
+
+_INLINE_SYMBOL_RE: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)\b"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,11 +239,81 @@ class CodegraphContextSlicer:
             )
         return slices
 
+    def discover_symbols(
+        self,
+        workspace_dir: str,
+        symbols: list[str] | None = None,
+        files_inspected: list[str] | None = None,
+        inline_text: str = "",
+    ) -> list[str]:
+        """Discover candidate symbols from explicit names, inline code, and `files_inspected`.
+
+        Args:
+            workspace_dir: Workspace directory containing `.codegraph/codegraph.db`.
+            symbols: Optional explicit symbol names requested by the caller.
+            files_inspected: Optional relative file paths to query in CodeGraph `nodes`.
+            inline_text: Optional inline Python code or diff text to scan for `def`/`class`.
+
+        Returns:
+            Deduplicated list of up to 12 candidate symbol names.
+        """
+        discovered: list[str] = []
+        seen: set[str] = set()
+        for raw_sym in symbols or ():
+            s = raw_sym.strip()
+            if s and s not in seen:
+                seen.add(s)
+                discovered.append(s)
+                if len(discovered) >= 12:
+                    return discovered
+        if inline_text:
+            for m in _INLINE_SYMBOL_RE.finditer(inline_text):
+                name = m.group(1)
+                if name not in seen:
+                    seen.add(name)
+                    discovered.append(name)
+                    if len(discovered) >= 12:
+                        return discovered
+        if not files_inspected:
+            return discovered[:12]
+        resolved_ws = resolve_workspace_dir(workspace_dir)
+        if resolved_ws is None:
+            return discovered[:12]
+        db_path = Path(resolved_ws) / ".codegraph" / "codegraph.db"
+        if not db_path.is_file():
+            return discovered[:12]
+        try:
+            with contextlib.closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as conn:
+                for raw_file in files_inspected:
+                    cleaned = raw_file.strip().removeprefix("./")
+                    rel = Path(cleaned).as_posix() if cleaned else ""
+                    if not rel or rel == ".":
+                        continue
+                    rows = conn.execute(
+                        "SELECT DISTINCT name FROM nodes "
+                        "WHERE file_path = ? AND kind IN ('class', 'function', 'method') "
+                        "ORDER BY start_line ASC LIMIT 4",
+                        (rel,),
+                    ).fetchall()
+                    for row in rows:
+                        sym_name = str(row[0] or "").strip()
+                        if sym_name and sym_name not in seen:
+                            seen.add(sym_name)
+                            discovered.append(sym_name)
+                            if len(discovered) >= 12:
+                                return discovered
+        except sqlite3.Error:
+            return discovered[:12]
+        return discovered[:12]
+
     def format_context_block(
         self,
         workspace_dir: str,
-        symbols: list[str] | None,
+        symbols: list[str] | None = None,
         max_bytes: int = 48_000,
+        *,
+        files_inspected: list[str] | None = None,
+        inline_text: str = "",
     ) -> str:
         """Format matched CodeGraph symbol slices as a Markdown context block for prompts.
 
@@ -245,11 +321,16 @@ class CodegraphContextSlicer:
             workspace_dir: Workspace directory containing `.codegraph/codegraph.db`.
             symbols: Optional list of symbol names or qualified names to slice.
             max_bytes: Maximum UTF-8 byte budget for symbol source excerpts.
+            files_inspected: Optional relative file paths to auto-discover symbols from.
+            inline_text: Optional inline code or diff text to auto-discover symbols from.
 
         Returns:
             Formatted Markdown string with symbol metadata and excerpts, or empty string.
         """
-        slices = self.slice_symbols(workspace_dir, symbols, max_bytes=max_bytes)
+        effective_symbols = self.discover_symbols(
+            workspace_dir, symbols, files_inspected=files_inspected, inline_text=inline_text
+        )
+        slices = self.slice_symbols(workspace_dir, effective_symbols, max_bytes=max_bytes)
         if not slices:
             return ""
         blocks: list[str] = ["### CodeGraph Symbol Slices"]

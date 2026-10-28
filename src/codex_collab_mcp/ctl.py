@@ -13,11 +13,14 @@ import sys
 import tomllib
 from pathlib import Path
 
-from codex_collab_mcp.collab_enums import CtlCommand, CtlRelativePath, JobStatusKind, TriadRole
+from codex_collab_mcp.collab_enums import CtlCommand, CtlRelativePath, TriadRole
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
 from codex_collab_mcp.routing.auth_redaction import get_python_runtime_info
-from codex_collab_mcp.transports.agy_rpc_transport import AntigravityRpcClient
+from codex_collab_mcp.transports.agy_rpc_transport import (
+    AntigravityCircuitBreaker,
+    AntigravityRpcClient,
+)
 
 REPO_ROOT: Path = Path(__file__).resolve().parents[2]
 
@@ -281,8 +284,8 @@ class HeterarchyCliController:
             if h_store.db_path.is_file()
             else {r: 0 for r in roles}
         )
-        recent_jobs = j_store.list_jobs(limit=5) if j_store.db_path.is_file() else []
-        running_jobs = sum(1 for j in recent_jobs if j.get("status") == JobStatusKind.RUNNING)
+        telemetry = j_store.summarize_telemetry()
+        running_jobs = telemetry["running_jobs"]
         rt = get_python_runtime_info()
 
         print("=== Heterarchy Tri-Polar MCP Status (Argon + Sonnet/Opus 5.5 + Codex) ===")
@@ -298,6 +301,13 @@ class HeterarchyCliController:
         )
         print(f"  Active Stdio PIDs  : {pids if pids else 'None (spawns on demand)'}")
         print(f"  Running Async Jobs : {running_jobs}")
+        print(
+            f"  Job Telemetry      : total={telemetry['total_jobs']} | "
+            f"completed={telemetry['completed_jobs']} | "
+            f"failed={telemetry['failed_jobs']} | "
+            f"timed_out={telemetry['timed_out_unknown_jobs']} | "
+            f"avg={telemetry['avg_duration_seconds']}s"
+        )
         print(
             f"  Handoff Inbox      : Argon={pending.get(TriadRole.ARGON, 0)} | "
             f"Sonnet={pending.get(TriadRole.SONNET, 0)} | "
@@ -367,6 +377,7 @@ class HeterarchyCliController:
         mcp_cfg = self.env.resolve_path(CtlRelativePath.AGY_PLUGIN_ACTIVE) / "mcp_config.json"
         if mcp_cfg.is_file():
             mcp_cfg.touch()
+        AntigravityCircuitBreaker.reset()
         with contextlib.suppress(Exception):
             ep = asyncio.run(AntigravityRpcClient.discover_endpoint())
             if ep is not None:

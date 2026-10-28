@@ -28,11 +28,12 @@ from codex_collab_mcp.routing.auth_redaction import (
     get_python_runtime_info,
     redact_sensitive_text,
 )
+from codex_collab_mcp.routing.contract_dicts import JobTelemetrySummaryDict
 from codex_collab_mcp.routing.model_specs import (
     ANTIGRAVITY_MODEL_SPECS,
     CODEX_SUPPORTED_MODELS,
 )
-from codex_collab_mcp.transports.agy_rpc_transport import AgyEndpoint
+from codex_collab_mcp.transports.agy_rpc_transport import AgyEndpoint, AntigravityCircuitBreaker
 from codex_collab_mcp.transports.transport_dicts import AgyModelConfigEntryDict
 
 type AsyncEndpointProbeCallable = Callable[[], Coroutine[object, object, AgyEndpoint | None]]
@@ -227,6 +228,7 @@ class McpToolDispatcher:
         probes: BridgeHealthProbes,
         handoff_store: HandoffStore,
         active_background_jobs: int,
+        job_store: JobStore | None = None,
     ) -> str:
         """Probe Codex CLI binary, Antigravity local RPC endpoint, and handoff queue counts.
 
@@ -234,6 +236,7 @@ class McpToolDispatcher:
             probes: Tuple of `(resolve_codex_fn, discover_agy_fn, list_agy_models_fn)`.
             handoff_store: Active HandoffStore instance for pending ticket counts.
             active_background_jobs: Count of currently running background tasks.
+            job_store: Optional JobStore instance for SQLite telemetry summary.
 
         Returns:
             Pretty-printed JSON string reporting bridge health and routing contracts.
@@ -309,6 +312,7 @@ class McpToolDispatcher:
             endpoint=agy_ep.base_url if agy_ep else None,
             csrf_token_redacted=True,
             independent_of_codex_cli_oauth=True,
+            circuit_breaker_open=AntigravityCircuitBreaker.check_open(consume_probe=False)[0],
         )
         codex_auth = CodexCliBoundaryHealthDict(
             auth_context=AuthContextKind.CODEX_CHATGPT_OAUTH,
@@ -319,6 +323,19 @@ class McpToolDispatcher:
         auth_boundaries = AuthBoundariesHealthDict(
             antigravity_rpc=agy_auth,
             codex_cli_oauth=codex_auth,
+        )
+        telemetry = (
+            job_store.summarize_telemetry()
+            if job_store is not None
+            else JobTelemetrySummaryDict(
+                total_jobs=0,
+                completed_jobs=0,
+                failed_jobs=0,
+                timed_out_unknown_jobs=0,
+                running_jobs=0,
+                cancelled_jobs=0,
+                avg_duration_seconds=0.0,
+            )
         )
         response = BridgeHealthResponseDict(
             ok=cli_ready,
@@ -336,5 +353,6 @@ class McpToolDispatcher:
             pending_sonnet_handoffs=pending_counts.get(TriadRole.SONNET, 0),
             pending_opus_handoffs=pending_counts.get(TriadRole.OPUS, 0),
             pending_codex_handoffs=pending_counts.get(TriadRole.CODEX, 0),
+            job_telemetry=telemetry,
         )
         return json.dumps(response, ensure_ascii=False, indent=2)

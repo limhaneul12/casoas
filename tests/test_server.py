@@ -17,11 +17,15 @@ import pytest
 import codex_collab_mcp.server as server_mod
 from codex_collab_mcp.agy_bridge import (
     AgyEndpoint,
+    AntigravityCircuitBreaker,
     extract_json_from_model_text,
     run_agy_model_prompt,
 )
 from codex_collab_mcp.ctl import HeterarchyCliController, _PluginEnvironmentManager
-from codex_collab_mcp.evidence.codegraph_slicer import slice_codegraph_symbols
+from codex_collab_mcp.evidence.codegraph_slicer import (
+    CodegraphContextSlicer,
+    slice_codegraph_symbols,
+)
 from codex_collab_mcp.evidence.triad_adjudicator import adjudicate_collaboration_and_consensus
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
@@ -1742,3 +1746,222 @@ def test_mechanical_and_sqlite_retention_contracts(tmp_path: Path) -> None:
 
     env_mgr = _PluginEnvironmentManager(repo_root=repo_root, home_dir=tmp_path)
     assert HeterarchyCliController(env_mgr=env_mgr).dispatch(["prune"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestration_enhancements_auto_codegraph_council_round2_circuit_breaker_and_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify auto CodeGraph discovery, Council Round 2 cross-exam, circuit breaker, and telemetry."""
+    _seed_test_codegraph_db(tmp_path)
+
+    # 1. Zero-config CodeGraph symbol discovery from files_inspected and inline_text
+    by_file = slice_codegraph_symbols(
+        str(tmp_path),
+        None,
+        files_inspected=["src/codex_collab_mcp/domain/routing_policy.py"],
+    )
+    assert "RoutingPolicyEngine" in by_file
+    assert "validate_and_resolve_route" in by_file
+
+    by_inline = slice_codegraph_symbols(
+        str(tmp_path),
+        None,
+        inline_text="class RoutingPolicyEngine:\n    pass",
+    )
+    assert "RoutingPolicyEngine" in by_inline
+
+    # 2. Quota-Aware Pre-Dispatch Guard & Adaptive Circuit Breaker
+    AntigravityCircuitBreaker.reset()
+    ep = AgyEndpoint("https://127.0.0.1:59999", "tok-test", 999)
+
+    def quota_zero_transport(
+        base_url: str,
+        csrf_token: str,
+        method: str,
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> JsonObject:
+        if method == "GetCascadeModelConfigData":
+            return {
+                "clientModelConfigs": [
+                    {
+                        "label": "Claude Sonnet 5.5",
+                        "modelId": "claude-sonnet-5-5-medium",
+                        "modelOrAlias": {"model": "MODEL_PLACEHOLDER_M35"},
+                        "quotaInfo": {"remainingFraction": 0.0},
+                    }
+                ]
+            }
+        raise AssertionError("GetModelResponse must not be called when quota is 0.0")
+
+    quota_res = await run_agy_model_prompt(
+        prompt="Test quota guard",
+        model="claude-sonnet-5-5-medium",
+        endpoint=ep,
+        rpc_transport=quota_zero_transport,
+    )
+    assert quota_res["ok"] is False
+    assert quota_res["error_code"] == "ANTIGRAVITY_QUOTA_EXHAUSTED"
+
+    def failing_transport(
+        base_url: str,
+        csrf_token: str,
+        method: str,
+        payload: JsonObject,
+        timeout_seconds: float,
+    ) -> JsonObject:
+        raise ConnectionRefusedError("local language_server connection refused")
+
+    for _ in range(3):
+        fail_res = await run_agy_model_prompt(
+            prompt="Trigger circuit breaker",
+            model="claude-sonnet-5-5-medium",
+            endpoint=ep,
+            rpc_transport=failing_transport,
+        )
+        assert fail_res["ok"] is False
+
+    cb_open, cb_rem, _ = AntigravityCircuitBreaker.check_open()
+    assert cb_open is True
+    assert cb_rem > 0.0
+
+    fast_fail = await run_agy_model_prompt(
+        prompt="Should fast-fail on open circuit",
+        model="claude-sonnet-5-5-medium",
+        endpoint=ep,
+        rpc_transport=failing_transport,
+    )
+    assert fast_fail["ok"] is False
+    assert fast_fail["error_code"] == "ANTIGRAVITY_CIRCUIT_OPEN"
+    AntigravityCircuitBreaker.reset()
+
+    # 3. Council Mode Conflict Auto-Adjudication Round (mode="council", max_rounds=2)
+    isolated_jobs = JobStore(state_dir=tmp_path / "council_jobs")
+    isolated_handoffs = HandoffStore(state_dir=tmp_path / "council_handoffs")
+    monkeypatch.setattr(server_mod, "job_store", isolated_jobs)
+    monkeypatch.setattr(server_mod, "handoff_store", isolated_handoffs)
+
+    codex_calls = 0
+
+    async def council_agy_mock(prompt: str, model: str = "sonnet", **kwargs: object) -> JsonObject:
+        is_r2 = "[Council Round 1 Cross-Examination" in prompt
+        if "argon" in model.lower():
+            return {
+                "ok": True,
+                "status": "succeeded",
+                "outcome_state": "confirmed_success",
+                "model_id": "gemini-4-argon",
+                "structured_output": {
+                    "verdict": "PASS",
+                    "summary": "Argon R2 consensus" if is_r2 else "Argon R1 pass",
+                },
+            }
+        return {
+            "ok": True,
+            "status": "succeeded",
+            "outcome_state": "confirmed_success",
+            "model_id": "claude-sonnet-5-5-medium",
+            "structured_output": {
+                "verdict": "PASS",
+                "summary": "Sonnet R2 consensus" if is_r2 else "Sonnet R1 pass",
+                "crafted_code": "def f() -> int: return 42",
+                "handoff_notes_for_codex_audit": "Verify R2",
+            },
+        }
+
+    async def council_codex_mock(
+        prompt: str,
+        schema_name: str,
+        output_schema: JsonObject | None,
+        **kwargs: object,
+    ) -> JsonObject:
+        nonlocal codex_calls
+        codex_calls += 1
+        verdict = "WARN" if codex_calls == 1 else "PASS"
+        return {
+            "ok": True,
+            "status": "succeeded",
+            "outcome_state": "confirmed_success",
+            "model": "gpt-6.1-sol",
+            "structured_output": {
+                "verdict": verdict,
+                "executive_critique": f"Codex council round {codex_calls} ({verdict}).",
+                "failing_test_cases": [],
+            },
+        }
+
+    monkeypatch.setattr(server_mod, "run_agy_model_prompt", council_agy_mock)
+    monkeypatch.setattr(server_mod, "_execute_with_engine", council_codex_mock)
+
+    council_raw = await heterarchy_triad_orchestrate(
+        task_spec="Council cross-examination test",
+        target_code_or_context="def f() -> int: return 42",
+        workspace_dir=str(tmp_path),
+        mode="council",
+        max_rounds=2,
+    )
+    council_res = json.loads(council_raw)
+    assert council_res["ok"] is True
+    assert council_res["consensus_status"] == "consensus_verified"
+    assert council_res["repair_rounds_executed"] == 1
+    assert codex_calls == 2
+
+    # 4. SQLite JobStore Telemetry Summary & Codex Red-Team Regression Checks
+    failed_j = isolated_jobs.create_job(task_type="audit", workspace_dir=str(tmp_path))
+    isolated_jobs.fail_job(failed_j.job_id, error="boom")
+    telemetry = isolated_jobs.summarize_telemetry()
+    assert telemetry["total_jobs"] >= 2
+    assert telemetry["completed_jobs"] >= 1
+    assert telemetry["failed_jobs"] == 1
+
+    # 5. Red-Team Regression: 12-symbol cap on explicit + inline symbols
+    explicit_12 = [f"sym_{i}" for i in range(12)]
+    discovered = CodegraphContextSlicer().discover_symbols(
+        str(tmp_path),
+        symbols=explicit_12,
+        inline_text="def overflow_sym():\n    pass\n",
+    )
+    assert discovered == explicit_12
+
+    # 6. Red-Team Regression: Council Round 2 timeout containment
+    async def timeout_sonnet(_prompt: str) -> JsonObject:
+        raise TimeoutError("Round 2 sonnet timeout")
+
+    async def healthy_peer(_prompt: str) -> JsonObject:
+        return {
+            "ok": True,
+            "status": "succeeded",
+            "outcome_state": "confirmed_success",
+            "structured_output": {"verdict": "PASS", "summary": "peer ok"},
+        }
+
+    (
+        r2_argon,
+        r2_sonnet,
+        r2_codex,
+        r2_rounds,
+    ) = await BridgeVerificationGateRunner().run_council_adjudication_round(
+        await healthy_peer(""),
+        await healthy_peer(""),
+        {
+            "ok": True,
+            "status": "succeeded",
+            "outcome_state": "confirmed_success",
+            "structured_output": {"verdict": "BLOCK", "summary": "initial block"},
+        },
+        max_rounds=2,
+        task_spec="Test containment",
+        invariants_and_rules="",
+        target_code_or_context="def f(): pass",
+        language="python",
+        claude_model="claude-sonnet-5-5-medium",
+        invoke_sonnet_fn=timeout_sonnet,
+        invoke_codex_fn=healthy_peer,
+        invoke_argon_fn=healthy_peer,
+    )
+    assert r2_rounds == 1
+    assert r2_sonnet["status"] == "timed_out_unknown"
+    assert r2_argon is not None and r2_argon["status"] == "succeeded"
+    assert r2_codex["status"] == "succeeded"

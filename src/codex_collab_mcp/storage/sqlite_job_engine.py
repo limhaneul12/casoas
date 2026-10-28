@@ -12,7 +12,7 @@ from collections.abc import Generator
 from pathlib import Path
 
 from codex_collab_mcp.evidence.workspace_digests import matches_workspace, resolve_workspace_dir
-from codex_collab_mcp.routing.contract_dicts import CodexJobRecordDict
+from codex_collab_mcp.routing.contract_dicts import CodexJobRecordDict, JobTelemetrySummaryDict
 from codex_collab_mcp.storage.job_record import CodexJobRecord
 
 _JOBS_SCHEMA_SQL = (
@@ -303,3 +303,54 @@ class _JobQueryStore(_JobStorageEngine):
                 pass
             records = sorted(seen.values(), key=lambda r: r.created_at, reverse=True)
             return [r.to_dict() for r in records[:bounded_limit]]
+
+    def summarize_telemetry(self) -> JobTelemetrySummaryDict:
+        """Compute aggregated execution telemetry across all persisted SQLite job rows.
+
+        Returns:
+            JobTelemetrySummaryDict containing counts by status and average duration.
+        """
+        with self._lock:
+            if not self.db_path.is_file():
+                return JobTelemetrySummaryDict(
+                    total_jobs=0,
+                    completed_jobs=0,
+                    failed_jobs=0,
+                    timed_out_unknown_jobs=0,
+                    running_jobs=0,
+                    cancelled_jobs=0,
+                    avg_duration_seconds=0.0,
+                )
+            try:
+                with self._connect() as conn:
+                    row = conn.execute(
+                        "SELECT COUNT(*), "
+                        "COALESCE(SUM(CASE WHEN status IN ('completed', 'succeeded') THEN 1 ELSE 0 END), 0), "
+                        "COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0), "
+                        "COALESCE(SUM(CASE WHEN status = 'timed_out_unknown' THEN 1 ELSE 0 END), 0), "
+                        "COALESCE(SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END), 0), "
+                        "COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0), "
+                        "COALESCE(AVG(CASE WHEN status != 'running' AND updated_at >= created_at "
+                        "THEN updated_at - created_at END), 0.0) FROM jobs"
+                    ).fetchone()
+            except sqlite3.Error:
+                row = None
+            if row is None:
+                return JobTelemetrySummaryDict(
+                    total_jobs=0,
+                    completed_jobs=0,
+                    failed_jobs=0,
+                    timed_out_unknown_jobs=0,
+                    running_jobs=0,
+                    cancelled_jobs=0,
+                    avg_duration_seconds=0.0,
+                )
+            return JobTelemetrySummaryDict(
+                total_jobs=int(row[0] or 0),
+                completed_jobs=int(row[1] or 0),
+                failed_jobs=int(row[2] or 0),
+                timed_out_unknown_jobs=int(row[3] or 0),
+                running_jobs=int(row[4] or 0),
+                cancelled_jobs=int(row[5] or 0),
+                avg_duration_seconds=round(float(row[6] or 0.0), 2),
+            )

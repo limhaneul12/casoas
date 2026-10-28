@@ -15,6 +15,7 @@ from codex_collab_mcp.job_store import JobStore
 from codex_collab_mcp.routing.contract_dicts import (
     CodexJobRecordDict,
     HandoffTicketDict,
+    JobTelemetrySummaryDict,
     ModelSpecDict,
     PythonRuntimeInfoDict,
 )
@@ -222,6 +223,7 @@ class AgyRpcBoundaryHealthDict(TypedDict):
     endpoint: str | None
     csrf_token_redacted: bool
     independent_of_codex_cli_oauth: bool
+    circuit_breaker_open: bool
 
 
 class CodexCliBoundaryHealthDict(TypedDict):
@@ -272,6 +274,7 @@ class BridgeHealthResponseDict(TypedDict):
     pending_sonnet_handoffs: int
     pending_opus_handoffs: int
     pending_codex_handoffs: int
+    job_telemetry: JobTelemetrySummaryDict
 
 
 class DecisionCallerContentDict(TypedDict):

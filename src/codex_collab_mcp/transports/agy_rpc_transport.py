@@ -64,6 +64,70 @@ class AgyEndpoint:
 DiscoverEndpointFn = Callable[[], Awaitable[AgyEndpoint | None]]
 
 
+class AntigravityCircuitBreaker:
+    """Thread-safe adaptive circuit breaker for local Antigravity LanguageServer RPC."""
+
+    _lock: threading.Lock = threading.Lock()
+    _consecutive_failures: int = 0
+    _open_until_mono: float = 0.0
+    _probe_in_flight: bool = False
+    _last_error: str = ""
+    _FAILURE_THRESHOLD: int = 3
+    _COOLDOWN_SECONDS: float = 30.0
+
+    @classmethod
+    def record_success(cls) -> None:
+        """Reset failure counters and close the circuit after a healthy RPC response."""
+        with cls._lock:
+            cls._consecutive_failures = 0
+            cls._open_until_mono = 0.0
+            cls._probe_in_flight = False
+            cls._last_error = ""
+
+    @classmethod
+    def record_failure(cls, error_message: str) -> None:
+        """Record an RPC failure and open the circuit if the threshold is reached.
+
+        Args:
+            error_message: Redacted error description from the failed RPC call.
+        """
+        with cls._lock:
+            cls._probe_in_flight = False
+            cls._consecutive_failures += 1
+            cls._last_error = error_message
+            if cls._consecutive_failures >= cls._FAILURE_THRESHOLD:
+                cls._open_until_mono = time.monotonic() + cls._COOLDOWN_SECONDS
+
+    @classmethod
+    def check_open(cls, *, consume_probe: bool = True) -> tuple[bool, float, str]:
+        """Check circuit state and admit at most one half-open recovery probe after cooldown.
+
+        Args:
+            consume_probe: Whether to transition from expired cooldown to half-open probe.
+
+        Returns:
+            Tuple of `(is_open, remaining_cooldown_seconds, last_error_message)`.
+        """
+        with cls._lock:
+            if cls._open_until_mono <= 0.0:
+                if cls._probe_in_flight:
+                    return True, 1.0, cls._last_error
+                return False, 0.0, cls._last_error
+            rem = cls._open_until_mono - time.monotonic()
+            if rem > 0.0:
+                return True, round(rem, 2), cls._last_error
+            if not consume_probe:
+                return False, 0.0, cls._last_error
+            cls._open_until_mono = 0.0
+            cls._probe_in_flight = True
+            return False, 0.0, cls._last_error
+
+    @classmethod
+    def reset(cls) -> None:
+        """Clear all circuit breaker state (used on server restart or test setup)."""
+        cls.record_success()
+
+
 class AntigravityRpcClient:
     """Low-level Connect-RPC client and local language_server process endpoint discovery."""
 
@@ -417,6 +481,12 @@ class AntigravityModelCatalog:
             mid = entry["model_id"].lower()
             ph = entry["placeholder"]
             if mid == target_id and ph:
+                rem_quota = entry["remaining_quota"]
+                if rem_quota is not None and rem_quota <= 0.0:
+                    raise PermissionError(
+                        f"Antigravity model '{mid}' quota is exhausted "
+                        f"(remaining_quota={rem_quota})."
+                    )
                 return (mid, ph)
 
         if spec is None or not spec.placeholder:

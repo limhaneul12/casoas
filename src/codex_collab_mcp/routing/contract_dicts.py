@@ -147,3 +147,15 @@ class StderrAuthClassificationDict(TypedDict):
     isolated_external_mcp_oauth_warnings: list[ExternalMcpOAuthWarningDict]
     antigravity_rpc_affected: bool
     auto_credential_refresh_performed: bool
+
+
+class JobTelemetrySummaryDict(TypedDict):
+    """Aggregated SQLite job execution telemetry summary."""
+
+    total_jobs: int
+    completed_jobs: int
+    failed_jobs: int
+    timed_out_unknown_jobs: int
+    running_jobs: int
+    cancelled_jobs: int
+    avg_duration_seconds: float

@@ -81,9 +81,17 @@ class _TriadExecutionContext:
             req.language,
             normalized_mode,
         )
+        has_cg_inputs = bool(
+            req.symbols_inspected or req.files_inspected or req.target_code_or_context.strip()
+        )
         sliced = (
-            slice_codegraph_symbols(resolved_workspace, req.symbols_inspected)
-            if req.symbols_inspected
+            slice_codegraph_symbols(
+                resolved_workspace,
+                req.symbols_inspected,
+                files_inspected=req.files_inspected,
+                inline_text=req.target_code_or_context,
+            )
+            if has_cg_inputs
             else ""
         )
         effective_target_code = (
@@ -121,14 +129,17 @@ class _TriadExecutionContext:
             execute_fn=execute_fn,
         )
 
-    async def invoke_sonnet(self) -> JsonObject:
+    async def invoke_sonnet(self, prompt_override: str | None = None) -> JsonObject:
         """Invoke the Claude Sonnet/Opus craftsman pole with this context's configuration.
+
+        Args:
+            prompt_override: Optional custom prompt string (e.g. for Round 2 adjudication).
 
         Returns:
             Claude role response dictionary.
         """
         return await self.run_agy_fn(
-            prompt=self.sonnet_prompt,
+            prompt=prompt_override or self.sonnet_prompt,
             model=self.req.claude_model,
             expect_json=True,
             timeout_seconds=self.req.timeout_seconds,
@@ -318,6 +329,27 @@ class TriadOrchestrationService:
         sonnet_res = resumed[TriadRole.SONNET] if sonnet_task is None else sonnet_task.result()
         codex_res = resumed[TriadRole.CODEX] if codex_task is None else codex_task.result()
         argon_res = resumed.get(TriadRole.ARGON) if argon_task is None else argon_task.result()
+        repair_rounds: int | None = None
+        if req.max_rounds > 1 and not resumed:
+            (
+                argon_res,
+                sonnet_res,
+                codex_res,
+                repair_rounds,
+            ) = await self._gate_runner.run_council_adjudication_round(
+                argon_res,
+                sonnet_res,
+                codex_res,
+                max_rounds=req.max_rounds,
+                task_spec=req.task_spec,
+                invariants_and_rules=req.invariants_and_rules,
+                target_code_or_context=ctx.effective_target_code,
+                language=req.language,
+                claude_model=req.claude_model,
+                invoke_sonnet_fn=ctx.invoke_sonnet,
+                invoke_codex_fn=ctx.invoke_codex,
+                invoke_argon_fn=lambda extra: ctx.invoke_argon(self._resolver, extra),
+            )
         bridge_gates = (
             await self._gate_runner.run_allowlisted_gates(ctx.workspace_dir, req.timeout_seconds)
             if req.run_verification_gates
@@ -326,12 +358,13 @@ class TriadOrchestrationService:
         return self._finalize_triad_snapshot(
             ctx,
             mode=OrchestrationMode.COUNCIL,
-            provided_context_or_code=f"{req.task_spec}\n{ctx.effective_target_code}",
+            provided_context_or_code=f"{req.task_spec}\n{req.target_code_or_context}",
             argon_res=argon_res,
             sonnet_res=sonnet_res,
             codex_res=codex_res,
             codex_verdict=extract_verdict(codex_res),
             resumed_roles=sorted(resumed.keys()) if resumed else None,
+            repair_rounds_executed=repair_rounds,
             bridge_executed_gates=bridge_gates,
         )
 
@@ -370,6 +403,7 @@ class TriadOrchestrationService:
         sonnet_summary = str(s_dict.get("summary", ""))
         handoff_notes = str(s_dict.get("handoff_notes_for_codex_audit", ""))
         audit_target = crafted_code or ctx.effective_target_code or req.task_spec
+        evidence_target = crafted_code or req.target_code_or_context or req.task_spec
 
         if TriadRole.CODEX in resumed:
             codex_res = resumed[TriadRole.CODEX]
@@ -413,7 +447,9 @@ class TriadOrchestrationService:
             )
             if isinstance(rep_struct := sonnet_res.get("structured_output"), dict):
                 sonnet_summary = str(rep_struct.get("summary", sonnet_summary))
-                audit_target = str(rep_struct.get("crafted_code", "")) or audit_target
+                rep_crafted = str(rep_struct.get("crafted_code", ""))
+                audit_target = rep_crafted or audit_target
+                evidence_target = rep_crafted or evidence_target
 
         codex_critique = ""
         if isinstance(c_struct := codex_res.get("structured_output"), dict):
@@ -439,7 +475,7 @@ class TriadOrchestrationService:
         return self._finalize_triad_snapshot(
             ctx,
             mode=OrchestrationMode.PIPELINE,
-            provided_context_or_code=audit_target,
+            provided_context_or_code=evidence_target,
             argon_res=argon_res,
             sonnet_res=sonnet_res,
             codex_res=codex_res,

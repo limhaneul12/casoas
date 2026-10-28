@@ -26,6 +26,7 @@ from codex_collab_mcp.routing.receipt_budget import evaluate_budget_envelope
 from codex_collab_mcp.schemas import JsonObject, as_json_object
 from codex_collab_mcp.transports.agy_rpc_transport import (
     AgyEndpoint,
+    AntigravityCircuitBreaker,
     AntigravityModelCatalog,
     AntigravityRpcClient,
     RpcTransportFn,
@@ -39,6 +40,7 @@ extract_json_from_model_text = AntigravityModelCatalog.extract_json_from_model_t
 __all__ = [
     "DEFAULT_CLAUDE_MODEL",
     "AgyEndpoint",
+    "AntigravityCircuitBreaker",
     "discover_agy_endpoint",
     "extract_json_from_model_text",
     "list_agy_models",
@@ -196,67 +198,111 @@ async def run_agy_model_prompt(
     else:
         req_id = (request_id or "").strip() or f"cdx-{uuid.uuid4().hex[:10]}"
 
+    def _early_fail(
+        err_msg: str,
+        term_reason: str,
+        *,
+        actual_model: str = "",
+        rpc_connected: bool = False,
+        error_code: str | None = None,
+    ) -> JsonObject:
+        """Build and persist a confirmed early-failure receipt and payload.
+
+        Args:
+            err_msg: Redacted failure message.
+            term_reason: Budget termination reason string.
+            actual_model: Resolved model string or empty string.
+            rpc_connected: Whether the local LanguageServer endpoint was connected.
+            error_code: Optional structured error code.
+
+        Returns:
+            Structured failure response dictionary with receipt and budget envelope.
+        """
+        ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        duration = round(time.monotonic() - started_mono, 2)
+        receipt = build_execution_receipt(
+            request_id=req_id,
+            idempotency_key=idempotency_key,
+            route=route,
+            actual_model=actual_model,
+            call_path=call_path,
+            started_at_iso=started_iso,
+            ended_at_iso=ended_iso,
+            duration_seconds=duration,
+            status=JobStatusKind.FAILED,
+            outcome_state=OutcomeStateKind.CONFIRMED_FAILURE,
+            attempt_count=attempt_count,
+            result_ref=f"job://{req_id}",
+            failure_reason=err_msg,
+        )
+        if job_store is not None:
+            job_store.fail_job(req_id, error=err_msg, receipt=receipt)
+        budget = evaluate_budget_envelope(
+            prompt_text=prompt,
+            max_input_bytes=max_input_bytes,
+            timeout_seconds=timeout_seconds,
+            elapsed_seconds=duration,
+            termination_reason=term_reason,
+        )
+        auth_b = AntigravityModelCatalog.build_auth_boundary(rpc_connected)
+        out: JsonObject = {
+            "ok": False,
+            "status": JobStatusKind.FAILED,
+            "outcome_state": OutcomeStateKind.CONFIRMED_FAILURE,
+            "request_id": req_id,
+            "job_id": req_id,
+            "provider": route.provider,
+            "engine": EngineKind.ANTIGRAVITY_LOCAL_RPC,
+            "model_requested": model,
+            "model_id": route.resolved_model,
+            "error": err_msg,
+            "receipt": as_json_object(receipt),
+            "budget": as_json_object(budget),
+            "auth_boundary": as_json_object(auth_b),
+        }
+        if error_code is not None:
+            out["error_code"] = error_code
+        return out
+
+    cb_open, cb_rem, cb_last_err = AntigravityCircuitBreaker.check_open()
+    if cb_open:
+        return _early_fail(
+            f"Antigravity RPC circuit breaker is OPEN (cooldown={cb_rem}s remaining). "
+            f"Last failure: {cb_last_err}",
+            "circuit_breaker_open",
+            error_code="ANTIGRAVITY_CIRCUIT_OPEN",
+        )
+
     try:
         resolved_ep = endpoint or await discover_agy_endpoint()
         if resolved_ep is None:
-            ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-            duration = round(time.monotonic() - started_mono, 2)
-            err_msg = (
+            unavail_msg = (
                 "Could not discover a running local Antigravity language_server process. "
                 "Ensure Antigravity IDE / App is open."
             )
-            receipt = build_execution_receipt(
-                request_id=req_id,
-                idempotency_key=idempotency_key,
-                route=route,
-                actual_model="",
-                call_path=call_path,
-                started_at_iso=started_iso,
-                ended_at_iso=ended_iso,
-                duration_seconds=duration,
-                status=JobStatusKind.FAILED,
-                outcome_state=OutcomeStateKind.CONFIRMED_FAILURE,
-                attempt_count=attempt_count,
-                result_ref=f"job://{req_id}",
-                failure_reason=err_msg,
-            )
-            if job_store is not None:
-                job_store.fail_job(req_id, error=err_msg, receipt=receipt)
-            return {
-                "ok": False,
-                "status": JobStatusKind.FAILED,
-                "outcome_state": OutcomeStateKind.CONFIRMED_FAILURE,
-                "request_id": req_id,
-                "job_id": req_id,
-                "provider": route.provider,
-                "engine": EngineKind.ANTIGRAVITY_LOCAL_RPC,
-                "model_requested": model,
-                "model_id": route.resolved_model,
-                "error": err_msg,
-                "receipt": as_json_object(receipt),
-                "budget": as_json_object(
-                    evaluate_budget_envelope(
-                        prompt_text=prompt,
-                        max_input_bytes=max_input_bytes,
-                        timeout_seconds=timeout_seconds,
-                        elapsed_seconds=duration,
-                        termination_reason="endpoint_unavailable",
-                    )
-                ),
-                "auth_boundary": as_json_object(AntigravityModelCatalog.build_auth_boundary(False)),
-            }
-
+            AntigravityCircuitBreaker.record_failure(unavail_msg)
+            return _early_fail(unavail_msg, "endpoint_unavailable")
         resolved_model_id, placeholder = await AntigravityModelCatalog.resolve_model_placeholder(
             requested_model=model,
             endpoint=resolved_ep,
             rpc_transport=rpc_transport,
             discover_fn=discover_agy_endpoint,
         )
+    except PermissionError as exc:
+        AntigravityCircuitBreaker.record_success()
+        return _early_fail(
+            redact_sensitive_text(str(exc)),
+            "quota_exhausted",
+            actual_model=route.resolved_model,
+            rpc_connected=True,
+            error_code="ANTIGRAVITY_QUOTA_EXHAUSTED",
+        )
     except asyncio.CancelledError:
         if job_store is not None:
             job_store.cancel_job(req_id, reason="Antigravity RPC request cancelled.")
         raise
     except Exception as exc:
+        AntigravityCircuitBreaker.record_failure(redact_sensitive_text(str(exc)))
         if job_store is not None:
             job_store.fail_job(req_id, error=redact_sensitive_text(str(exc)))
         raise
@@ -320,6 +366,7 @@ async def run_agy_model_prompt(
             result_ref=f"job://{req_id}",
             failure_reason=err_msg,
         )
+        AntigravityCircuitBreaker.record_failure(err_msg)
         budget = evaluate_budget_envelope(
             prompt_text=prompt,
             max_input_bytes=max_input_bytes,
@@ -361,6 +408,7 @@ async def run_agy_model_prompt(
         }
 
     ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    AntigravityCircuitBreaker.record_success()
     duration = round(time.monotonic() - started_mono, 2)
     raw_response = str(rpc_resp.get("response", ""))
     reported_model_raw = rpc_resp.get("modelId") or rpc_resp.get("actualModel")

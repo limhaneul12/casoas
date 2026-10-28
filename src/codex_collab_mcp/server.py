@@ -715,7 +715,9 @@ async def codex_bridge_health() -> str:
         Pretty-printed JSON string reporting bridge health and routing contracts.
     """
     probes = (resolve_codex_binary, discover_agy_endpoint, list_agy_models)
-    return await _tool_dispatcher.check_bridge_health(probes, handoff_store, len(_background_tasks))
+    return await _tool_dispatcher.check_bridge_health(
+        probes, handoff_store, len(_background_tasks), job_store=job_store
+    )
 
 
 def main() -> None:

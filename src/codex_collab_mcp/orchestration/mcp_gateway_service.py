@@ -306,11 +306,18 @@ class McpExecutionGateway:
             Pretty-printed JSON string containing the execution result or job handle.
         """
         schema_name, output_schema = _CODEX_TOOL_SCHEMAS[req.task_type]
+        has_cg_inputs = bool(
+            req.symbols_inspected or req.files_inspected or req.provided_context_or_code.strip()
+        )
         sliced = (
             await asyncio.to_thread(
-                slice_codegraph_symbols, req.workspace_dir, req.symbols_inspected
+                slice_codegraph_symbols,
+                req.workspace_dir,
+                req.symbols_inspected,
+                files_inspected=req.files_inspected,
+                inline_text=req.provided_context_or_code,
             )
-            if req.symbols_inspected
+            if has_cg_inputs
             else ""
         )
         effective_prompt = (
@@ -382,11 +389,18 @@ class McpExecutionGateway:
         Returns:
             Pretty-printed JSON string containing the Claude craft result and receipt.
         """
+        has_cg_inputs = bool(
+            req.symbols_inspected or req.files_inspected or req.target_code_or_context.strip()
+        )
         sliced = (
             await asyncio.to_thread(
-                slice_codegraph_symbols, req.workspace_dir, req.symbols_inspected
+                slice_codegraph_symbols,
+                req.workspace_dir,
+                req.symbols_inspected,
+                files_inspected=req.files_inspected,
+                inline_text=req.target_code_or_context,
             )
-            if req.symbols_inspected
+            if has_cg_inputs
             else ""
         )
         effective_ctx = (

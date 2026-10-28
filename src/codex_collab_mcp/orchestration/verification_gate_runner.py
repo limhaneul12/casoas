@@ -306,3 +306,137 @@ class BridgeVerificationGateRunner:
             codex_verdict = extract_verdict(codex_res)
 
         return sonnet_res, codex_res, codex_verdict, repair_rounds_executed
+
+    async def run_council_adjudication_round(
+        self,
+        argon_res: JsonObject | None,
+        sonnet_res: JsonObject,
+        codex_res: JsonObject,
+        *,
+        max_rounds: int,
+        task_spec: str,
+        invariants_and_rules: str,
+        target_code_or_context: str,
+        language: str,
+        claude_model: str,
+        invoke_sonnet_fn: Callable[[str], Coroutine[object, object, JsonObject]],
+        invoke_codex_fn: Callable[[str], Coroutine[object, object, JsonObject]],
+        invoke_argon_fn: Callable[[str], Coroutine[object, object, JsonObject | None]],
+    ) -> tuple[JsonObject | None, JsonObject, JsonObject, int]:
+        """Run a Round 2 Council cross-examination when Round 1 verdicts conflict or block.
+
+        Args:
+            argon_res: Round 1 Gemini 4 Argon response dictionary or None.
+            sonnet_res: Round 1 Claude Sonnet/Opus response dictionary.
+            codex_res: Round 1 OpenAI Codex response dictionary.
+            max_rounds: Maximum council rounds requested (`1..3`).
+            task_spec: Task specification string.
+            invariants_and_rules: Invariants and repository rules string.
+            target_code_or_context: Target code or context string.
+            language: Target programming language.
+            claude_model: Claude Medium-tier model identifier.
+            invoke_sonnet_fn: Async callable taking a Round 2 Sonnet prompt.
+            invoke_codex_fn: Async callable taking a Round 2 Codex prompt.
+            invoke_argon_fn: Async callable taking Round 1 peer context for Argon.
+
+        Returns:
+            Tuple of `(argon_res, sonnet_res, codex_res, repair_rounds_executed)`.
+        """
+        if max_rounds <= 1:
+            return argon_res, sonnet_res, codex_res, 0
+        states = (
+            map_response_to_role_state(argon_res),
+            map_response_to_role_state(sonnet_res),
+            map_response_to_role_state(codex_res),
+        )
+        if any(s != RoleExecutionState.SUCCEEDED for s in states):
+            return argon_res, sonnet_res, codex_res, 0
+
+        v_argon = extract_verdict(argon_res)
+        v_sonnet = extract_verdict(sonnet_res)
+        v_codex = extract_verdict(codex_res)
+        verdicts = (v_argon, v_sonnet, v_codex)
+        has_conflict = len(set(verdicts)) > 1 or AuditVerdict.BLOCK in verdicts
+        if not has_conflict:
+            return argon_res, sonnet_res, codex_res, 0
+
+        def _extract_summary(resp: JsonObject | None) -> str:
+            """Extract the summary or executive_critique from a role response.
+
+            Args:
+                resp: Role response dictionary or None.
+
+            Returns:
+                Extracted summary string.
+            """
+            if not isinstance(resp, dict):
+                return ""
+            st = resp.get("structured_output")
+            if isinstance(st, dict):
+                return str(st.get("summary") or st.get("executive_critique") or "")
+            return ""
+
+        cross_exam_digest = (
+            "[Council Round 1 Cross-Examination — Peer Verdicts & Critiques]:\n"
+            f"- Gemini 4 Argon (verdict={v_argon}): {_extract_summary(argon_res)}\n"
+            f"- Claude Sonnet/Opus (verdict={v_sonnet}): {_extract_summary(sonnet_res)}\n"
+            f"- OpenAI Codex (verdict={v_codex}): {_extract_summary(codex_res)}\n"
+            "Re-evaluate the target code and peer critiques to reach a verified Round 2 verdict."
+        )
+        r2_sonnet_prompt = build_claude_craft_prompt(
+            f"{task_spec}\n\n{cross_exam_digest}",
+            target_code_or_context,
+            invariants_and_rules,
+            language,
+            claude_model,
+        )
+        r2_codex_prompt = build_adversarial_audit_prompt(
+            target_code_or_diff=target_code_or_context or task_spec,
+            design_rationale=f"{task_spec}\n\nInvariants:\n{invariants_and_rules}",
+            attack_vectors=[],
+            context_notes=cross_exam_digest,
+        )
+
+        async def _safe_call(
+            fn: Callable[[str], Coroutine[object, object, JsonObject | None]],
+            arg: str,
+        ) -> JsonObject:
+            """Invoke a Round 2 role callable, converting provider errors into role outcomes.
+
+            Args:
+                fn: Async role invocation callable.
+                arg: Prompt or extra context string.
+
+            Returns:
+                Role response dictionary or structured failure/timeout dictionary.
+            """
+            try:
+                res = await fn(arg)
+                if res is None:
+                    return {
+                        "ok": False,
+                        "status": JobStatusKind.FAILED,
+                        "outcome_state": OutcomeStateKind.CONFIRMED_FAILURE,
+                        "error": "Round 2 role returned no response.",
+                    }
+                return res
+            except TimeoutError as exc:
+                return {
+                    "ok": False,
+                    "status": JobStatusKind.TIMED_OUT_UNKNOWN,
+                    "outcome_state": OutcomeStateKind.OUTCOME_UNKNOWN,
+                    "error": f"Round 2 provider timeout: {exc}",
+                }
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "status": JobStatusKind.FAILED,
+                    "outcome_state": OutcomeStateKind.CONFIRMED_FAILURE,
+                    "error": f"Round 2 provider error: {exc}",
+                }
+
+        async with asyncio.TaskGroup() as tg:
+            s_task = tg.create_task(_safe_call(invoke_sonnet_fn, r2_sonnet_prompt))
+            c_task = tg.create_task(_safe_call(invoke_codex_fn, r2_codex_prompt))
+            a_task = tg.create_task(_safe_call(invoke_argon_fn, cross_exam_digest))
+        return a_task.result(), s_task.result(), c_task.result(), 1
