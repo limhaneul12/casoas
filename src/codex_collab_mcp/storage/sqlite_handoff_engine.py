@@ -39,20 +39,24 @@ class _HandoffStorageBase:
     def __init__(
         self,
         state_dir: Path | None = None,
+        max_retained_tickets: int = 1000,
         lock: threading.RLock | None = None,
     ) -> None:
         """Initialize the handoff storage base without eagerly creating directories.
 
         Args:
             state_dir: Optional directory path for storing the SQLite database.
+            max_retained_tickets: Maximum resolved tickets retained in SQLite before pruning.
             lock: Optional shared reentrant lock from a subclass.
         """
         self.state_dir: Path = state_dir or (
             Path.home() / ".cache" / "codex-collab-mcp" / "handoffs"
         )
         self.db_path: Path = self.state_dir / "handoffs.db"
+        self.max_retained_tickets: int = max(1, max_retained_tickets)
         self._lock: threading.RLock = lock if lock is not None else threading.RLock()
         self._schema_ready: bool = False
+        self._write_count: int = 0
 
     def ensure_db_initialized(self) -> Path:
         """Lazily create the handoff directory and initialize the SQLite WAL schema.
@@ -110,8 +114,54 @@ class _HandoffStorageBase:
                         "INSERT OR REPLACE INTO handoffs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         row,
                     )
+                    self._write_count += 1
+                    if self._write_count % 64 == 0:
+                        conn.execute(
+                            "DELETE FROM handoffs WHERE status IN ('completed', 'rejected') "
+                            "AND ticket_id NOT IN ("
+                            "SELECT ticket_id FROM handoffs "
+                            "WHERE status IN ('completed', 'rejected') "
+                            "ORDER BY updated_at DESC LIMIT ?)",
+                            (self.max_retained_tickets,),
+                        )
             except sqlite3.Error as exc:
                 raise OSError(f"SQLite handoff persistence failed: {exc}") from exc
+
+    def prune_resolved_tickets(
+        self,
+        max_retained: int | None = None,
+        wal_checkpoint: bool = False,
+    ) -> int:
+        """Delete old resolved handoff tickets beyond `max_retained` and optionally truncate WAL.
+
+        Args:
+            max_retained: Maximum number of newest tickets to keep (defaults to `max_retained_tickets`).
+            wal_checkpoint: Whether to run `PRAGMA wal_checkpoint(TRUNCATE)` after pruning.
+
+        Returns:
+            Number of resolved (`completed` or `rejected`) ticket rows deleted from SQLite.
+        """
+        keep = max(1, max_retained if max_retained is not None else self.max_retained_tickets)
+        with self._lock:
+            if not self.db_path.is_file():
+                return 0
+            try:
+                with self._connect() as conn:
+                    with conn:
+                        cur = conn.execute(
+                            "DELETE FROM handoffs WHERE status IN ('completed', 'rejected') "
+                            "AND ticket_id NOT IN ("
+                            "SELECT ticket_id FROM handoffs "
+                            "WHERE status IN ('completed', 'rejected') "
+                            "ORDER BY updated_at DESC LIMIT ?)",
+                            (keep,),
+                        )
+                        deleted = max(0, cur.rowcount)
+                    if wal_checkpoint:
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    return deleted
+            except sqlite3.Error:
+                return 0
 
     def _load_ticket(self, ticket_id: str) -> HandoffTicket | None:
         """Load and deserialize a handoff ticket from SQLite by ticket ID.

@@ -19,14 +19,25 @@ from codex_collab_mcp.storage.sqlite_job_engine import _JobQueryStore
 class JobStore(_JobQueryStore):
     """Thread-safe in-memory and SQLite-backed job store for durable requests and timeouts."""
 
-    def __init__(self, state_dir: Path | None = None, max_cached_jobs: int = 512) -> None:
-        """Initialize the job store with an explicit reentrant lock and LRU cache limit.
+    def __init__(
+        self,
+        state_dir: Path | None = None,
+        max_cached_jobs: int = 512,
+        max_retained_jobs: int = 1000,
+    ) -> None:
+        """Initialize the job store with an explicit reentrant lock and retention limits.
 
         Args:
             state_dir: Optional directory path for the SQLite `jobs.db` file.
             max_cached_jobs: Maximum number of records retained in the in-memory LRU cache.
+            max_retained_jobs: Maximum terminal job rows retained in SQLite before pruning.
         """
-        super().__init__(state_dir, max_cached_jobs, lock=threading.RLock())
+        super().__init__(
+            state_dir,
+            max_cached_jobs,
+            max_retained_jobs=max_retained_jobs,
+            lock=threading.RLock(),
+        )
 
     def create_job(
         self,

@@ -35,6 +35,7 @@ class _JobStorageEngine:
         self,
         state_dir: Path | None = None,
         max_cached_jobs: int = 512,
+        max_retained_jobs: int = 1000,
         lock: threading.RLock | None = None,
     ) -> None:
         """Initialize the storage engine without eagerly creating directories on disk.
@@ -42,14 +43,17 @@ class _JobStorageEngine:
         Args:
             state_dir: Optional directory path for the SQLite database file.
             max_cached_jobs: Maximum number of records retained in the in-memory LRU cache.
+            max_retained_jobs: Maximum terminal job rows retained in SQLite before pruning.
             lock: Optional shared reentrant lock from a subclass.
         """
         self.state_dir: Path = state_dir or (Path.home() / ".cache" / "codex-collab-mcp" / "jobs")
         self.db_path: Path = self.state_dir / "jobs.db"
         self.max_cached_jobs: int = max(1, max_cached_jobs)
+        self.max_retained_jobs: int = max(1, max_retained_jobs)
         self._lock: threading.RLock = lock if lock is not None else threading.RLock()
         self._jobs: OrderedDict[str, CodexJobRecord] = OrderedDict()
         self._schema_ready: bool = False
+        self._write_count: int = 0
 
     def ensure_db_initialized(self) -> Path:
         """Lazily create the backing directory and initialize the SQLite WAL schema.
@@ -108,8 +112,55 @@ class _JobStorageEngine:
             try:
                 with self._connect() as conn, conn:
                     conn.execute("INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?,?,?)", p1 + p2)
+                    self._write_count += 1
+                    if self._write_count % 64 == 0:
+                        conn.execute(
+                            "DELETE FROM jobs WHERE status != 'running' AND job_id NOT IN ("
+                            "SELECT job_id FROM jobs WHERE status != 'running' "
+                            "ORDER BY created_at DESC LIMIT ?)",
+                            (self.max_retained_jobs,),
+                        )
             except sqlite3.Error as exc:
                 raise OSError(f"SQLite job persistence failed: {exc}") from exc
+
+    def prune_completed_jobs(
+        self,
+        max_retained: int | None = None,
+        wal_checkpoint: bool = False,
+    ) -> int:
+        """Delete old terminal job records beyond `max_retained` and optionally truncate WAL.
+
+        Args:
+            max_retained: Maximum number of newest jobs to keep (defaults to `max_retained_jobs`).
+            wal_checkpoint: Whether to run `PRAGMA wal_checkpoint(TRUNCATE)` after pruning.
+
+        Returns:
+            Number of terminal job rows deleted from SQLite.
+        """
+        keep = max(1, max_retained if max_retained is not None else self.max_retained_jobs)
+        with self._lock:
+            if not self.db_path.is_file():
+                return 0
+            try:
+                with self._connect() as conn:
+                    with conn:
+                        cur = conn.execute(
+                            "DELETE FROM jobs WHERE status != 'running' AND job_id NOT IN ("
+                            "SELECT job_id FROM jobs WHERE status != 'running' "
+                            "ORDER BY created_at DESC LIMIT ?)",
+                            (keep,),
+                        )
+                        deleted = max(0, cur.rowcount)
+                        if deleted > 0:
+                            kept_rows = conn.execute("SELECT job_id FROM jobs").fetchall()
+                            kept_ids = {str(r[0]) for r in kept_rows}
+                            for jid in [k for k in self._jobs if k not in kept_ids]:
+                                self._jobs.pop(jid, None)
+                    if wal_checkpoint:
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    return deleted
+            except sqlite3.Error:
+                return 0
 
     def get_persisted_job(self, job_id: str) -> CodexJobRecord | None:
         """Read a job record directly from SQLite without consulting or mutating the cache.

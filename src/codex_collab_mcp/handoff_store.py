@@ -19,13 +19,22 @@ from codex_collab_mcp.storage.sqlite_handoff_engine import _HandoffStorageBase
 class HandoffStore(_HandoffStorageBase):
     """Thread-safe SQLite-backed blackboard store for cross-agent handoff tickets."""
 
-    def __init__(self, state_dir: Path | None = None) -> None:
-        """Initialize the handoff store with an explicit reentrant lock.
+    def __init__(
+        self,
+        state_dir: Path | None = None,
+        max_retained_tickets: int = 1000,
+    ) -> None:
+        """Initialize the handoff store with an explicit reentrant lock and retention limit.
 
         Args:
             state_dir: Optional directory path for the SQLite `handoffs.db` file.
+            max_retained_tickets: Maximum resolved tickets retained in SQLite before pruning.
         """
-        super().__init__(state_dir, lock=threading.RLock())
+        super().__init__(
+            state_dir,
+            max_retained_tickets=max_retained_tickets,
+            lock=threading.RLock(),
+        )
 
     def create_ticket(
         self,

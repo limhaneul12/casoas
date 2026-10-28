@@ -1696,3 +1696,99 @@ async def test_triad_role_snapshot_model_ids_and_job_telemetry(
                 workspace_dir=str(tmp_path),
                 resolve_binary_fn=lambda: "/opt/homebrew/bin/codex",
             )
+
+
+def test_mechanical_and_sqlite_retention_contracts(tmp_path: Path) -> None:
+    """Verify mechanical architecture contracts and SQLite WAL retention pruning + checkpoint."""
+    import ast
+    import subprocess
+    import sys
+
+    from codex_collab_mcp.ctl import HeterarchyCliController
+
+    repo_root = Path(__file__).resolve().parents[1]
+    harness_script = repo_root / ".agents" / "python_dev_harness" / "verify_mechanical_contracts.py"
+    if harness_script.is_file():
+        res = subprocess.run(  # noqa: S603
+            [sys.executable, str(harness_script)],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res.returncode == 0, f"Mechanical harness failed:\n{res.stdout}\n{res.stderr}"
+
+    src_root = repo_root / "src" / "codex_collab_mcp"
+    for pkg_dir in [src_root, *[p for p in src_root.rglob("*") if p.is_dir()]]:
+        if pkg_dir.name == "__pycache__":
+            continue
+        direct_py = [p for p in pkg_dir.glob("*.py") if p.name != "__init__.py"]
+        assert len(direct_py) <= 10, f"Package {pkg_dir} exceeds 10 direct .py modules"
+
+    for py_file in sorted(src_root.rglob("*.py")):
+        source = py_file.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                assert node.func.id not in ("getattr", "hasattr", "setattr"), (
+                    f"Forbidden dynamic attribute call {node.func.id} in {py_file}"
+                )
+            if isinstance(node, ast.ClassDef):
+                methods = [
+                    n
+                    for n in node.body
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and not (n.name.startswith("__") and n.name.endswith("__"))
+                    and not any(
+                        isinstance(d, ast.Name) and d.id == "property" for d in n.decorator_list
+                    )
+                ]
+                assert len(methods) <= 6, (
+                    f"Class {node.name} in {py_file.name} has {len(methods)} behavioral methods (>6)"
+                )
+
+    jobs = JobStore(state_dir=tmp_path / "jobs", max_cached_jobs=16, max_retained_jobs=3)
+    running_job = jobs.create_job(task_type="active_task", workspace_dir=str(tmp_path))
+    completed_ids: list[str] = []
+    for idx in range(6):
+        rec = jobs.create_job(
+            task_type="batch_task",
+            workspace_dir=str(tmp_path),
+            created_at=1000.0 + idx,
+        )
+        jobs.complete_job(rec.job_id, result={"idx": idx})
+        completed_ids.append(rec.job_id)
+
+    deleted_jobs = jobs.prune_completed_jobs(max_retained=3, wal_checkpoint=True)
+    assert deleted_jobs == 3
+    assert jobs.get_job(running_job.job_id) is not None
+    assert jobs.get_job(completed_ids[0]) is None
+    assert jobs.get_job(completed_ids[-1]) is not None
+
+    handoffs = HandoffStore(state_dir=tmp_path / "handoffs", max_retained_tickets=2)
+    pending_ticket = handoffs.create_ticket(
+        sender="argon",
+        recipient="sonnet",
+        title="Keep pending",
+        spec_or_payload="Do not prune pending tickets",
+        workspace_dir=str(tmp_path),
+    )
+    resolved_ids: list[str] = []
+    for idx in range(5):
+        t = handoffs.create_ticket(
+            sender="argon",
+            recipient="codex",
+            title=f"Resolved {idx}",
+            spec_or_payload=" Audit done",
+            workspace_dir=str(tmp_path),
+        )
+        handoffs.update_ticket_status(t.ticket_id, status="completed", resolution_note="Done")
+        resolved_ids.append(t.ticket_id)
+
+    deleted_tickets = handoffs.prune_resolved_tickets(max_retained=2, wal_checkpoint=True)
+    assert deleted_tickets == 3
+    assert handoffs.get_ticket(pending_ticket.ticket_id) is not None
+    assert handoffs.get_ticket(resolved_ids[0]) is None
+    assert handoffs.get_ticket(resolved_ids[-1]) is not None
+
+    assert HeterarchyCliController().dispatch(["prune"]) == 0

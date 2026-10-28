@@ -29,6 +29,13 @@ jobs:
         run: |
           uv run python -c "import sys; assert 't' in getattr(sys, 'abiflags', ''); assert not sys._is_gil_enabled(); print('Verified Python', sys.version)"
 
+      - name: Mechanical harness & architecture contracts
+        run: |
+          if [ -f .agents/python_dev_harness/verify_mechanical_contracts.py ]; then
+            uv run python .agents/python_dev_harness/verify_mechanical_contracts.py
+          fi
+          uv run pytest -v -k test_mechanical_and_sqlite_retention_contracts
+
       - name: Ruff format & lint check
         run: |
           uv run ruff format --check src tests

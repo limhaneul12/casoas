@@ -213,3 +213,4 @@ class CtlCommand(StrEnum):
     OFF = "off"
     RESTART = "restart"
     INBOX = "inbox"
+    PRUNE = "prune"

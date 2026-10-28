@@ -305,33 +305,50 @@ class HeterarchyCliController:
         )
         return 0
 
-    def cmd_on(self) -> int:
-        """Enable plugin and MCP server for Antigravity and Codex.
+    def cmd_toggle(self, enable: bool) -> int:
+        """Enable or disable plugin, skills, and MCP server for Antigravity and Codex.
+
+        Args:
+            enable: True to enable (`on`), False to disable and stop (`off`).
 
         Returns:
             Status command exit code.
         """
-        self.env.set_agy_plugin_enabled(True)
-        self.env.set_codex_mcp_enabled(True)
-        print("[hcodex] Enabled Heterarchy Codex MCP & skills for Antigravity and GPT/Codex.")
+        self.env.set_agy_plugin_enabled(enable)
+        self.env.set_codex_mcp_enabled(enable)
+        if enable:
+            print("[hcodex] Enabled Heterarchy Codex MCP & skills for Antigravity and GPT/Codex.")
+        else:
+            pids = self.env.find_running_mcp_pids()
+            for pid in pids:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGTERM)
+            print(f"[hcodex] Disabled Heterarchy Codex MCP (terminated PIDs: {pids or 'none'}).")
         return self.cmd_status()
 
-    def cmd_off(self) -> int:
-        """Disable plugin and terminate running MCP processes.
+    def cmd_prune(self, max_retained: int = 1000) -> int:
+        """Prune old terminal SQLite records and truncate WAL journals for jobs and handoffs.
+
+        Args:
+            max_retained: Maximum number of newest records to retain per table.
 
         Returns:
-            Status command exit code.
+            Zero exit code.
         """
-        self.env.set_agy_plugin_enabled(False)
-        self.env.set_codex_mcp_enabled(False)
-        pids = self.env.find_running_mcp_pids()
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        print(f"[hcodex] Disabled Heterarchy Codex MCP (terminated PIDs: {pids or 'none'}).")
-        return self.cmd_status()
+        jobs_deleted = JobStore().prune_completed_jobs(
+            max_retained=max_retained,
+            wal_checkpoint=True,
+        )
+        tickets_deleted = HandoffStore().prune_resolved_tickets(
+            max_retained=max_retained,
+            wal_checkpoint=True,
+        )
+        print(
+            f"[hcodex] Pruned SQLite WAL stores "
+            f"(jobs_deleted={jobs_deleted}, handoffs_deleted={tickets_deleted}, "
+            f"max_retained={max_retained})."
+        )
+        return 0
 
     def cmd_restart(self) -> int:
         """Terminate old MCP stdio PIDs, sync plugin/skills, and invoke RefreshMcpServers RPC.
@@ -392,14 +409,16 @@ class HeterarchyCliController:
         if sub in (CtlCommand.STATUS, "st"):
             return self.cmd_status()
         if sub in (CtlCommand.ON, "enable", "start"):
-            return self.cmd_on()
+            return self.cmd_toggle(True)
         if sub in (CtlCommand.OFF, "disable", "stop"):
-            return self.cmd_off()
+            return self.cmd_toggle(False)
         if sub in (CtlCommand.RESTART, "reload"):
             return self.cmd_restart()
         if sub in (CtlCommand.INBOX, "tickets"):
             return self.cmd_inbox()
-        print("Usage: hcodex [status | on | off | restart | inbox]")
+        if sub in (CtlCommand.PRUNE, "compact", "clean"):
+            return self.cmd_prune()
+        print("Usage: hcodex [status | on | off | restart | inbox | prune]")
         return 1
 
 
