@@ -29,18 +29,6 @@ class CodegraphSymbolSlice:
 class CodegraphContextSlicer:
     """Read-only `.codegraph/codegraph.db` slicer extracting symbol definitions and 1-hop edges."""
 
-    def _resolve_workspace(self, workspace_dir: str) -> Path | None:
-        """Resolve and validate the workspace directory path.
-
-        Args:
-            workspace_dir: Raw workspace directory path string.
-
-        Returns:
-            Resolved workspace Path if valid, otherwise None.
-        """
-        resolved = resolve_workspace_dir(workspace_dir)
-        return Path(resolved) if resolved is not None else None
-
     def _query_neighbors(
         self,
         conn: sqlite3.Connection,
@@ -95,7 +83,7 @@ class CodegraphContextSlicer:
         start_line: int,
         end_line: int,
         max_bytes: int,
-    ) -> str:
+    ) -> tuple[str, int]:
         """Extract `start_line..end_line` from pre-loaded file lines bounded by `max_bytes`.
 
         Args:
@@ -105,17 +93,18 @@ class CodegraphContextSlicer:
             max_bytes: Maximum UTF-8 byte budget for the excerpt.
 
         Returns:
-            UTF-8 source excerpt string.
+            Tuple of `(utf8_excerpt_str, used_utf8_bytes)`.
         """
         if max_bytes <= 0 or not lines:
-            return ""
+            return "", 0
         lo = max(1, start_line) - 1
         hi = max(lo + 1, end_line)
         excerpt = "\n".join(lines[lo:hi])
         encoded = excerpt.encode("utf-8")
         if len(encoded) <= max_bytes:
-            return excerpt
-        return encoded[:max_bytes].decode("utf-8", errors="ignore")
+            return excerpt, len(encoded)
+        clipped = encoded[:max_bytes].decode("utf-8", errors="ignore")
+        return clipped, len(clipped.encode("utf-8"))
 
     def slice_symbols(
         self,
@@ -135,9 +124,10 @@ class CodegraphContextSlicer:
         """
         if not symbols:
             return []
-        ws_path = self._resolve_workspace(workspace_dir)
-        if ws_path is None:
+        resolved_ws = resolve_workspace_dir(workspace_dir)
+        if resolved_ws is None:
             return []
+        ws_path = Path(resolved_ws)
         db_path = ws_path / ".codegraph" / "codegraph.db"
         if not db_path.is_file():
             return []
@@ -221,19 +211,12 @@ class CodegraphContextSlicer:
             callers,
             callees,
         ) in raw_nodes:
-            raw_ex = self._slice_lines(
+            excerpt, used_bytes = self._slice_lines(
                 file_lines_map.get(file_path, []),
                 start_line,
                 end_line,
-                per_symbol_cap,
+                min(per_symbol_cap, remaining_bytes),
             )
-            encoded = raw_ex.encode("utf-8")
-            if len(encoded) > remaining_bytes:
-                excerpt = encoded[:remaining_bytes].decode("utf-8", errors="ignore")
-                used_bytes = len(excerpt.encode("utf-8"))
-            else:
-                excerpt = raw_ex
-                used_bytes = len(encoded)
             remaining_bytes = max(0, remaining_bytes - used_bytes)
             slices.append(
                 CodegraphSymbolSlice(

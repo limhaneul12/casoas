@@ -142,21 +142,19 @@ class RoleArtifactInspector:
                 return normalized
         return None
 
-    def is_valid_review(self, res: JsonObject | None) -> bool:
-        """Require successful completion, a valid verdict, and non-empty review narrative.
+    def extract_verdict(self, res: JsonObject | None) -> str | None:
+        """Extract a `PASS | WARN | BLOCK` verdict from a successful narrative-backed artifact.
 
         Args:
             res: Role execution response dictionary or None.
 
         Returns:
-            True if the response contains a valid, narrative-backed review artifact.
+            Normalized verdict string if valid and narrative-backed, else None.
         """
         artifact = self.extract_artifact(res)
-        return (
-            artifact is not None
-            and self.verdict_from_artifact(artifact) is not None
-            and self.has_narrative(artifact)
-        )
+        if not self.has_narrative(artifact):
+            return None
+        return self.verdict_from_artifact(artifact)
 
 
 class TriadConsensusAdjudicator:
@@ -396,7 +394,7 @@ class TriadConsensusAdjudicator:
                 return None
             expected_dimensions = EvidenceDimensionsDict(
                 static_code_review=(
-                    "verified"
+                    str(EvidenceDimensionState.VERIFIED)
                     if completed_success
                     and artifact_present
                     and artifact_has_narrative
@@ -404,7 +402,9 @@ class TriadConsensusAdjudicator:
                     else str(EvidenceDimensionState.NOT_RUN)
                 ),
                 test_generation=(
-                    "verified" if generated_tests_present else str(EvidenceDimensionState.NOT_RUN)
+                    str(EvidenceDimensionState.VERIFIED)
+                    if generated_tests_present
+                    else str(EvidenceDimensionState.NOT_RUN)
                 ),
                 test_execution=str(EvidenceDimensionState.NOT_RUN),
                 integration_verification=str(EvidenceDimensionState.NOT_RUN),
@@ -441,21 +441,6 @@ structured_review_artifact = _ROLE_INSPECTOR.extract_artifact
 has_review_narrative = _ROLE_INSPECTOR.has_narrative
 verdict_from_artifact = _ROLE_INSPECTOR.verdict_from_artifact
 map_response_to_role_state = _ROLE_INSPECTOR.map_state
-is_valid_review_response = _ROLE_INSPECTOR.is_valid_review
+extract_verdict = _ROLE_INSPECTOR.extract_verdict
 adjudicate_collaboration_and_consensus = _CONSENSUS_ADJUDICATOR.adjudicate
 recompute_saved_triad_adjudication = _CONSENSUS_ADJUDICATOR.recompute
-
-
-def extract_verdict(res: JsonObject | None) -> str | None:
-    """Extract a `PASS | WARN | BLOCK` verdict from a successful role artifact.
-
-    Args:
-        res: Role execution response dictionary or None.
-
-    Returns:
-        Normalized verdict string if valid and narrative-backed, else None.
-    """
-    artifact = _ROLE_INSPECTOR.extract_artifact(res)
-    if not _ROLE_INSPECTOR.has_narrative(artifact):
-        return None
-    return _ROLE_INSPECTOR.verdict_from_artifact(artifact)

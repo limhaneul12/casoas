@@ -18,47 +18,28 @@ from codex_collab_mcp.collab_enums import (
     TriadRole,
 )
 from codex_collab_mcp.evidence.codegraph_slicer import slice_codegraph_symbols
-from codex_collab_mcp.evidence.scope_builder import (
-    compute_task_digest,
-    prepare_triad_role_evidence,
-    resolve_workspace_dir,
-)
+from codex_collab_mcp.evidence.scope_builder import prepare_triad_role_evidence
 from codex_collab_mcp.evidence.triad_adjudicator import extract_verdict, map_response_to_role_state
 from codex_collab_mcp.evidence.triad_role_resolver import TriadRoleResolver
+from codex_collab_mcp.evidence.workspace_digests import compute_task_digest, resolve_workspace_dir
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.orchestration.service_dicts import TriadOrchestrationRequest
 from codex_collab_mcp.orchestration.verification_gate_runner import BridgeVerificationGateRunner
 from codex_collab_mcp.prompts import build_adversarial_audit_prompt, build_claude_craft_prompt
 from codex_collab_mcp.schemas import ADVERSARIAL_AUDIT_SCHEMA, JsonObject, as_json_object
 
 type AsyncEngineCallable = Callable[..., Coroutine[object, object, JsonObject]]
-type TriadTaskSpec = tuple[str, str, str, str, str, str]
-type TriadModelSelection = tuple[str, str | None, str, str]
-type TriadRunOptions = tuple[bool, str | None, float, int]
-type TriadEvidenceOptions = tuple[list[str] | None, list[str] | None, list[JsonObject] | None]
-type TriadContinuationOptions = tuple[str | None, int, bool]
 
 
 @dataclass(frozen=True, slots=True)
 class _TriadExecutionContext:
     """Immutable internal execution context for a single Triad orchestration run."""
 
-    task_spec: str
-    target_code_or_context: str
-    invariants_and_rules: str
-    language: str
+    req: TriadOrchestrationRequest
+    normalized_mode: str
     workspace_dir: str
-    claude_model: str
-    codex_model: str | None
-    codex_reasoning_effort: str
-    argon_model: str
-    invoke_argon_rpc: bool
-    argon_handoff_ticket_id: str | None
-    timeout_seconds: float
-    files_inspected: list[str] | None
-    symbols_inspected: list[str] | None
-    executed_test_commands: list[JsonObject] | None
-    max_input_bytes: int
+    effective_target_code: str
     sonnet_prompt: str
     argon_prompt: str
     source_task_digest: str
@@ -66,89 +47,79 @@ class _TriadExecutionContext:
     handoff_store: HandoffStore
     run_agy_fn: AsyncEngineCallable
     execute_fn: AsyncEngineCallable
-    resume_collaboration_id: str | None = None
-    max_rounds: int = 1
-    run_verification_gates: bool = False
     started_at: float = field(default_factory=time.time)
 
     @classmethod
     def from_inputs(
         cls,
-        spec: TriadTaskSpec,
-        models: TriadModelSelection,
-        opts: TriadRunOptions,
-        ev_opts: TriadEvidenceOptions,
-        stores: tuple[JobStore, HandoffStore],
-        fns: tuple[AsyncEngineCallable, AsyncEngineCallable],
-        cont_opts: TriadContinuationOptions = (None, 1, False),
+        req: TriadOrchestrationRequest,
+        job_store: JobStore,
+        handoff_store: HandoffStore,
+        run_agy_fn: AsyncEngineCallable,
+        execute_fn: AsyncEngineCallable,
     ) -> _TriadExecutionContext:
         """Validate workspace directory and build the immutable execution context.
 
         Args:
-            spec: Tuple of `(task_spec, target_code_or_context, invariants_and_rules,
-                language, normalized_mode, workspace_dir)`.
-            models: Tuple of `(claude_model, codex_model, codex_reasoning_effort, argon_model)`.
-            opts: Tuple of `(invoke_argon_rpc, argon_handoff_ticket_id, timeout_seconds,
-                max_input_bytes)`.
-            ev_opts: Tuple of `(files_inspected, symbols_inspected, executed_test_commands)`.
-            stores: Tuple of `(job_store, handoff_store)`.
-            fns: Tuple of `(run_agy_fn, execute_fn)`.
-            cont_opts: Tuple of `(resume_collaboration_id, max_rounds, run_verification_gates)`.
+            req: Validated TriadOrchestrationRequest bundle.
+            job_store: Active JobStore instance.
+            handoff_store: Active HandoffStore instance.
+            run_agy_fn: Antigravity RPC invocation callable.
+            execute_fn: Engine execution callable.
 
         Returns:
             Initialized `_TriadExecutionContext` instance with validated workspace and prompts.
         """
-        task_spec, target_code, invariants, language, normalized_mode, workspace_dir = spec
-        claude_model, codex_model, codex_effort, argon_model = models
-        invoke_argon_rpc, argon_ticket_id, timeout_s, max_bytes = opts
-        files_in, symbols_in, tests_in = ev_opts
-
-        resolved_workspace = resolve_workspace_dir(workspace_dir)
+        resolved_workspace = resolve_workspace_dir(req.workspace_dir)
         if resolved_workspace is None or not Path(resolved_workspace).is_dir():
             raise ValueError("Workspace directory must resolve to an existing directory.")
+        normalized_mode = req.mode.strip().lower()
         source_task_digest = compute_task_digest(
-            task_spec, target_code, invariants, language, normalized_mode
+            req.task_spec,
+            req.target_code_or_context,
+            req.invariants_and_rules,
+            req.language,
+            normalized_mode,
         )
-        sliced = slice_codegraph_symbols(resolved_workspace, symbols_in) if symbols_in else ""
+        sliced = (
+            slice_codegraph_symbols(resolved_workspace, req.symbols_inspected)
+            if req.symbols_inspected
+            else ""
+        )
         effective_target_code = (
-            f"{target_code}\n\n[CodeGraph Sliced Symbol Context]:\n{sliced}"
+            f"{req.target_code_or_context}\n\n[CodeGraph Sliced Symbol Context]:\n{sliced}"
             if sliced
-            else target_code
+            else req.target_code_or_context
         )
         sonnet_prompt = build_claude_craft_prompt(
-            task_spec, effective_target_code, invariants, language, claude_model
+            req.task_spec,
+            effective_target_code,
+            req.invariants_and_rules,
+            req.language,
+            req.claude_model,
         )
         argon_prompt = (
             "You are Gemini 4 Argon (Macro-Architect) adjudicating a Tri-Polar Heterarchy task.\n"
-            f"[Task Specification]:\n{task_spec}\n\n"
-            f"[Invariants & Rules]:\n{invariants}\n\n"
+            f"[Task Specification]:\n{req.task_spec}\n\n"
+            f"[Invariants & Rules]:\n{req.invariants_and_rules}\n\n"
             f"[Target Code / Context]:\n{effective_target_code}\n\n"
             "Respond strictly with a JSON object containing:\n"
             '{"verdict": "PASS" | "WARN" | "BLOCK", "summary": "...", '
             '"architectural_risks": ["..."], "final_recommendation": "..."}'
         )
-        args = (
-            task_spec,
-            effective_target_code,
-            invariants,
-            language,
-            resolved_workspace,
-            claude_model,
-            codex_model,
-            codex_effort,
-            argon_model,
-            invoke_argon_rpc,
-            argon_ticket_id,
-            timeout_s,
-            files_in,
-            symbols_in,
-            tests_in,
-            max_bytes,
-            sonnet_prompt,
-            argon_prompt,
-            source_task_digest,
+        return cls(
+            req=req,
+            normalized_mode=normalized_mode,
+            workspace_dir=resolved_workspace,
+            effective_target_code=effective_target_code,
+            sonnet_prompt=sonnet_prompt,
+            argon_prompt=argon_prompt,
+            source_task_digest=source_task_digest,
+            job_store=job_store,
+            handoff_store=handoff_store,
+            run_agy_fn=run_agy_fn,
+            execute_fn=execute_fn,
         )
-        return cls(*args, *stores, *fns, *cont_opts)
 
     async def invoke_sonnet(self) -> JsonObject:
         """Invoke the Claude Sonnet/Opus craftsman pole with this context's configuration.
@@ -158,10 +129,10 @@ class _TriadExecutionContext:
         """
         return await self.run_agy_fn(
             prompt=self.sonnet_prompt,
-            model=self.claude_model,
+            model=self.req.claude_model,
             expect_json=True,
-            timeout_seconds=self.timeout_seconds,
-            max_input_bytes=self.max_input_bytes,
+            timeout_seconds=self.req.timeout_seconds,
+            max_input_bytes=self.req.max_input_bytes,
             workspace_dir=self.workspace_dir,
             job_store=self.job_store,
         )
@@ -181,11 +152,11 @@ class _TriadExecutionContext:
             output_schema=ADVERSARIAL_AUDIT_SCHEMA,
             workspace_dir=self.workspace_dir,
             sandbox_mode="read-only",
-            model=self.codex_model,
-            reasoning_effort=self.codex_reasoning_effort,
+            model=self.req.codex_model,
+            reasoning_effort=self.req.codex_reasoning_effort,
             engine="cli",
-            timeout_seconds=self.timeout_seconds,
-            max_input_bytes=self.max_input_bytes,
+            timeout_seconds=self.req.timeout_seconds,
+            max_input_bytes=self.req.max_input_bytes,
         )
 
     async def invoke_argon(
@@ -201,13 +172,13 @@ class _TriadExecutionContext:
             Argon role response dictionary or None.
         """
         return await resolver.resolve_argon_role(
-            argon_model=self.argon_model,
+            argon_model=self.req.argon_model,
             argon_prompt=self.argon_prompt,
             extra_context=extra_context,
-            argon_handoff_ticket_id=self.argon_handoff_ticket_id,
-            invoke_argon_rpc=self.invoke_argon_rpc,
-            timeout_seconds=self.timeout_seconds,
-            max_input_bytes=self.max_input_bytes,
+            argon_handoff_ticket_id=self.req.argon_handoff_ticket_id,
+            invoke_argon_rpc=self.req.invoke_argon_rpc,
+            timeout_seconds=self.req.timeout_seconds,
+            max_input_bytes=self.req.max_input_bytes,
             workspace_dir=self.workspace_dir,
             job_store=self.job_store,
             handoff_store=self.handoff_store,
@@ -268,11 +239,12 @@ class TriadOrchestrationService:
         )
         consensus_reached = adjudication["consensus_reached"]
         collab_status = adjudication["collaboration_status"]
+        req = ctx.req
         participants: JsonObject = {
-            "macro_architect": ctx.argon_model,
-            "code_craftsman": sonnet_res.get("model_id", ctx.claude_model),
+            "macro_architect": req.argon_model,
+            "code_craftsman": sonnet_res.get("model_id", req.claude_model),
             "red_team_auditor": codex_res.get(
-                "model", ctx.codex_model or CanonicalModelId.CODEX_DEFAULT
+                "model", req.codex_model or CanonicalModelId.CODEX_DEFAULT
             ),
         }
         payload: JsonObject = {
@@ -291,16 +263,16 @@ class TriadOrchestrationService:
         }
         if resumed_roles:
             payload["resumed_roles"] = list(resumed_roles)
-            payload["resumed_from_collaboration_id"] = ctx.resume_collaboration_id
+            payload["resumed_from_collaboration_id"] = req.resume_collaboration_id
         if repair_rounds_executed is not None:
             payload["repair_rounds_executed"] = repair_rounds_executed
         self._resolver.attach_triad_evidence_and_persist(
             payload,
             workspace_dir=ctx.workspace_dir,
             provided_context_or_code=provided_context_or_code,
-            files_inspected=ctx.files_inspected,
-            symbols_inspected=ctx.symbols_inspected,
-            executed_test_commands=ctx.executed_test_commands,
+            files_inspected=req.files_inspected,
+            symbols_inspected=req.symbols_inspected,
+            executed_test_commands=req.executed_test_commands,
             bridge_executed_gates=bridge_executed_gates,
             orchestration_mode=mode,
             source_task_digest=ctx.source_task_digest,
@@ -321,12 +293,13 @@ class TriadOrchestrationService:
         Returns:
             Pretty-printed JSON string containing the council orchestration outcome.
         """
+        req = ctx.req
         resumed = self._gate_runner.load_resumable_roles(
-            ctx.resume_collaboration_id, ctx.workspace_dir, ctx.source_task_digest, ctx.job_store
+            req.resume_collaboration_id, ctx.workspace_dir, ctx.source_task_digest, ctx.job_store
         )
         codex_audit_prompt = build_adversarial_audit_prompt(
-            target_code_or_diff=ctx.target_code_or_context or ctx.task_spec,
-            design_rationale=f"{ctx.task_spec}\n\nInvariants:\n{ctx.invariants_and_rules}",
+            target_code_or_diff=ctx.effective_target_code or req.task_spec,
+            design_rationale=f"{req.task_spec}\n\nInvariants:\n{req.invariants_and_rules}",
             attack_vectors=[],
             context_notes=(
                 "Parallel Triad Council mode alongside Claude Sonnet 5.5 and Gemini 4 Argon."
@@ -346,14 +319,14 @@ class TriadOrchestrationService:
         codex_res = resumed[TriadRole.CODEX] if codex_task is None else codex_task.result()
         argon_res = resumed.get(TriadRole.ARGON) if argon_task is None else argon_task.result()
         bridge_gates = (
-            await self._gate_runner.run_allowlisted_gates(ctx.workspace_dir, ctx.timeout_seconds)
-            if ctx.run_verification_gates
+            await self._gate_runner.run_allowlisted_gates(ctx.workspace_dir, req.timeout_seconds)
+            if req.run_verification_gates
             else None
         )
         return self._finalize_triad_snapshot(
             ctx,
             mode=OrchestrationMode.COUNCIL,
-            provided_context_or_code=f"{ctx.task_spec}\n{ctx.target_code_or_context}",
+            provided_context_or_code=f"{req.task_spec}\n{ctx.effective_target_code}",
             argon_res=argon_res,
             sonnet_res=sonnet_res,
             codex_res=codex_res,
@@ -371,8 +344,9 @@ class TriadOrchestrationService:
         Returns:
             Pretty-printed JSON string containing the pipeline orchestration outcome.
         """
+        req = ctx.req
         resumed = self._gate_runner.load_resumable_roles(
-            ctx.resume_collaboration_id, ctx.workspace_dir, ctx.source_task_digest, ctx.job_store
+            req.resume_collaboration_id, ctx.workspace_dir, ctx.source_task_digest, ctx.job_store
         )
         sonnet_res = (
             resumed[TriadRole.SONNET] if TriadRole.SONNET in resumed else await ctx.invoke_sonnet()
@@ -381,10 +355,10 @@ class TriadOrchestrationService:
             return self._resolver.build_sonnet_abort_payload(
                 sonnet_res,
                 workspace_dir=ctx.workspace_dir,
-                provided_context_or_code=f"{ctx.task_spec}\n{ctx.target_code_or_context}",
-                files_inspected=ctx.files_inspected,
-                symbols_inspected=ctx.symbols_inspected,
-                executed_test_commands=ctx.executed_test_commands,
+                provided_context_or_code=f"{req.task_spec}\n{ctx.effective_target_code}",
+                files_inspected=req.files_inspected,
+                symbols_inspected=req.symbols_inspected,
+                executed_test_commands=req.executed_test_commands,
                 source_task_digest=ctx.source_task_digest,
                 job_store=ctx.job_store,
                 started_at=ctx.started_at,
@@ -395,7 +369,7 @@ class TriadOrchestrationService:
         crafted_code = str(s_dict.get("crafted_code", ""))
         sonnet_summary = str(s_dict.get("summary", ""))
         handoff_notes = str(s_dict.get("handoff_notes_for_codex_audit", ""))
-        audit_target = crafted_code or ctx.target_code_or_context or ctx.task_spec
+        audit_target = crafted_code or ctx.effective_target_code or req.task_spec
 
         if TriadRole.CODEX in resumed:
             codex_res = resumed[TriadRole.CODEX]
@@ -403,7 +377,7 @@ class TriadOrchestrationService:
             audit_prompt = build_adversarial_audit_prompt(
                 target_code_or_diff=audit_target,
                 design_rationale=(
-                    f"[Argon Spec]: {ctx.task_spec}\n[Invariants]: {ctx.invariants_and_rules}\n"
+                    f"[Argon Spec]: {req.task_spec}\n[Invariants]: {req.invariants_and_rules}\n"
                     f"[Claude Sonnet Craft Summary]: {sonnet_summary}"
                 ),
                 attack_vectors=[],
@@ -412,7 +386,7 @@ class TriadOrchestrationService:
             codex_res = await ctx.invoke_codex(audit_prompt)
         codex_verdict = extract_verdict(codex_res)
         repair_rounds: int | None = None
-        if ctx.max_rounds > 1 and TriadRole.CODEX not in resumed:
+        if req.max_rounds > 1 and TriadRole.CODEX not in resumed:
             (
                 sonnet_res,
                 codex_res,
@@ -422,17 +396,17 @@ class TriadOrchestrationService:
                 sonnet_res,
                 codex_res,
                 codex_verdict,
-                max_rounds=ctx.max_rounds,
-                task_spec=ctx.task_spec,
-                invariants_and_rules=ctx.invariants_and_rules,
-                target_code_or_context=ctx.target_code_or_context,
-                language=ctx.language,
+                max_rounds=req.max_rounds,
+                task_spec=req.task_spec,
+                invariants_and_rules=req.invariants_and_rules,
+                target_code_or_context=ctx.effective_target_code,
+                language=req.language,
                 workspace_dir=ctx.workspace_dir,
-                claude_model=ctx.claude_model,
-                codex_model=ctx.codex_model,
-                codex_reasoning_effort=ctx.codex_reasoning_effort,
-                timeout_seconds=ctx.timeout_seconds,
-                max_input_bytes=ctx.max_input_bytes,
+                claude_model=req.claude_model,
+                codex_model=req.codex_model,
+                codex_reasoning_effort=req.codex_reasoning_effort,
+                timeout_seconds=req.timeout_seconds,
+                max_input_bytes=req.max_input_bytes,
                 job_store=ctx.job_store,
                 run_agy_fn=ctx.run_agy_fn,
                 execute_fn=ctx.execute_fn,
@@ -458,8 +432,8 @@ class TriadOrchestrationService:
             else await ctx.invoke_argon(self._resolver, extra_ctx)
         )
         bridge_gates = (
-            await self._gate_runner.run_allowlisted_gates(ctx.workspace_dir, ctx.timeout_seconds)
-            if ctx.run_verification_gates
+            await self._gate_runner.run_allowlisted_gates(ctx.workspace_dir, req.timeout_seconds)
+            if req.run_verification_gates
             else None
         )
         return self._finalize_triad_snapshot(
@@ -477,35 +451,32 @@ class TriadOrchestrationService:
 
     async def orchestrate_triad(
         self,
-        spec: TriadTaskSpec,
-        models: TriadModelSelection,
-        opts: TriadRunOptions,
-        ev_opts: TriadEvidenceOptions,
-        stores: tuple[JobStore, HandoffStore],
-        fns: tuple[AsyncEngineCallable, AsyncEngineCallable],
-        cont_opts: TriadContinuationOptions = (None, 1, False),
+        req: TriadOrchestrationRequest,
+        job_store: JobStore,
+        handoff_store: HandoffStore,
+        run_agy_fn: AsyncEngineCallable,
+        execute_fn: AsyncEngineCallable,
     ) -> str:
         """Orchestrate Gemini 4 Argon + Claude Sonnet 5.5 + OpenAI Codex with explicit role states.
 
         Args:
-            spec: Tuple of `(task_spec, target_code_or_context, invariants_and_rules,
-                language, mode, workspace_dir)`.
-            models: Tuple of `(claude_model, codex_model, codex_reasoning_effort, argon_model)`.
-            opts: Tuple of `(invoke_argon_rpc, argon_handoff_ticket_id, timeout_seconds,
-                max_input_bytes)`.
-            ev_opts: Tuple of `(files_inspected, symbols_inspected, executed_test_commands)`.
-            stores: Tuple of `(job_store, handoff_store)`.
-            fns: Tuple of `(run_agy_fn, execute_fn)`.
-            cont_opts: Tuple of `(resume_collaboration_id, max_rounds, run_verification_gates)`.
+            req: Validated TriadOrchestrationRequest bundle.
+            job_store: Active JobStore instance.
+            handoff_store: Active HandoffStore instance.
+            run_agy_fn: Antigravity RPC invocation callable.
+            execute_fn: Engine execution callable.
 
         Returns:
             Pretty-printed JSON string containing the orchestration outcome and evidence scope.
         """
-        t_spec, target_code, invariants, language, mode, workspace_dir = spec
-        normalized_mode = mode.strip().lower()
-        norm_spec = (t_spec, target_code, invariants, language, normalized_mode, workspace_dir)
-        in_args = (norm_spec, models, opts, ev_opts, stores, fns, cont_opts)
-        ctx = await asyncio.to_thread(_TriadExecutionContext.from_inputs, *in_args)
-        if normalized_mode == OrchestrationMode.COUNCIL:
+        ctx = await asyncio.to_thread(
+            _TriadExecutionContext.from_inputs,
+            req,
+            job_store,
+            handoff_store,
+            run_agy_fn,
+            execute_fn,
+        )
+        if ctx.normalized_mode == OrchestrationMode.COUNCIL:
             return await self._execute_council_roles(ctx)
         return await self._execute_pipeline_roles(ctx)

@@ -14,9 +14,9 @@ import tomllib
 from pathlib import Path
 
 from codex_collab_mcp.collab_enums import CtlCommand, CtlRelativePath, JobStatusKind, TriadRole
-from codex_collab_mcp.contracts import get_python_runtime_info
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.routing.auth_redaction import get_python_runtime_info
 from codex_collab_mcp.transports.agy_rpc_transport import AntigravityRpcClient
 
 REPO_ROOT: Path = Path(__file__).resolve().parents[2]
@@ -272,8 +272,9 @@ class HeterarchyCliController:
         agy_skill_ok = (agy_skill / "SKILL.md").is_file()
         codex_skill_ok = (codex_skill / "SKILL.md").is_file()
         pids = self.env.find_running_mcp_pids()
-        h_store = HandoffStore()
-        j_store = JobStore()
+        cache_root = self.env.home_dir / ".cache" / "codex-collab-mcp"
+        h_store = HandoffStore(state_dir=cache_root / "handoffs")
+        j_store = JobStore(state_dir=cache_root / "jobs")
         roles = (TriadRole.ARGON, TriadRole.SONNET, TriadRole.OPUS, TriadRole.CODEX)
         pending = (
             h_store.count_pending_by_recipient(roles)
@@ -335,11 +336,12 @@ class HeterarchyCliController:
         Returns:
             Zero exit code.
         """
-        jobs_deleted = JobStore().prune_completed_jobs(
+        cache_root = self.env.home_dir / ".cache" / "codex-collab-mcp"
+        jobs_deleted = JobStore(state_dir=cache_root / "jobs").prune_completed_jobs(
             max_retained=max_retained,
             wal_checkpoint=True,
         )
-        tickets_deleted = HandoffStore().prune_resolved_tickets(
+        tickets_deleted = HandoffStore(state_dir=cache_root / "handoffs").prune_resolved_tickets(
             max_retained=max_retained,
             wal_checkpoint=True,
         )
@@ -383,7 +385,10 @@ class HeterarchyCliController:
         Returns:
             Zero exit code.
         """
-        tickets = HandoffStore().list_tickets(status=None, limit=15)
+        cache_root = self.env.home_dir / ".cache" / "codex-collab-mcp"
+        tickets = HandoffStore(state_dir=cache_root / "handoffs").list_tickets(
+            status=None, limit=15
+        )
         if not tickets:
             print("[hcodex] Handoff inbox is empty.")
             return 0

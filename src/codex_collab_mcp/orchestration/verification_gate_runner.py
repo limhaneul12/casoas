@@ -17,14 +17,13 @@ from codex_collab_mcp.collab_enums import (
     RoleExecutionState,
     SchemaName,
 )
-from codex_collab_mcp.evidence.scope_builder import canonical_sha256
 from codex_collab_mcp.evidence.triad_adjudicator import (
     TRIAD_REQUIRED_ROLES,
     TRIAD_RESULT_SCHEMA_VERSION,
     extract_verdict,
     map_response_to_role_state,
 )
-from codex_collab_mcp.evidence.workspace_digests import compute_sha256_hex
+from codex_collab_mcp.evidence.workspace_digests import canonical_sha256, compute_sha256_hex
 from codex_collab_mcp.job_store import JobStore
 from codex_collab_mcp.prompts import build_adversarial_audit_prompt, build_claude_craft_prompt
 from codex_collab_mcp.schemas import ADVERSARIAL_AUDIT_SCHEMA, JsonObject

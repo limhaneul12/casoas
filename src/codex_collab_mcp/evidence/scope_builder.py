@@ -21,23 +21,22 @@ from codex_collab_mcp.evidence.triad_adjudicator import (
     TRIAD_REQUIRED_ROLES,
     TRIAD_VERDICTS,
     adjudicate_collaboration_and_consensus,
+    extract_verdict,
     has_review_narrative,
     is_successful_role_response,
-    is_valid_review_response,
     map_response_to_role_state,
     structured_review_artifact,
     verdict_from_artifact,
 )
 from codex_collab_mcp.evidence.workspace_digests import (
     DIGEST_CALCULATOR,
-    canonical_sha256,
-    compute_task_digest,
     resolve_workspace_dir,
 )
 from codex_collab_mcp.routing.receipt_budget import compute_sha256_hex
 from codex_collab_mcp.schemas import JsonObject, JsonValue, as_json_object
 
 _NOT_RUN = str(EvidenceDimensionState.NOT_RUN)
+_VERIFIED = str(EvidenceDimensionState.VERIFIED)
 
 
 def _build_dimensions(
@@ -177,11 +176,11 @@ class EvidenceScopeBuilder:
             Constructed EvidenceScopeDict attached to `result["evidence_scope"]`.
         """
         succeeded = is_successful_role_response(result)
-        static_review = "verified" if is_valid_review_response(result) else _NOT_RUN
-        test_gen = "verified" if (succeeded and self.has_tests(result)) else _NOT_RUN
+        static_review = _VERIFIED if extract_verdict(result) is not None else _NOT_RUN
+        test_gen = _VERIFIED if (succeeded and self.has_tests(result)) else _NOT_RUN
         if bridge_executed_gates:
             all_passed = all(g.get("exit_code") == 0 for g in bridge_executed_gates)
-            test_exec_dim = "verified" if all_passed else str(EvidenceDimensionState.EXECUTED_FAIL)
+            test_exec_dim = _VERIFIED if all_passed else str(EvidenceDimensionState.EXECUTED_FAIL)
             eff_cmds = bridge_executed_gates
             origin: str | None = "bridge_executed"
         else:
@@ -260,13 +259,13 @@ class EvidenceScopeBuilder:
         for role in TRIAD_REQUIRED_ROLES:
             response = role_responses.get(role)
             state = map_response_to_role_state(response)
-            artifact = structured_review_artifact(response)
-            verdict = verdict_from_artifact(artifact)
-            artifact_has_narrative = has_review_narrative(artifact)
-            artifact_digest = DIGEST_CALCULATOR.canonical_hash(artifact) if artifact else None
             ok_succ = (
                 is_successful_role_response(response) and state == RoleExecutionState.SUCCEEDED
             )
+            artifact = structured_review_artifact(response) if ok_succ else None
+            verdict = verdict_from_artifact(artifact)
+            artifact_has_narrative = has_review_narrative(artifact)
+            artifact_digest = DIGEST_CALCULATOR.canonical_hash(artifact) if artifact else None
             review_valid = (
                 ok_succ
                 and artifact is not None
@@ -279,8 +278,8 @@ class EvidenceScopeBuilder:
             normalized_status = raw_status.strip().lower() if isinstance(raw_status, str) else None
             raw_ok = response.get("ok") if response is not None else None
             response_ok = raw_ok if isinstance(raw_ok, bool) else None
-            rev_dim = "verified" if review_valid else _NOT_RUN
-            test_dim = "verified" if generated_tests else _NOT_RUN
+            rev_dim = _VERIFIED if review_valid else _NOT_RUN
+            test_dim = _VERIFIED if generated_tests else _NOT_RUN
             evidence_dimensions = _build_dimensions(rev_dim, test_dim)
             role_snapshot: JsonObject = {
                 "state": state,
@@ -324,7 +323,6 @@ class EvidenceScopeBuilder:
         Returns:
             Compacted evidence scope dictionary suitable for durable storage.
         """
-        raw_scope = dict(evidence_scope)
         compact: JsonObject = {}
         for k in (
             "codegraph",
@@ -337,10 +335,10 @@ class EvidenceScopeBuilder:
             "evidence_dimensions",
             "test_execution_evidence_origin",
         ):
-            val = raw_scope.get(k)
+            val = evidence_scope.get(k)
             if isinstance(val, (str, int, float, bool, list, dict)):
                 compact[k] = val
-        raw_commands = raw_scope.get("executed_test_commands")
+        raw_commands = evidence_scope.get("executed_test_commands")
         if isinstance(raw_commands, list):
             command_evidence: list[JsonValue] = []
             for raw_cmd in raw_commands:
@@ -369,9 +367,7 @@ compact_evidence_scope = _SCOPE_BUILDER.compact_scope
 __all__ = [
     "EvidenceScopeBuilder",
     "attach_evidence_scope",
-    "canonical_sha256",
     "compact_evidence_scope",
-    "compute_task_digest",
     "prepare_triad_role_evidence",
     "resolve_workspace_dir",
 ]

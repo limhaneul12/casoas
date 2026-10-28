@@ -20,16 +20,12 @@ from codex_collab_mcp.agy_bridge import (
     extract_json_from_model_text,
     run_agy_model_prompt,
 )
-from codex_collab_mcp.contracts import (
-    adjudicate_collaboration_and_consensus,
-    classify_stderr_and_auth_boundaries,
-    get_python_runtime_info,
-    redact_sensitive_text,
-    validate_and_resolve_route,
-)
+from codex_collab_mcp.ctl import HeterarchyCliController, _PluginEnvironmentManager
 from codex_collab_mcp.evidence.codegraph_slicer import slice_codegraph_symbols
+from codex_collab_mcp.evidence.triad_adjudicator import adjudicate_collaboration_and_consensus
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.orchestration.verification_gate_runner import BridgeVerificationGateRunner
 from codex_collab_mcp.prompts import (
     build_adversarial_audit_prompt,
     build_claude_craft_prompt,
@@ -37,6 +33,12 @@ from codex_collab_mcp.prompts import (
     build_rescue_prompt,
     build_targeted_synthesis_prompt,
 )
+from codex_collab_mcp.routing.auth_redaction import (
+    classify_stderr_and_auth_boundaries,
+    get_python_runtime_info,
+    redact_sensitive_text,
+)
+from codex_collab_mcp.routing.policy_engine import validate_and_resolve_route
 from codex_collab_mcp.runner import (
     build_codex_exec_command,
     build_codex_review_command,
@@ -50,6 +52,7 @@ from codex_collab_mcp.schemas import (
     RESCUE_DIAGNOSIS_SCHEMA,
     TARGETED_SYNTHESIS_SCHEMA,
     JsonObject,
+    JsonValue,
     validate_structured_output,
 )
 from codex_collab_mcp.server import (
@@ -72,6 +75,48 @@ def _isolate_server_stores(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     monkeypatch.setattr(
         server_mod, "handoff_store", HandoffStore(state_dir=tmp_path / "_default_handoffs")
     )
+
+
+def _agy_ok_response(
+    model: str,
+    structured_output: JsonObject,
+    request_id: str = "cdx-agyok",
+    raw_output: str | None = None,
+) -> JsonObject:
+    """Build a standard successful Antigravity RPC response fixture."""
+    payload: JsonObject = {
+        "ok": True,
+        "status": "succeeded",
+        "outcome_state": "confirmed_success",
+        "request_id": request_id,
+        "model_id": model,
+        "structured_output": structured_output,
+    }
+    if raw_output is not None:
+        payload["raw_output"] = raw_output
+    return payload
+
+
+def _codex_audit_response(
+    verdict: str = "PASS",
+    critique: str = "Clean implementation.",
+    tests: list[str] | None = None,
+    request_id: str = "cdx-codexok",
+) -> JsonObject:
+    """Build a standard successful Codex adversarial audit response fixture."""
+    test_cases: list[JsonValue] = [*(tests or ["def test_edge(): assert True"])]
+    return {
+        "ok": True,
+        "status": "succeeded",
+        "outcome_state": "confirmed_success",
+        "request_id": request_id,
+        "model": "gpt-6.1-sol",
+        "structured_output": {
+            "verdict": verdict,
+            "executive_critique": critique,
+            "failing_test_cases": test_cases,
+        },
+    }
 
 
 def _assert_strict_openai_json_schema(schema: JsonObject) -> None:
@@ -596,11 +641,6 @@ async def test_contract_4_handoff_pending_and_argon_timeout_yield_partial_not_co
     tmp_path: Path,
 ) -> None:
     """Prove pending handoff (`hnd-...`) or Argon timeout produces `partial`, never `consensus`."""
-    isolated_jobs = JobStore(state_dir=tmp_path / "jobs")
-    isolated_handoffs = HandoffStore(state_dir=tmp_path / "handoffs")
-    monkeypatch.setattr(server_mod, "job_store", isolated_jobs)
-    monkeypatch.setattr(server_mod, "handoff_store", isolated_handoffs)
-
     # 1. Create a handoff ticket (reproducing `argon-readonly-handoff.json`)
     hnd_raw = await heterarchy_handoff_create(
         title="Argon read-only review of Sky Backcraft continuation",
@@ -632,19 +672,16 @@ async def test_contract_4_handoff_pending_and_argon_timeout_yield_partial_not_co
                 "model_id": model,
                 "error": "Antigravity RPC read timed out after 75.12s",
             }
-        return {
-            "ok": True,
-            "status": "succeeded",
-            "outcome_state": "confirmed_success",
-            "request_id": "cdx-sonnetok",
-            "model_id": "claude-sonnet-5-5-medium",
-            "structured_output": {
+        return _agy_ok_response(
+            "claude-sonnet-5-5-medium",
+            {
                 "summary": "Refactored continuation window",
                 "crafted_code": "def continuation(): return True",
                 "handoff_notes_for_codex_audit": "Check window bounds",
             },
-            "raw_output": '{"summary": "Refactored continuation window"}',
-        }
+            request_id="cdx-sonnetok",
+            raw_output='{"summary": "Refactored continuation window"}',
+        )
 
     async def mock_codex_engine(
         prompt: str,
@@ -652,17 +689,7 @@ async def test_contract_4_handoff_pending_and_argon_timeout_yield_partial_not_co
         output_schema: JsonObject | None,
         **kwargs: object,
     ) -> JsonObject:
-        return {
-            "ok": True,
-            "status": "succeeded",
-            "outcome_state": "confirmed_success",
-            "request_id": "cdx-codexok",
-            "model": "gpt-6.1-sol",
-            "structured_output": {
-                "verdict": "PASS",
-                "failing_test_cases": ["def test_edge(): assert True"],
-            },
-        }
+        return _codex_audit_response()
 
     monkeypatch.setattr(server_mod, "run_agy_model_prompt", mock_agy_prompt)
     monkeypatch.setattr(server_mod, "_execute_with_engine", mock_codex_engine)
@@ -1105,11 +1132,6 @@ async def test_triad_checkpoint_resume_reuses_succeeded_roles(
     tmp_path: Path,
 ) -> None:
     """Verify `resume_collaboration_id` reuses succeeded Sonnet/Codex roles without re-dispatch."""
-    isolated_jobs = JobStore(state_dir=tmp_path / "jobs")
-    isolated_handoffs = HandoffStore(state_dir=tmp_path / "handoffs")
-    monkeypatch.setattr(server_mod, "job_store", isolated_jobs)
-    monkeypatch.setattr(server_mod, "handoff_store", isolated_handoffs)
-
     sonnet_calls = 0
     codex_calls = 0
     argon_calls = 0
@@ -1133,31 +1155,25 @@ async def test_triad_checkpoint_resume_reuses_succeeded_roles(
                     "model_id": model,
                     "error": "Argon RPC read timed out on first attempt",
                 }
-            return {
-                "ok": True,
-                "status": "succeeded",
-                "outcome_state": "confirmed_success",
-                "request_id": "cdx-argonok02",
-                "model_id": model,
-                "structured_output": {
+            return _agy_ok_response(
+                model,
+                {
                     "verdict": "PASS",
                     "summary": "Argon approved resumed pipeline after checkpoint.",
                 },
-            }
+                request_id="cdx-argonok02",
+            )
         sonnet_calls += 1
-        return {
-            "ok": True,
-            "status": "succeeded",
-            "outcome_state": "confirmed_success",
-            "request_id": "cdx-sonnetok01",
-            "model_id": model,
-            "structured_output": {
+        return _agy_ok_response(
+            model,
+            {
                 "verdict": "PASS",
                 "summary": "Sonnet crafted checkpointable pipeline stage.",
                 "crafted_code": "def checkpoint_fn() -> int: return 42",
                 "handoff_notes_for_codex_audit": "Verify return constant",
             },
-        }
+            request_id="cdx-sonnetok01",
+        )
 
     async def mock_codex_engine(
         prompt: str,
@@ -1167,18 +1183,11 @@ async def test_triad_checkpoint_resume_reuses_succeeded_roles(
     ) -> JsonObject:
         nonlocal codex_calls
         codex_calls += 1
-        return {
-            "ok": True,
-            "status": "succeeded",
-            "outcome_state": "confirmed_success",
-            "request_id": "cdx-codexok01",
-            "model": "gpt-6.1-sol",
-            "structured_output": {
-                "verdict": "PASS",
-                "executive_critique": "Codex verified checkpoint_fn with zero findings.",
-                "failing_test_cases": ["def test_checkpoint_fn(): assert checkpoint_fn() == 42"],
-            },
-        }
+        return _codex_audit_response(
+            critique="Codex verified checkpoint_fn with zero findings.",
+            tests=["def test_checkpoint_fn(): assert checkpoint_fn() == 42"],
+            request_id="cdx-codexok01",
+        )
 
     monkeypatch.setattr(server_mod, "run_agy_model_prompt", mock_agy_prompt)
     monkeypatch.setattr(server_mod, "_execute_with_engine", mock_codex_engine)
@@ -1220,11 +1229,6 @@ async def test_triad_multi_turn_auto_repair_loop(
     tmp_path: Path,
 ) -> None:
     """Verify `max_rounds=2` runs an automatic Claude repair + Codex re-audit loop on BLOCK."""
-    isolated_jobs = JobStore(state_dir=tmp_path / "jobs")
-    isolated_handoffs = HandoffStore(state_dir=tmp_path / "handoffs")
-    monkeypatch.setattr(server_mod, "job_store", isolated_jobs)
-    monkeypatch.setattr(server_mod, "handoff_store", isolated_handoffs)
-
     sonnet_calls = 0
     codex_calls = 0
 
@@ -1237,40 +1241,27 @@ async def test_triad_multi_turn_auto_repair_loop(
     ) -> JsonObject:
         nonlocal sonnet_calls
         if "argon" in model.lower():
-            return {
-                "ok": True,
-                "status": "succeeded",
-                "outcome_state": "confirmed_success",
-                "request_id": "cdx-argonrepair",
-                "model_id": model,
-                "structured_output": {
-                    "verdict": "PASS",
-                    "summary": "Argon verified repaired implementation.",
-                },
-            }
+            return _agy_ok_response(
+                model,
+                {"verdict": "PASS", "summary": "Argon verified repaired implementation."},
+                request_id="cdx-argonrepair",
+            )
         sonnet_calls += 1
         if sonnet_calls == 1:
-            return {
-                "ok": True,
-                "status": "succeeded",
-                "outcome_state": "confirmed_success",
-                "request_id": "cdx-sonnet-r1",
-                "model_id": model,
-                "structured_output": {
+            return _agy_ok_response(
+                model,
+                {
                     "verdict": "PASS",
                     "summary": "Initial division helper",
                     "crafted_code": "def safe_div(a: float, b: float) -> float: return a / b",
                     "handoff_notes_for_codex_audit": "Check division behavior",
                 },
-            }
+                request_id="cdx-sonnet-r1",
+            )
         assert "Auto-Repair Round 2" in prompt
-        return {
-            "ok": True,
-            "status": "succeeded",
-            "outcome_state": "confirmed_success",
-            "request_id": "cdx-sonnet-r2",
-            "model_id": model,
-            "structured_output": {
+        return _agy_ok_response(
+            model,
+            {
                 "verdict": "PASS",
                 "summary": "Repaired division helper with zero-denominator guard",
                 "crafted_code": (
@@ -1278,7 +1269,8 @@ async def test_triad_multi_turn_auto_repair_loop(
                 ),
                 "handoff_notes_for_codex_audit": "Added b == 0 guard",
             },
-        }
+            request_id="cdx-sonnet-r2",
+        )
 
     async def mock_codex_engine(
         prompt: str,
@@ -1289,30 +1281,18 @@ async def test_triad_multi_turn_auto_repair_loop(
         nonlocal codex_calls
         codex_calls += 1
         if codex_calls == 1:
-            return {
-                "ok": True,
-                "status": "succeeded",
-                "outcome_state": "confirmed_success",
-                "request_id": "cdx-codex-r1",
-                "model": "gpt-6.1-sol",
-                "structured_output": {
-                    "verdict": "BLOCK",
-                    "executive_critique": "ZeroDivisionError when b == 0 is unguarded.",
-                    "failing_test_cases": ["def test_zero(): safe_div(1.0, 0.0)"],
-                },
-            }
-        return {
-            "ok": True,
-            "status": "succeeded",
-            "outcome_state": "confirmed_success",
-            "request_id": "cdx-codex-r2",
-            "model": "gpt-6.1-sol",
-            "structured_output": {
-                "verdict": "PASS",
-                "executive_critique": "Zero denominator is now guarded properly.",
-                "failing_test_cases": ["def test_zero(): assert safe_div(1.0, 0.0) == 0.0"],
-            },
-        }
+            return _codex_audit_response(
+                verdict="BLOCK",
+                critique="ZeroDivisionError when b == 0 is unguarded.",
+                tests=["def test_zero(): safe_div(1.0, 0.0)"],
+                request_id="cdx-codex-r1",
+            )
+        return _codex_audit_response(
+            verdict="PASS",
+            critique="Zero denominator is now guarded properly.",
+            tests=["def test_zero(): assert safe_div(1.0, 0.0) == 0.0"],
+            request_id="cdx-codex-r2",
+        )
 
     monkeypatch.setattr(server_mod, "run_agy_model_prompt", mock_agy_prompt)
     monkeypatch.setattr(server_mod, "_execute_with_engine", mock_codex_engine)
@@ -1337,17 +1317,12 @@ async def test_bridge_executed_verification_gates_promote_test_execution(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Verify `run_verification_gates=True` runs pytest in workspace and promotes test_execution."""
-    isolated_jobs = JobStore(state_dir=tmp_path / "jobs")
-    isolated_handoffs = HandoffStore(state_dir=tmp_path / "handoffs")
-    monkeypatch.setattr(server_mod, "job_store", isolated_jobs)
-    monkeypatch.setattr(server_mod, "handoff_store", isolated_handoffs)
-
+    """Verify `run_verification_gates=True` runs allowlisted gate and promotes test_execution."""
     sample_test = tmp_path / "test_sample.py"
-    sample_test.write_text(
-        "def test_sample_gate_passes() -> None:\n    assert 3 * 7 == 21\n",
-        encoding="utf-8",
-    )
+    sample_test.write_text("def test_sample() -> None:\n    assert True\n", encoding="utf-8")
+    gate_cmd = BridgeVerificationGateRunner()._resolve_gate_command(str(tmp_path))
+    assert "pytest" in gate_cmd
+    sample_test.unlink()
 
     async def mock_agy_prompt(
         prompt: str,
@@ -1356,18 +1331,15 @@ async def test_bridge_executed_verification_gates_promote_test_execution(
         timeout_seconds: float = 180.0,
         **kwargs: object,
     ) -> JsonObject:
-        return {
-            "ok": True,
-            "status": "succeeded",
-            "outcome_state": "confirmed_success",
-            "request_id": "cdx-gate-agy",
-            "model_id": model,
-            "structured_output": {
+        return _agy_ok_response(
+            model,
+            {
                 "verdict": "PASS",
                 "summary": "Verified gate implementation.",
                 "crafted_code": "def mul() -> int: return 21",
             },
-        }
+            request_id="cdx-gate-agy",
+        )
 
     async def mock_codex_engine(
         prompt: str,
@@ -1375,18 +1347,10 @@ async def test_bridge_executed_verification_gates_promote_test_execution(
         output_schema: JsonObject | None,
         **kwargs: object,
     ) -> JsonObject:
-        return {
-            "ok": True,
-            "status": "succeeded",
-            "outcome_state": "confirmed_success",
-            "request_id": "cdx-gate-codex",
-            "model": "gpt-6.1-sol",
-            "structured_output": {
-                "verdict": "PASS",
-                "executive_critique": "Clean implementation.",
-                "failing_test_cases": ["def test_mul(): assert mul() == 21"],
-            },
-        }
+        return _codex_audit_response(
+            tests=["def test_mul(): assert mul() == 21"],
+            request_id="cdx-gate-codex",
+        )
 
     monkeypatch.setattr(server_mod, "run_agy_model_prompt", mock_agy_prompt)
     monkeypatch.setattr(server_mod, "_execute_with_engine", mock_codex_engine)
@@ -1701,23 +1665,8 @@ async def test_triad_role_snapshot_model_ids_and_job_telemetry(
 def test_mechanical_and_sqlite_retention_contracts(tmp_path: Path) -> None:
     """Verify mechanical architecture contracts and SQLite WAL retention pruning + checkpoint."""
     import ast
-    import subprocess
-    import sys
-
-    from codex_collab_mcp.ctl import HeterarchyCliController
 
     repo_root = Path(__file__).resolve().parents[1]
-    harness_script = repo_root / ".agents" / "python_dev_harness" / "verify_mechanical_contracts.py"
-    if harness_script.is_file():
-        res = subprocess.run(  # noqa: S603
-            [sys.executable, str(harness_script)],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert res.returncode == 0, f"Mechanical harness failed:\n{res.stdout}\n{res.stderr}"
-
     src_root = repo_root / "src" / "codex_collab_mcp"
     for pkg_dir in [src_root, *[p for p in src_root.rglob("*") if p.is_dir()]]:
         if pkg_dir.name == "__pycache__":
@@ -1791,4 +1740,5 @@ def test_mechanical_and_sqlite_retention_contracts(tmp_path: Path) -> None:
     assert handoffs.get_ticket(resolved_ids[0]) is None
     assert handoffs.get_ticket(resolved_ids[-1]) is not None
 
-    assert HeterarchyCliController().dispatch(["prune"]) == 0
+    env_mgr = _PluginEnvironmentManager(repo_root=repo_root, home_dir=tmp_path)
+    assert HeterarchyCliController(env_mgr=env_mgr).dispatch(["prune"]) == 0

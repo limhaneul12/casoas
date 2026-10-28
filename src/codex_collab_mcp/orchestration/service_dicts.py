@@ -6,7 +6,11 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import TypedDict
 
-from codex_collab_mcp.collab_enums import CanonicalModelId
+from codex_collab_mcp.collab_enums import (
+    CanonicalModelId,
+    OrchestrationMode,
+    ReasoningTier,
+)
 from codex_collab_mcp.job_store import JobStore
 from codex_collab_mcp.routing.contract_dicts import (
     CodexJobRecordDict,
@@ -103,6 +107,32 @@ class ClaudeCraftRequest:
     files_inspected: list[str] | None = None
     symbols_inspected: list[str] | None = None
     executed_test_commands: list[JsonObject] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TriadOrchestrationRequest:
+    """Validated request bundle for Tri-Polar Heterarchy orchestration."""
+
+    task_spec: str
+    target_code_or_context: str = ""
+    invariants_and_rules: str = ""
+    language: str = "python"
+    mode: str = OrchestrationMode.PIPELINE
+    workspace_dir: str = "."
+    claude_model: str = CanonicalModelId.CLAUDE_SONNET_5_5_MEDIUM
+    codex_model: str | None = None
+    codex_reasoning_effort: str = ReasoningTier.XHIGH
+    argon_model: str = CanonicalModelId.GEMINI_4_ARGON_HIGH
+    invoke_argon_rpc: bool = True
+    argon_handoff_ticket_id: str | None = None
+    timeout_seconds: float = 300.0
+    files_inspected: list[str] | None = None
+    symbols_inspected: list[str] | None = None
+    executed_test_commands: list[JsonObject] | None = None
+    max_input_bytes: int = 256_000
+    resume_collaboration_id: str | None = None
+    max_rounds: int = 1
+    run_verification_gates: bool = False
 
 
 @dataclass(frozen=True, slots=True)

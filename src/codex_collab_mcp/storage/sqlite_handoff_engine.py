@@ -28,6 +28,8 @@ CREATE TABLE IF NOT EXISTS handoffs (
 );
 CREATE INDEX IF NOT EXISTS idx_handoffs_recipient_status
 ON handoffs(recipient, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_handoffs_workspace_updated
+ON handoffs(workspace_dir, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_handoffs_updated_at
 ON handoffs(updated_at DESC);
 """

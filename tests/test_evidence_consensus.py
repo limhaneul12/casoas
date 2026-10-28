@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import codex_collab_mcp.server as server
+from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import CodexJobRecord, JobStore
 from codex_collab_mcp.schemas import JsonObject
 
@@ -17,6 +18,7 @@ from codex_collab_mcp.schemas import JsonObject
 @pytest.fixture(autouse=True)
 def isolate_job_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(server, "job_store", JobStore(state_dir=tmp_path / "jobs"))
+    monkeypatch.setattr(server, "handoff_store", HandoffStore(state_dir=tmp_path / "handoffs"))
 
 
 def successful_review(verdict: str = "PASS") -> JsonObject:
@@ -31,14 +33,16 @@ def successful_review(verdict: str = "PASS") -> JsonObject:
 async def run_council(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    roles: dict[str, JsonObject],
+    roles: dict[str, JsonObject] | None = None,
     invoke_argon_rpc: bool = True,
 ) -> dict[str, object]:
+    effective_roles = roles or {role: successful_review() for role in ("argon", "sonnet", "codex")}
+
     async def agy(**kwargs: object) -> JsonObject:
-        return roles["argon" if "argon" in str(kwargs.get("model")) else "sonnet"]
+        return effective_roles["argon" if "argon" in str(kwargs.get("model")) else "sonnet"]
 
     async def codex(**kwargs: object) -> JsonObject:
-        return roles["codex"]
+        return effective_roles["codex"]
 
     monkeypatch.setattr(server, "run_agy_model_prompt", agy)
     monkeypatch.setattr(server, "_execute_with_engine", codex)
@@ -308,9 +312,7 @@ async def test_argon_cross_scope_replay_is_not_approved(
     tmp_path: Path,
     wrong_fence: str,
 ) -> None:
-    result = await run_council(
-        monkeypatch, tmp_path, {role: successful_review() for role in ("argon", "sonnet", "codex")}
-    )
+    result = await run_council(monkeypatch, tmp_path)
     scope = result["evidence_scope"]
     assert isinstance(scope, dict)
     pack = await pack_for(
@@ -335,9 +337,7 @@ async def test_inflight_aggregate_is_unverified(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    result = await run_council(
-        monkeypatch, tmp_path, {role: successful_review() for role in ("argon", "sonnet", "codex")}
-    )
+    result = await run_council(monkeypatch, tmp_path)
     job = server.job_store.get_job(str(result["collaboration_id"]))
     assert job is not None
     running_job = dataclasses.replace(job, status="running")
@@ -395,9 +395,7 @@ async def test_stored_aggregate_is_compact_and_corruption_is_not_approved(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    result = await run_council(
-        monkeypatch, tmp_path, {role: successful_review() for role in ("argon", "sonnet", "codex")}
-    )
+    result = await run_council(monkeypatch, tmp_path)
     job = server.job_store.get_job(str(result["collaboration_id"]))
     assert job is not None and isinstance(job.result, dict)
     encoded = json.dumps(job.result)
@@ -472,9 +470,7 @@ async def test_persistence_error_keeps_completed_peer_results(
         raise OSError("simulated full disk")
 
     monkeypatch.setattr(server.job_store, "create_job", disk_full)
-    result = await run_council(
-        monkeypatch, tmp_path, {role: successful_review() for role in ("argon", "sonnet", "codex")}
-    )
+    result = await run_council(monkeypatch, tmp_path)
     assert not result.get("collaboration_id")
     assert result["collaboration_persistence"] == "failed"
     for role in ("argon_review", "sonnet_craft", "codex_audit"):
@@ -566,9 +562,7 @@ async def test_failed_final_write_cannot_certify_cached_completed_record(
         original_persist(record)
 
     monkeypatch.setattr(server.job_store, "_persist", fail_completed_write)
-    result = await run_council(
-        monkeypatch, tmp_path, {role: successful_review() for role in ("argon", "sonnet", "codex")}
-    )
+    result = await run_council(monkeypatch, tmp_path)
     assert result["collaboration_persistence"] == "failed"
     assert not result.get("collaboration_id")
     unconfirmed = str(result["unconfirmed_collaboration_id"])

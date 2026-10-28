@@ -114,12 +114,14 @@ class _JobStorageEngine:
                     conn.execute("INSERT OR REPLACE INTO jobs VALUES (?,?,?,?,?,?,?,?,?)", p1 + p2)
                     self._write_count += 1
                     if self._write_count % 64 == 0:
-                        conn.execute(
+                        evicted = conn.execute(
                             "DELETE FROM jobs WHERE status != 'running' AND job_id NOT IN ("
                             "SELECT job_id FROM jobs WHERE status != 'running' "
-                            "ORDER BY created_at DESC LIMIT ?)",
+                            "ORDER BY created_at DESC LIMIT ?) RETURNING job_id",
                             (self.max_retained_jobs,),
-                        )
+                        ).fetchall()
+                        for row in evicted:
+                            self._jobs.pop(str(row[0]), None)
             except sqlite3.Error as exc:
                 raise OSError(f"SQLite job persistence failed: {exc}") from exc
 
@@ -144,21 +146,17 @@ class _JobStorageEngine:
             try:
                 with self._connect() as conn:
                     with conn:
-                        cur = conn.execute(
+                        evicted = conn.execute(
                             "DELETE FROM jobs WHERE status != 'running' AND job_id NOT IN ("
                             "SELECT job_id FROM jobs WHERE status != 'running' "
-                            "ORDER BY created_at DESC LIMIT ?)",
+                            "ORDER BY created_at DESC LIMIT ?) RETURNING job_id",
                             (keep,),
-                        )
-                        deleted = max(0, cur.rowcount)
-                        if deleted > 0:
-                            kept_rows = conn.execute("SELECT job_id FROM jobs").fetchall()
-                            kept_ids = {str(r[0]) for r in kept_rows}
-                            for jid in [k for k in self._jobs if k not in kept_ids]:
-                                self._jobs.pop(jid, None)
+                        ).fetchall()
+                        for row in evicted:
+                            self._jobs.pop(str(row[0]), None)
                     if wal_checkpoint:
                         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    return deleted
+                    return len(evicted)
             except sqlite3.Error:
                 return 0
 
@@ -275,26 +273,32 @@ class _JobQueryStore(_JobStorageEngine):
                 with self._connect() as conn:
                     if ws is not None:
                         rows = conn.execute(
-                            "SELECT job_id, record_json FROM jobs "
+                            "SELECT job_id, workspace_dir, record_json FROM jobs "
                             "WHERE workspace_dir = ? ORDER BY created_at DESC LIMIT ?",
                             (ws, bounded_limit),
                         ).fetchall()
                         if len(rows) < bounded_limit:
-                            rows = conn.execute(
-                                "SELECT job_id, record_json FROM jobs ORDER BY created_at DESC LIMIT ?",
-                                (bounded_limit * 4,),
-                            ).fetchall()
+                            rows.extend(
+                                conn.execute(
+                                    "SELECT job_id, workspace_dir, record_json FROM jobs "
+                                    "WHERE workspace_dir != ? ORDER BY created_at DESC LIMIT ?",
+                                    (ws, bounded_limit * 4),
+                                ).fetchall()
+                            )
                     else:
                         rows = conn.execute(
-                            "SELECT job_id, record_json FROM jobs ORDER BY created_at DESC LIMIT ?",
+                            "SELECT job_id, workspace_dir, record_json FROM jobs "
+                            "ORDER BY created_at DESC LIMIT ?",
                             (bounded_limit,),
                         ).fetchall()
                 for row in rows:
-                    jid = str(row[0])
-                    if jid not in seen and isinstance(row[1], str):
-                        if (rec := CodexJobRecord.from_json(row[1])) is not None:
-                            if ws is None or matches_workspace(rec.workspace_dir, ws):
-                                seen[jid] = rec
+                    jid, row_ws, raw_json = str(row[0]), str(row[1]), row[2]
+                    if jid in seen or not isinstance(raw_json, str):
+                        continue
+                    if ws is not None and row_ws != ws and not matches_workspace(row_ws, ws):
+                        continue
+                    if (rec := CodexJobRecord.from_json(raw_json)) is not None:
+                        seen[jid] = rec
             except sqlite3.Error:
                 pass
             records = sorted(seen.values(), key=lambda r: r.created_at, reverse=True)

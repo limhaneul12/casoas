@@ -33,6 +33,7 @@ from codex_collab_mcp.orchestration.service_dicts import (
     DecisionPackRequest,
     EngineDispatchRequest,
     ServerGatewayBindings,
+    TriadOrchestrationRequest,
 )
 from codex_collab_mcp.orchestration.triad_pipeline_service import TriadOrchestrationService
 from codex_collab_mcp.prompts import (
@@ -648,12 +649,13 @@ async def heterarchy_triad_orchestrate(
     """
     spec = (task_spec, target_code_or_context, invariants_and_rules, language, mode, workspace_dir)
     models = (claude_model, codex_model, codex_reasoning_effort, argon_model)
-    opts = (invoke_argon_rpc, argon_handoff_ticket_id, timeout_seconds, max_input_bytes)
-    ev = (files_inspected, symbols_inspected, executed_test_commands)
-    stores = (job_store, handoff_store)
-    fns = (run_agy_model_prompt, _execute_with_engine)
-    cont_opts = (resume_collaboration_id, max_rounds, run_verification_gates)
-    return await _triad_service.orchestrate_triad(spec, models, opts, ev, stores, fns, cont_opts)
+    opts = (invoke_argon_rpc, argon_handoff_ticket_id, timeout_seconds)
+    ev = (files_inspected, symbols_inspected, executed_test_commands, max_input_bytes)
+    cont = (resume_collaboration_id, max_rounds, run_verification_gates)
+    req = TriadOrchestrationRequest(*spec, *models, *opts, *ev, *cont)
+    return await _triad_service.orchestrate_triad(
+        req, job_store, handoff_store, run_agy_model_prompt, _execute_with_engine
+    )
 
 
 @mcp.tool()

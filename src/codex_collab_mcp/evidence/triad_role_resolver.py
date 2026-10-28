@@ -94,22 +94,23 @@ class TriadRoleResolver:
             bridge_executed_gates=bridge_executed_gates,
         )
         not_run = str(EvidenceDimensionState.NOT_RUN)
+        verified = str(EvidenceDimensionState.VERIFIED)
         successful_reviews = sum(
             1
             for role in TRIAD_REQUIRED_ROLES
-            if role_evidence_dimensions[role]["static_code_review"] == "verified"
+            if role_evidence_dimensions[role]["static_code_review"] == verified
         )
         aggregate_review = (
-            "verified"
+            verified
             if successful_reviews == len(TRIAD_REQUIRED_ROLES)
             else "partial"
             if successful_reviews > 0
             else not_run
         )
         aggregate_test_generation = (
-            "verified"
+            verified
             if any(
-                role_evidence_dimensions[role]["test_generation"] == "verified"
+                role_evidence_dimensions[role]["test_generation"] == verified
                 for role in TRIAD_REQUIRED_ROLES
             )
             else not_run

@@ -12,12 +12,12 @@ from codex_collab_mcp.collab_enums import (
     OutcomeStateKind,
 )
 from codex_collab_mcp.evidence.evidence_dicts import TriadAdjudicationDict
-from codex_collab_mcp.evidence.scope_builder import canonical_sha256, resolve_workspace_dir
 from codex_collab_mcp.evidence.triad_adjudicator import (
     TRIAD_REQUIRED_ROLES,
     TRIAD_RESULT_SCHEMA_VERSION,
     recompute_saved_triad_adjudication,
 )
+from codex_collab_mcp.evidence.workspace_digests import canonical_sha256, resolve_workspace_dir
 from codex_collab_mcp.job_store import CodexJobRecord, JobStore
 from codex_collab_mcp.orchestration.service_dicts import (
     DecisionAuthoritativeEvidenceDict,
@@ -31,27 +31,28 @@ from codex_collab_mcp.schemas import JsonObject
 _COLLABORATION_ID_PATTERN = re.compile(r"cdx-[0-9a-f]{10}\Z")
 _SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
-type DecisionFencesTuple = tuple[str | None, str | None, str | None]
-
 
 class AlexandriaDecisionPackService:
     """Validate persisted triad aggregates and package Alexandria decision bundles."""
 
     def load_scoped_triad_aggregate(
         self,
-        fences: DecisionFencesTuple,
+        collaboration_id: str | None,
+        expected_workspace: str | None,
+        expected_scope_digest: str | None,
         job_store: JobStore,
     ) -> tuple[JsonObject, TriadAdjudicationDict] | None:
         """Load one completed triad aggregate after validating its ID and scope fence.
 
         Args:
-            fences: Tuple of `(collaboration_id, expected_workspace, expected_scope_digest)`.
+            collaboration_id: Requested collaboration identifier (`cdx-...`), or None.
+            expected_workspace: Canonicalized expected workspace directory path, or None.
+            expected_scope_digest: Expected SHA-256 scope digest fence, or None.
             job_store: Active JobStore instance used to read cached and persisted records.
 
         Returns:
             Tuple of `(snapshot_dict, adjudication_dict)` when verified, else None.
         """
-        collaboration_id, expected_workspace, expected_scope_digest = fences
         if (
             collaboration_id is None
             or _COLLABORATION_ID_PATTERN.fullmatch(collaboration_id) is None
@@ -61,10 +62,11 @@ class AlexandriaDecisionPackService:
         ):
             return None
 
-        cached_record = job_store.get_job(collaboration_id)
+        in_memory = job_store._jobs.get(collaboration_id)
         record = job_store.get_persisted_job(collaboration_id)
-        if cached_record is None or record is None or cached_record != record:
+        if record is None or (in_memory is not None and in_memory != record):
             return None
+        job_store._cache_put(record)
         if (
             record.job_id != collaboration_id
             or record.task_type != "triad_orchestration"
@@ -299,7 +301,7 @@ Caller-provided resolution; it has not been verified against the cited run.
         )
 
         validated_source = self.load_scoped_triad_aggregate(
-            (req.collaboration_id, expected_ws, req.expected_scope_digest), job_store
+            req.collaboration_id, expected_ws, req.expected_scope_digest, job_store
         )
         source_snapshot: JsonObject | None = None
         adjudication: TriadAdjudicationDict | None = None

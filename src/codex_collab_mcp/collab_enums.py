@@ -122,10 +122,8 @@ class AuditSeverity(StrEnum):
 class EvidenceDimensionState(StrEnum):
     """Verification states for individual evidence dimensions."""
 
-    EXECUTED_PASS = "executed_pass"  # noqa: S105
+    VERIFIED = "verified"
     EXECUTED_FAIL = "executed_fail"
-    PERFORMED = "performed"
-    GENERATED_NOT_EXECUTED = "generated_not_executed"
     NOT_RUN = "not_run"
 
 
@@ -146,13 +144,10 @@ class OutcomeStateKind(StrEnum):
     """Explicit outcome state classifications for execution receipts and jobs."""
 
     IN_FLIGHT = "in_flight"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
     CONFIRMED_SUCCESS = "confirmed_success"
     CONFIRMED_FAILURE = "confirmed_failure"
     OUTCOME_UNKNOWN = "outcome_unknown"
     CANCELLED = "cancelled"
-    REJECTED_PRE_DISPATCH = "rejected_pre_dispatch"
 
 
 class HandoffStatusKind(StrEnum):

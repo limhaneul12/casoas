@@ -8,7 +8,6 @@ import json
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 
-from codex_collab_mcp.agy_bridge import AgyEndpoint
 from codex_collab_mcp.collab_enums import AuthContextKind, RoleExecutionState, TriadRole
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
@@ -33,6 +32,7 @@ from codex_collab_mcp.routing.model_specs import (
     ANTIGRAVITY_MODEL_SPECS,
     CODEX_SUPPORTED_MODELS,
 )
+from codex_collab_mcp.transports.agy_rpc_transport import AgyEndpoint
 from codex_collab_mcp.transports.transport_dicts import AgyModelConfigEntryDict
 
 type AsyncEndpointProbeCallable = Callable[[], Coroutine[object, object, AgyEndpoint | None]]
@@ -65,11 +65,13 @@ class McpToolDispatcher:
         Returns:
             Pretty-printed JSON string containing the job record and outcome state.
         """
-        record = job_store.get_job(job_id.strip()) if job_id.strip() else None
-        if record is None and idempotency_key and idempotency_key.strip():
-            record = job_store.find_by_idempotency_key(idempotency_key.strip())
+        jid = job_id.strip()
+        ikey = (idempotency_key or "").strip()
+        record = job_store.get_job(jid) if jid else None
+        if record is None and ikey:
+            record = job_store.find_by_idempotency_key(ikey)
         if not record:
-            lookup_ref = job_id or idempotency_key or "<empty>"
+            lookup_ref = jid or ikey or "<empty>"
             err = ToolErrorResponseDict(ok=False, error=f"Job '{lookup_ref}' not found.")
             return json.dumps(err, ensure_ascii=False, indent=2)
         if cancel and (updated := job_store.cancel_job(record.job_id)) is not None:
@@ -238,36 +240,54 @@ class McpToolDispatcher:
         """
         resolve_codex_fn, discover_agy_fn, list_agy_models_fn = probes
         verified_at_utc = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        try:
-            codex_bin = resolve_codex_fn()
-            proc = await asyncio.create_subprocess_exec(
-                codex_bin,
-                "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-            except BaseException:
-                if proc.returncode is None:
-                    with contextlib.suppress(ProcessLookupError):
-                        proc.kill()
-                    await proc.wait()
-                raise
-            version_str = stdout_bytes.decode("utf-8", errors="replace").strip()
-            cli_ready = proc.returncode == 0
-        except Exception as exc:
-            codex_bin = "not_found"
-            version_str = redact_sensitive_text(str(exc))
-            cli_ready = False
 
-        agy_ep = await discover_agy_fn()
-        agy_models = await list_agy_models_fn(endpoint=agy_ep) if agy_ep else []
+        async def _probe_codex_cli() -> tuple[str, str, bool]:
+            """Probe the local Codex CLI binary and version.
+
+            Returns:
+                Tuple of `(codex_binary, version_or_error_str, cli_ready)`.
+            """
+            try:
+                c_bin = resolve_codex_fn()
+                proc = await asyncio.create_subprocess_exec(
+                    c_bin,
+                    "--version",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                except BaseException:
+                    if proc.returncode is None:
+                        with contextlib.suppress(ProcessLookupError):
+                            proc.kill()
+                        await proc.wait()
+                    raise
+                ver = stdout_bytes.decode("utf-8", errors="replace").strip()
+                return c_bin, ver, proc.returncode == 0
+            except Exception as exc:
+                return "not_found", redact_sensitive_text(str(exc)), False
+
+        async def _probe_agy() -> tuple[AgyEndpoint | None, list[AgyModelConfigEntryDict]]:
+            """Discover the local Antigravity LanguageServer endpoint and model catalog.
+
+            Returns:
+                Tuple of `(endpoint, model_catalog_entries)`.
+            """
+            ep = await discover_agy_fn()
+            models = await list_agy_models_fn(endpoint=ep) if ep else []
+            return ep, models
+
+        (codex_bin, version_str, cli_ready), (agy_ep, agy_models) = await asyncio.gather(
+            _probe_codex_cli(),
+            _probe_agy(),
+        )
         routable_agy_models: list[str] = [
             mid for m in agy_models if m["routable"] and (mid := m["model_id"])
         ]
         advertised_agy_specs = [spec.to_dict() for spec in ANTIGRAVITY_MODEL_SPECS.values()]
-        routable_codex_models: list[str] = sorted(CODEX_SUPPORTED_MODELS) if cli_ready else []
+        advertised_codex = sorted(CODEX_SUPPORTED_MODELS)
+        routable_codex_models: list[str] = advertised_codex if cli_ready else []
         pending_counts = handoff_store.count_pending_by_recipient(
             (TriadRole.ARGON, TriadRole.SONNET, TriadRole.OPUS, TriadRole.CODEX)
         )
@@ -279,7 +299,7 @@ class McpToolDispatcher:
             advertised_antigravity_models=advertised_agy_specs,
             routable_antigravity_models=routable_agy_models,
             antigravity_routable=agy_ep is not None and len(routable_agy_models) > 0,
-            advertised_codex_models=sorted(CODEX_SUPPORTED_MODELS),
+            advertised_codex_models=advertised_codex,
             routable_codex_models=routable_codex_models,
             codex_cli_routable=cli_ready,
         )

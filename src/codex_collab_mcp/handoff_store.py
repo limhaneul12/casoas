@@ -178,7 +178,7 @@ class HandoffStore(_HandoffStorageBase):
                 with self._connect() as conn:
                     if ws_filter is None:
                         cursor = conn.execute(
-                            "SELECT ticket_json FROM handoffs "
+                            "SELECT workspace_dir, ticket_json FROM handoffs "
                             "WHERE (? IS NULL OR recipient = ?) AND (? IS NULL OR status = ?) "
                             "ORDER BY updated_at DESC LIMIT ?",
                             (
@@ -191,22 +191,25 @@ class HandoffStore(_HandoffStorageBase):
                         )
                     else:
                         cursor = conn.execute(
-                            "SELECT ticket_json FROM handoffs "
+                            "SELECT workspace_dir, ticket_json FROM handoffs "
                             "WHERE (? IS NULL OR recipient = ?) AND (? IS NULL OR status = ?) "
                             "ORDER BY updated_at DESC",
                             (recipient_filter, recipient_filter, status_filter, status_filter),
                         )
                     for row in cursor:
-                        if not isinstance(row[0], str):
+                        row_ws, raw_json = str(row[0]), row[1]
+                        if not isinstance(raw_json, str):
                             continue
-                        ticket = HandoffTicket.from_json(row[0])
-                        if ticket is None:
+                        if (
+                            ws_filter
+                            and row_ws != ws_filter
+                            and not matches_workspace(row_ws, ws_filter)
+                        ):
                             continue
-                        if ws_filter and not matches_workspace(ticket.workspace_dir, ws_filter):
-                            continue
-                        tickets.append(ticket)
-                        if len(tickets) >= bounded_limit:
-                            break
+                        if (ticket := HandoffTicket.from_json(raw_json)) is not None:
+                            tickets.append(ticket)
+                            if len(tickets) >= bounded_limit:
+                                break
             except sqlite3.Error:
                 return []
             return [t.to_dict() for t in tickets[:bounded_limit]]
