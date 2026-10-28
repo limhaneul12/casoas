@@ -5,7 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 
-from codex_collab_mcp.collab_enums import EvidenceDimensionState, RoleExecutionState, TriadRole
+from codex_collab_mcp.collab_enums import (
+    CanonicalModelId,
+    EvidenceDimensionState,
+    RoleExecutionState,
+    TriadRole,
+)
 from codex_collab_mcp.evidence.evidence_dicts import (
     EvidenceDimensionsDict,
     EvidenceScopeDict,
@@ -156,7 +161,7 @@ class EvidenceScopeBuilder:
         symbols_inspected: list[str] | None = None,
         executed_test_commands: list[JsonObject] | None = None,
         bridge_executed_gates: list[JsonObject] | None = None,
-    ) -> JsonObject:
+    ) -> EvidenceScopeDict:
         """Attach verified evidence scope to a collaboration response without inflating claims.
 
         Args:
@@ -169,14 +174,14 @@ class EvidenceScopeBuilder:
             bridge_executed_gates: Optional list of bridge-executed quality gate records.
 
         Returns:
-            Updated response dictionary with `evidence_scope` attached.
+            Constructed EvidenceScopeDict attached to `result["evidence_scope"]`.
         """
         succeeded = is_successful_role_response(result)
         static_review = "verified" if is_valid_review_response(result) else _NOT_RUN
         test_gen = "verified" if (succeeded and self.has_tests(result)) else _NOT_RUN
         if bridge_executed_gates:
             all_passed = all(g.get("exit_code") == 0 for g in bridge_executed_gates)
-            test_exec_dim = "verified" if all_passed else "executed_fail"
+            test_exec_dim = "verified" if all_passed else str(EvidenceDimensionState.EXECUTED_FAIL)
             eff_cmds = bridge_executed_gates
             origin: str | None = "bridge_executed"
         else:
@@ -196,7 +201,7 @@ class EvidenceScopeBuilder:
         if origin is not None:
             evidence_scope["test_execution_evidence_origin"] = origin
         result["evidence_scope"] = as_json_object(evidence_scope)
-        return result
+        return evidence_scope
 
     def extract_references(self, res: JsonObject | None) -> JsonObject:
         """Keep only lookup references and receipt selectors from a role response.
@@ -217,7 +222,7 @@ class EvidenceScopeBuilder:
             if (
                 isinstance(am := rec.get("actual_model"), str)
                 and (am_s := am.strip())
-                and am_s != "codex-default"
+                and am_s != CanonicalModelId.CODEX_DEFAULT
             ):
                 refs["model_id"] = am_s
             for k in ("request_id", "result_ref", "output_digest"):
@@ -225,7 +230,7 @@ class EvidenceScopeBuilder:
                     refs[f"receipt_{k}"] = v.strip()
         for k in ("model_id", "model"):
             if "model_id" not in refs and isinstance(m := res.get(k), str):
-                if (m_s := m.strip()) and m_s != "codex-default":
+                if (m_s := m.strip()) and m_s != CanonicalModelId.CODEX_DEFAULT:
                     refs["model_id"] = m_s
         if isinstance(ht := res.get("handoff_ticket"), dict):
             if isinstance(tid := ht.get("ticket_id"), str) and tid.strip():

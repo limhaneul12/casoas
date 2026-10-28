@@ -8,6 +8,7 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
+from codex_collab_mcp.collab_enums import CanonicalModelId, JobStatusKind
 from codex_collab_mcp.job_store import CodexJobRecord
 from codex_collab_mcp.routing.contract_dicts import ExternalMcpOAuthWarningDict
 from codex_collab_mcp.schemas import JsonObject, JsonValue, as_json_object
@@ -215,7 +216,7 @@ class CodexCommandBuilder:
         ]
         if schema_file:
             cmd.extend(["--output-schema", schema_file])
-        if model and (model_s := model.strip()) and model_s != "codex-default":
+        if model and (model_s := model.strip()) and model_s != CanonicalModelId.CODEX_DEFAULT:
             if model_s.startswith("-"):
                 raise ValueError("Codex model identifier must not start with '-'.")
             cmd.extend(["-m", model_s])
@@ -263,7 +264,7 @@ class CodexCommandBuilder:
         elif uncommitted:
             cmd.append("--uncommitted")
         cmd.extend(["-c", "mcp_servers={}"])
-        if model and (model_s := model.strip()) and model_s != "codex-default":
+        if model and (model_s := model.strip()) and model_s != CanonicalModelId.CODEX_DEFAULT:
             if model_s.startswith("-"):
                 raise ValueError("Codex model identifier must not start with '-'.")
             model_str = json.dumps(model_s, ensure_ascii=False).replace("\x7f", "\\u007f")
@@ -314,7 +315,7 @@ class CodexCommandBuilder:
             Deduplicated execution response dictionary.
         """
         return {
-            "ok": record.status == "completed",
+            "ok": record.status == JobStatusKind.COMPLETED,
             "deduplicated_existing_request": True,
             "request_id": record.job_id,
             "job_id": record.job_id,

@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from codex_collab_mcp.evidence.evidence_dicts import CodegraphSymbolSliceDict
+from codex_collab_mcp.evidence.workspace_digests import resolve_workspace_dir
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,24 +25,6 @@ class CodegraphSymbolSlice:
     callees: list[str]
     source_excerpt: str
 
-    def to_dict(self) -> CodegraphSymbolSliceDict:
-        """Serialize the symbol slice to an explicit TypedDict.
-
-        Returns:
-            Serialized CodegraphSymbolSliceDict mapping.
-        """
-        return CodegraphSymbolSliceDict(
-            name=self.name,
-            qualified_name=self.qualified_name,
-            kind=self.kind,
-            file_path=self.file_path,
-            start_line=self.start_line,
-            end_line=self.end_line,
-            callers=self.callers,
-            callees=self.callees,
-            source_excerpt=self.source_excerpt,
-        )
-
 
 class CodegraphContextSlicer:
     """Read-only `.codegraph/codegraph.db` slicer extracting symbol definitions and 1-hop edges."""
@@ -56,12 +38,8 @@ class CodegraphContextSlicer:
         Returns:
             Resolved workspace Path if valid, otherwise None.
         """
-        if not workspace_dir.strip():
-            return None
-        try:
-            return Path(workspace_dir).expanduser().resolve()
-        except OSError, RuntimeError, ValueError:
-            return None
+        resolved = resolve_workspace_dir(workspace_dir)
+        return Path(resolved) if resolved is not None else None
 
     def _query_neighbors(
         self,
@@ -91,34 +69,45 @@ class CodegraphContextSlicer:
         callees = [str(r[0]) for r in callee_rows if r and r[0] is not None]
         return callers, callees
 
-    def _read_excerpt(
-        self,
-        ws_path: Path,
-        file_path: str,
-        start_line: int,
-        end_line: int,
-        max_bytes: int,
-    ) -> str:
-        """Read lines `start_line..end_line` from a workspace-contained file bounded by `max_bytes`.
+    def _read_file_lines(self, ws_path: Path, file_path: str) -> list[str]:
+        """Read and split lines from a workspace-contained file once.
 
         Args:
             ws_path: Resolved workspace root directory path.
             file_path: Node file path relative to `ws_path` (or inside `ws_path`).
-            start_line: 1-based inclusive start line number.
-            end_line: 1-based inclusive end line number.
-            max_bytes: Remaining UTF-8 byte budget for the excerpt.
 
         Returns:
-            UTF-8 source excerpt string (or empty string if unreadable or out of budget).
+            List of lines from the file, or empty list if unreadable or outside workspace.
         """
-        if max_bytes <= 0 or not file_path.strip():
-            return ""
+        if not file_path.strip():
+            return []
         try:
             candidate = (ws_path / file_path).resolve()
             if not candidate.is_relative_to(ws_path) or not candidate.is_file():
-                return ""
-            lines = candidate.read_text(encoding="utf-8", errors="replace").splitlines()
+                return []
+            return candidate.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError, RuntimeError, ValueError:
+            return []
+
+    def _slice_lines(
+        self,
+        lines: list[str],
+        start_line: int,
+        end_line: int,
+        max_bytes: int,
+    ) -> str:
+        """Extract `start_line..end_line` from pre-loaded file lines bounded by `max_bytes`.
+
+        Args:
+            lines: Pre-loaded lines of the source file.
+            start_line: 1-based inclusive start line number.
+            end_line: 1-based inclusive end line number.
+            max_bytes: Maximum UTF-8 byte budget for the excerpt.
+
+        Returns:
+            UTF-8 source excerpt string.
+        """
+        if max_bytes <= 0 or not lines:
             return ""
         lo = max(1, start_line) - 1
         hi = max(lo + 1, end_line)
@@ -166,10 +155,18 @@ class CodegraphContextSlicer:
                     rows = conn.execute(
                         "SELECT id, kind, name, qualified_name, file_path, start_line, end_line "
                         "FROM nodes "
-                        "WHERE name = ? OR qualified_name = ? OR qualified_name LIKE ? "
+                        "WHERE name = ? OR qualified_name = ? "
                         "ORDER BY start_line ASC LIMIT 3",
-                        (sym, sym, f"%.{sym}"),
+                        (sym, sym),
                     ).fetchall()
+                    if not rows:
+                        rows = conn.execute(
+                            "SELECT id, kind, name, qualified_name, file_path, start_line, end_line "
+                            "FROM nodes "
+                            "WHERE qualified_name LIKE ? "
+                            "ORDER BY start_line ASC LIMIT 3",
+                            (f"%.{sym}",),
+                        ).fetchall()
                     for row in rows:
                         node_id = str(row[0])
                         if node_id in seen_ids:
@@ -194,24 +191,24 @@ class CodegraphContextSlicer:
         if not raw_nodes:
             return []
 
-        def _load_node_excerpt(
-            item: tuple[str, str, str, str, int, int, list[str], list[str]],
-        ) -> str:
-            """Read a single node's source excerpt bounded by `per_symbol_cap`.
+        unique_files = list(dict.fromkeys(node[3] for node in raw_nodes))
+
+        def _load_one_file(rel_path: str) -> tuple[str, list[str]]:
+            """Read a single file's lines once for all symbols in that file.
 
             Args:
-                item: Tuple of node metadata and caller/callee lists.
+                rel_path: Relative file path within workspace.
 
             Returns:
-                Extracted UTF-8 source excerpt string.
+                Tuple of `(rel_path, split_lines)`.
             """
-            return self._read_excerpt(ws_path, item[3], item[4], item[5], per_symbol_cap)
+            return rel_path, self._read_file_lines(ws_path, rel_path)
 
-        if len(raw_nodes) == 1:
-            excerpts = [_load_node_excerpt(raw_nodes[0])]
+        if len(unique_files) == 1:
+            file_lines_map = dict([_load_one_file(unique_files[0])])
         else:
-            with ThreadPoolExecutor(max_workers=min(8, len(raw_nodes))) as pool:
-                excerpts = list(pool.map(_load_node_excerpt, raw_nodes))
+            with ThreadPoolExecutor(max_workers=min(8, len(unique_files))) as pool:
+                file_lines_map = dict(pool.map(_load_one_file, unique_files))
 
         slices: list[CodegraphSymbolSlice] = []
         for (
@@ -223,13 +220,21 @@ class CodegraphContextSlicer:
             end_line,
             callers,
             callees,
-        ), raw_ex in zip(raw_nodes, excerpts, strict=True):
+        ) in raw_nodes:
+            raw_ex = self._slice_lines(
+                file_lines_map.get(file_path, []),
+                start_line,
+                end_line,
+                per_symbol_cap,
+            )
             encoded = raw_ex.encode("utf-8")
             if len(encoded) > remaining_bytes:
                 excerpt = encoded[:remaining_bytes].decode("utf-8", errors="ignore")
+                used_bytes = len(excerpt.encode("utf-8"))
             else:
                 excerpt = raw_ex
-            remaining_bytes = max(0, remaining_bytes - len(excerpt.encode("utf-8")))
+                used_bytes = len(encoded)
+            remaining_bytes = max(0, remaining_bytes - used_bytes)
             slices.append(
                 CodegraphSymbolSlice(
                     name=name,

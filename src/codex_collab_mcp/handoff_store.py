@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import sqlite3
 import threading
 import time
@@ -11,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from codex_collab_mcp.collab_enums import HandoffPriorityKind, HandoffStatusKind, TriadRole
+from codex_collab_mcp.evidence.workspace_digests import matches_workspace, resolve_workspace_dir
 from codex_collab_mcp.routing.contract_dicts import HandoffTicketDict
 from codex_collab_mcp.storage.handoff_ticket import HandoffTicket
 from codex_collab_mcp.storage.sqlite_handoff_engine import _HandoffStorageBase
@@ -64,11 +64,7 @@ class HandoffStore(_HandoffStorageBase):
             if norm_priority not in valid_priorities:
                 norm_priority = str(HandoffPriorityKind.NORMAL)
 
-            resolved_ws = (
-                str(Path(workspace_dir).expanduser().resolve())
-                if workspace_dir.strip()
-                else workspace_dir
-            )
+            resolved_ws = resolve_workspace_dir(workspace_dir) or workspace_dir
             ticket = HandoffTicket(
                 ticket_id=ticket_id,
                 sender=sender.strip().lower(),
@@ -164,36 +160,44 @@ class HandoffStore(_HandoffStorageBase):
         """
         recipient_filter = recipient.strip().lower() if recipient else None
         status_filter = status.strip().lower() if status else None
-        ws_filter = (
-            str(Path(workspace_dir).expanduser().resolve())
-            if workspace_dir and workspace_dir.strip()
-            else None
-        )
+        ws_filter = resolve_workspace_dir(workspace_dir) if workspace_dir else None
         bounded_limit = max(1, limit)
 
         with self._lock:
-            db_path = self.ensure_db_initialized()
-            query_sql = (
-                "SELECT ticket_json FROM handoffs "
-                "WHERE (? IS NULL OR recipient = ?) AND (? IS NULL OR status = ?) "
-                "ORDER BY updated_at DESC"
-            )
-            query_params = (recipient_filter, recipient_filter, status_filter, status_filter)
             tickets: list[HandoffTicket] = []
             try:
-                with contextlib.closing(sqlite3.connect(db_path, timeout=10.0)) as conn:
-                    rows = conn.execute(query_sql, query_params).fetchall()
-                for row in rows:
-                    if not isinstance(row[0], str):
-                        continue
-                    ticket = self._deserialize_ticket(row[0])
-                    if ticket is None:
-                        continue
-                    if ws_filter and not self._matches_workspace(ticket.workspace_dir, ws_filter):
-                        continue
-                    tickets.append(ticket)
-                    if len(tickets) >= bounded_limit:
-                        break
+                with self._connect() as conn:
+                    if ws_filter is None:
+                        cursor = conn.execute(
+                            "SELECT ticket_json FROM handoffs "
+                            "WHERE (? IS NULL OR recipient = ?) AND (? IS NULL OR status = ?) "
+                            "ORDER BY updated_at DESC LIMIT ?",
+                            (
+                                recipient_filter,
+                                recipient_filter,
+                                status_filter,
+                                status_filter,
+                                bounded_limit,
+                            ),
+                        )
+                    else:
+                        cursor = conn.execute(
+                            "SELECT ticket_json FROM handoffs "
+                            "WHERE (? IS NULL OR recipient = ?) AND (? IS NULL OR status = ?) "
+                            "ORDER BY updated_at DESC",
+                            (recipient_filter, recipient_filter, status_filter, status_filter),
+                        )
+                    for row in cursor:
+                        if not isinstance(row[0], str):
+                            continue
+                        ticket = HandoffTicket.from_json(row[0])
+                        if ticket is None:
+                            continue
+                        if ws_filter and not matches_workspace(ticket.workspace_dir, ws_filter):
+                            continue
+                        tickets.append(ticket)
+                        if len(tickets) >= bounded_limit:
+                            break
             except sqlite3.Error:
                 return []
             return [t.to_dict() for t in tickets[:bounded_limit]]
@@ -220,9 +224,8 @@ class HandoffStore(_HandoffStorageBase):
         if not normalized_recipients:
             return counts
         with self._lock:
-            db_path = self.ensure_db_initialized()
             try:
-                with contextlib.closing(sqlite3.connect(db_path, timeout=10.0)) as conn:
+                with self._connect() as conn:
                     rows = conn.execute(
                         "SELECT recipient, COUNT(*) FROM handoffs "
                         "WHERE status = ? GROUP BY recipient",
@@ -237,4 +240,4 @@ class HandoffStore(_HandoffStorageBase):
             return counts
 
 
-__all__ = ["HandoffStore", "HandoffTicket"]
+__all__ = ["HandoffStore"]

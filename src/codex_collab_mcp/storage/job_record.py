@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 from codex_collab_mcp.collab_enums import OutcomeStateKind
 from codex_collab_mcp.routing.contract_dicts import CodexJobRecordDict, ExecutionReceiptDict
@@ -97,7 +97,7 @@ class CodexJobRecord:
             eng = g0 if isinstance(g0, str) else None
             att = a0 if isinstance(a0, int) else 1
             rcp = r0 if isinstance(r0, dict) else None
-            base = cls(
+            return cls(
                 job_id=str(raw["job_id"]),
                 task_type=str(raw["task_type"]),
                 status=str(raw["status"]),
@@ -109,9 +109,6 @@ class CodexJobRecord:
                 result=raw.get("result"),
                 error=err,
                 metadata=meta,
-            )
-            return replace(
-                base,
                 outcome_state=ost,
                 idempotency_key=ik,
                 provider=prv,

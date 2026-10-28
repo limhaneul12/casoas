@@ -84,7 +84,7 @@ class TriadRoleResolver:
         if resolved_workspace is None:
             raise ValueError("A valid workspace directory is required for triad evidence.")
 
-        attach_evidence_scope(
+        evidence_scope_value = attach_evidence_scope(
             payload,
             workspace_dir=resolved_workspace,
             provided_context_or_code=provided_context_or_code,
@@ -114,19 +114,15 @@ class TriadRoleResolver:
             )
             else not_run
         )
-        evidence_scope_value = payload.get("evidence_scope")
-        if not isinstance(evidence_scope_value, dict):
-            raise RuntimeError("Triad evidence scope was not built.")
-        evidence_dimensions = evidence_scope_value.get("evidence_dimensions")
-        if not isinstance(evidence_dimensions, dict):
-            raise RuntimeError("Triad evidence dimensions were not built.")
+        evidence_dimensions = evidence_scope_value["evidence_dimensions"]
         evidence_dimensions["static_code_review"] = aggregate_review
         evidence_dimensions["test_generation"] = aggregate_test_generation
         evidence_dimensions["runtime_confirmation"] = not_run
 
-        payload["role_evidence_dimensions"] = {
+        role_dims_json: JsonObject = {
             role: as_json_object(role_evidence_dimensions[role]) for role in TRIAD_REQUIRED_ROLES
         }
+        payload["role_evidence_dimensions"] = role_dims_json
         payload["review_approved"] = adjudication["review_approved"] is True
         payload["source_task_digest"] = source_task_digest
         payload["workspace_dir"] = resolved_workspace

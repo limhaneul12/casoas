@@ -13,7 +13,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-from codex_collab_mcp.collab_enums import CtlCommand, CtlRelativePath, TriadRole
+from codex_collab_mcp.collab_enums import CtlCommand, CtlRelativePath, JobStatusKind, TriadRole
 from codex_collab_mcp.contracts import get_python_runtime_info
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
@@ -111,7 +111,7 @@ class _PluginEnvironmentManager:
         else:
             content = cfg_path.read_text(encoding="utf-8")
         section_pattern = re.compile(
-            r"(\[mcp_servers\.heterarchy_codex\]\n(?:(?!\[).*\n)*)",
+            r"(\[mcp_servers\.heterarchy_codex\]\r?\n(?:(?!\[).*(?:\r?\n|$))*)",
             re.MULTILINE,
         )
         match = section_pattern.search(content)
@@ -275,9 +275,13 @@ class HeterarchyCliController:
         h_store = HandoffStore()
         j_store = JobStore()
         roles = (TriadRole.ARGON, TriadRole.SONNET, TriadRole.OPUS, TriadRole.CODEX)
-        pending = h_store.count_pending_by_recipient(roles)
-        recent_jobs = j_store.list_jobs(limit=5)
-        running_jobs = sum(1 for j in recent_jobs if j.get("status") == "running")
+        pending = (
+            h_store.count_pending_by_recipient(roles)
+            if h_store.db_path.is_file()
+            else {r: 0 for r in roles}
+        )
+        recent_jobs = j_store.list_jobs(limit=5) if j_store.db_path.is_file() else []
+        running_jobs = sum(1 for j in recent_jobs if j.get("status") == JobStatusKind.RUNNING)
         rt = get_python_runtime_info()
 
         print("=== Heterarchy Tri-Polar MCP Status (Argon + Sonnet/Opus 5.5 + Codex) ===")

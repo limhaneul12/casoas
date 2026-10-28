@@ -9,7 +9,14 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from codex_collab_mcp.collab_enums import OrchestrationMode, TriadRole
+from codex_collab_mcp.collab_enums import (
+    CanonicalModelId,
+    CollaborationState,
+    OrchestrationMode,
+    RoleExecutionState,
+    SchemaName,
+    TriadRole,
+)
 from codex_collab_mcp.evidence.codegraph_slicer import slice_codegraph_symbols
 from codex_collab_mcp.evidence.scope_builder import (
     compute_task_digest,
@@ -95,19 +102,12 @@ class _TriadExecutionContext:
         claude_model, codex_model, codex_effort, argon_model = models
         invoke_argon_rpc, argon_ticket_id, timeout_s, max_bytes = opts
         files_in, symbols_in, tests_in = ev_opts
-        job_store, handoff_store = stores
-        run_agy_fn, execute_fn = fns
-        resume_id, max_rounds, run_gates = cont_opts
 
         resolved_workspace = resolve_workspace_dir(workspace_dir)
         if resolved_workspace is None or not Path(resolved_workspace).is_dir():
             raise ValueError("Workspace directory must resolve to an existing directory.")
         source_task_digest = compute_task_digest(
-            task_spec=task_spec,
-            target_code_or_context=target_code,
-            invariants_and_rules=invariants,
-            language=language,
-            mode=normalized_mode,
+            task_spec, target_code, invariants, language, normalized_mode
         )
         sliced = slice_codegraph_symbols(resolved_workspace, symbols_in) if symbols_in else ""
         effective_target_code = (
@@ -116,11 +116,7 @@ class _TriadExecutionContext:
             else target_code
         )
         sonnet_prompt = build_claude_craft_prompt(
-            task_spec=task_spec,
-            target_code_or_context=effective_target_code,
-            invariants_and_rules=invariants,
-            language=language,
-            claude_model=claude_model,
+            task_spec, effective_target_code, invariants, language, claude_model
         )
         argon_prompt = (
             "You are Gemini 4 Argon (Macro-Architect) adjudicating a Tri-Polar Heterarchy task.\n"
@@ -131,7 +127,7 @@ class _TriadExecutionContext:
             '{"verdict": "PASS" | "WARN" | "BLOCK", "summary": "...", '
             '"architectural_risks": ["..."], "final_recommendation": "..."}'
         )
-        return cls(
+        args = (
             task_spec,
             effective_target_code,
             invariants,
@@ -151,14 +147,8 @@ class _TriadExecutionContext:
             sonnet_prompt,
             argon_prompt,
             source_task_digest,
-            job_store,
-            handoff_store,
-            run_agy_fn,
-            execute_fn,
-            resume_id,
-            max_rounds,
-            run_gates,
         )
+        return cls(*args, *stores, *fns, *cont_opts)
 
     async def invoke_sonnet(self) -> JsonObject:
         """Invoke the Claude Sonnet/Opus craftsman pole with this context's configuration.
@@ -187,7 +177,7 @@ class _TriadExecutionContext:
         """
         return await self.execute_fn(
             prompt=prompt,
-            schema_name="adversarial_audit",
+            schema_name=SchemaName.ADVERSARIAL_AUDIT,
             output_schema=ADVERSARIAL_AUDIT_SCHEMA,
             workspace_dir=self.workspace_dir,
             sandbox_mode="read-only",
@@ -281,10 +271,12 @@ class TriadOrchestrationService:
         participants: JsonObject = {
             "macro_architect": ctx.argon_model,
             "code_craftsman": sonnet_res.get("model_id", ctx.claude_model),
-            "red_team_auditor": codex_res.get("model", ctx.codex_model or "codex-default"),
+            "red_team_auditor": codex_res.get(
+                "model", ctx.codex_model or CanonicalModelId.CODEX_DEFAULT
+            ),
         }
         payload: JsonObject = {
-            "ok": collab_status == "complete" and consensus_reached,
+            "ok": collab_status == CollaborationState.COMPLETE and consensus_reached,
             "collaboration_status": collab_status,
             "consensus_status": adjudication["consensus_status"],
             "consensus_reached": consensus_reached,
@@ -344,15 +336,15 @@ class TriadOrchestrationService:
         codex_task: asyncio.Task[JsonObject] | None = None
         argon_task: asyncio.Task[JsonObject | None] | None = None
         async with asyncio.TaskGroup() as tg:
-            if "sonnet" not in resumed:
+            if TriadRole.SONNET not in resumed:
                 sonnet_task = tg.create_task(ctx.invoke_sonnet())
-            if "codex" not in resumed:
+            if TriadRole.CODEX not in resumed:
                 codex_task = tg.create_task(ctx.invoke_codex(codex_audit_prompt))
-            if "argon" not in resumed:
+            if TriadRole.ARGON not in resumed:
                 argon_task = tg.create_task(ctx.invoke_argon(self._resolver))
-        sonnet_res = resumed["sonnet"] if sonnet_task is None else sonnet_task.result()
-        codex_res = resumed["codex"] if codex_task is None else codex_task.result()
-        argon_res = resumed.get("argon") if argon_task is None else argon_task.result()
+        sonnet_res = resumed[TriadRole.SONNET] if sonnet_task is None else sonnet_task.result()
+        codex_res = resumed[TriadRole.CODEX] if codex_task is None else codex_task.result()
+        argon_res = resumed.get(TriadRole.ARGON) if argon_task is None else argon_task.result()
         bridge_gates = (
             await self._gate_runner.run_allowlisted_gates(ctx.workspace_dir, ctx.timeout_seconds)
             if ctx.run_verification_gates
@@ -382,8 +374,10 @@ class TriadOrchestrationService:
         resumed = self._gate_runner.load_resumable_roles(
             ctx.resume_collaboration_id, ctx.workspace_dir, ctx.source_task_digest, ctx.job_store
         )
-        sonnet_res = resumed["sonnet"] if "sonnet" in resumed else await ctx.invoke_sonnet()
-        if map_response_to_role_state(sonnet_res) != "succeeded":
+        sonnet_res = (
+            resumed[TriadRole.SONNET] if TriadRole.SONNET in resumed else await ctx.invoke_sonnet()
+        )
+        if map_response_to_role_state(sonnet_res) != RoleExecutionState.SUCCEEDED:
             return self._resolver.build_sonnet_abort_payload(
                 sonnet_res,
                 workspace_dir=ctx.workspace_dir,
@@ -403,8 +397,8 @@ class TriadOrchestrationService:
         handoff_notes = str(s_dict.get("handoff_notes_for_codex_audit", ""))
         audit_target = crafted_code or ctx.target_code_or_context or ctx.task_spec
 
-        if "codex" in resumed:
-            codex_res = resumed["codex"]
+        if TriadRole.CODEX in resumed:
+            codex_res = resumed[TriadRole.CODEX]
         else:
             audit_prompt = build_adversarial_audit_prompt(
                 target_code_or_diff=audit_target,
@@ -418,7 +412,7 @@ class TriadOrchestrationService:
             codex_res = await ctx.invoke_codex(audit_prompt)
         codex_verdict = extract_verdict(codex_res)
         repair_rounds: int | None = None
-        if ctx.max_rounds > 1 and "codex" not in resumed:
+        if ctx.max_rounds > 1 and TriadRole.CODEX not in resumed:
             (
                 sonnet_res,
                 codex_res,
@@ -459,8 +453,8 @@ class TriadOrchestrationService:
             f"[Codex Red-Team Critique]: {codex_critique}"
         )
         argon_res = (
-            resumed["argon"]
-            if "argon" in resumed
+            resumed[TriadRole.ARGON]
+            if TriadRole.ARGON in resumed
             else await ctx.invoke_argon(self._resolver, extra_ctx)
         )
         bridge_gates = (
@@ -510,9 +504,8 @@ class TriadOrchestrationService:
         t_spec, target_code, invariants, language, mode, workspace_dir = spec
         normalized_mode = mode.strip().lower()
         norm_spec = (t_spec, target_code, invariants, language, normalized_mode, workspace_dir)
-        ctx = _TriadExecutionContext.from_inputs(
-            norm_spec, models, opts, ev_opts, stores, fns, cont_opts
-        )
+        in_args = (norm_spec, models, opts, ev_opts, stores, fns, cont_opts)
+        ctx = await asyncio.to_thread(_TriadExecutionContext.from_inputs, *in_args)
         if normalized_mode == OrchestrationMode.COUNCIL:
             return await self._execute_council_roles(ctx)
         return await self._execute_pipeline_roles(ctx)

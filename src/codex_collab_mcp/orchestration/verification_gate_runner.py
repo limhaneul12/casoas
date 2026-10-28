@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import contextlib
 import json
 import sys
 import time
@@ -15,12 +15,16 @@ from codex_collab_mcp.collab_enums import (
     JobStatusKind,
     OutcomeStateKind,
     RoleExecutionState,
+    SchemaName,
 )
+from codex_collab_mcp.evidence.scope_builder import canonical_sha256
 from codex_collab_mcp.evidence.triad_adjudicator import (
     TRIAD_REQUIRED_ROLES,
+    TRIAD_RESULT_SCHEMA_VERSION,
     extract_verdict,
     map_response_to_role_state,
 )
+from codex_collab_mcp.evidence.workspace_digests import compute_sha256_hex
 from codex_collab_mcp.job_store import JobStore
 from codex_collab_mcp.prompts import build_adversarial_audit_prompt, build_claude_craft_prompt
 from codex_collab_mcp.schemas import ADVERSARIAL_AUDIT_SCHEMA, JsonObject
@@ -43,7 +47,7 @@ class BridgeVerificationGateRunner:
         ws_path = Path(workspace_dir)
         has_tests = (ws_path / "tests").is_dir() or any(ws_path.glob("test_*.py"))
         return (
-            [sys.executable, "-m", "pytest", "-q"]
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
             if has_tests
             else [sys.executable, "-c", "import ast; print('syntax_ok')"]
         )
@@ -55,8 +59,9 @@ class BridgeVerificationGateRunner:
     ) -> list[JsonObject]:
         """Run an allowlisted verification probe in `workspace_dir` and return gate receipts.
 
-        Runs `[sys.executable, "-m", "pytest", "-q"]` if `tests/` or any `test_*.py` file
-        exists in `workspace_dir`; otherwise runs a deterministic Python syntax probe.
+        Runs `[sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]` if `tests/`
+        or any `test_*.py` file exists in `workspace_dir`; otherwise runs a deterministic
+        Python syntax probe.
 
         Args:
             workspace_dir: Target workspace directory path.
@@ -80,17 +85,18 @@ class BridgeVerificationGateRunner:
                 timeout=timeout_seconds,
             )
             exit_code = proc.returncode if proc.returncode is not None else -1
-        except TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await proc.wait()
+        except BaseException as exc:
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+            if not isinstance(exc, TimeoutError):
+                raise
             stdout_bytes = b""
             exit_code = -1
 
         duration = round(time.monotonic() - started_mono, 2)
-        stdout_digest = f"sha256:{hashlib.sha256(stdout_bytes).hexdigest()}"
+        stdout_digest = f"sha256:{compute_sha256_hex(stdout_bytes)}"
         return [
             {
                 "command": cmd_str,
@@ -130,12 +136,19 @@ class BridgeVerificationGateRunner:
             or not isinstance(record.result, dict)
         ):
             return {}
+        result = record.result
+        stored_digest = result.get("snapshot_digest")
         if (
-            record.result.get("workspace_dir") != workspace_dir
-            or record.result.get("source_task_digest") != source_task_digest
+            not isinstance(stored_digest, str)
+            or result.get("schema_version") != TRIAD_RESULT_SCHEMA_VERSION
+            or result.get("workspace_dir") != workspace_dir
+            or result.get("source_task_digest") != source_task_digest
         ):
             return {}
-        roles = record.result.get("roles")
+        unsigned = {k: v for k, v in result.items() if k != "snapshot_digest"}
+        if canonical_sha256(unsigned) != stored_digest:
+            return {}
+        roles = result.get("roles")
         if not isinstance(roles, dict):
             return {}
 
@@ -146,7 +159,7 @@ class BridgeVerificationGateRunner:
                 continue
             verdict = role_snap.get("verdict")
             if (
-                role_snap.get("state") == str(RoleExecutionState.SUCCEEDED)
+                role_snap.get("state") == RoleExecutionState.SUCCEEDED
                 and role_snap.get("review_artifact_present") is True
                 and isinstance(verdict, str)
             ):
@@ -166,8 +179,8 @@ class BridgeVerificationGateRunner:
                             restored_struct = dict(orig_struct)
                 resumed[role] = {
                     "ok": True,
-                    "status": str(JobStatusKind.SUCCEEDED),
-                    "outcome_state": str(OutcomeStateKind.CONFIRMED_SUCCESS),
+                    "status": JobStatusKind.SUCCEEDED,
+                    "outcome_state": OutcomeStateKind.CONFIRMED_SUCCESS,
                     "resumed_from_collaboration_id": cid,
                     "structured_output": restored_struct,
                 }
@@ -221,7 +234,7 @@ class BridgeVerificationGateRunner:
         bounded_max = max(1, min(max_rounds, 3))
         round_idx = 1
         repair_rounds_executed = 0
-        trigger_verdicts = (str(AuditVerdict.BLOCK), str(AuditVerdict.WARN))
+        trigger_verdicts = (AuditVerdict.BLOCK, AuditVerdict.WARN)
 
         while round_idx < bounded_max and codex_verdict in trigger_verdicts:
             round_idx += 1
@@ -257,7 +270,7 @@ class BridgeVerificationGateRunner:
                 job_store=job_store,
             )
             sonnet_res = repaired_sonnet
-            if map_response_to_role_state(sonnet_res) != str(RoleExecutionState.SUCCEEDED):
+            if map_response_to_role_state(sonnet_res) != RoleExecutionState.SUCCEEDED:
                 break
             repair_rounds_executed += 1
 
@@ -281,7 +294,7 @@ class BridgeVerificationGateRunner:
             )
             codex_res = await execute_fn(
                 prompt=audit_prompt,
-                schema_name="adversarial_audit",
+                schema_name=SchemaName.ADVERSARIAL_AUDIT,
                 output_schema=ADVERSARIAL_AUDIT_SCHEMA,
                 workspace_dir=workspace_dir,
                 sandbox_mode="read-only",

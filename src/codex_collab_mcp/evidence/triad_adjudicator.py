@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import json
 import re
 
 from codex_collab_mcp.collab_enums import (
     AuditVerdict,
+    CanonicalModelId,
     CollaborationState,
     ConsensusState,
     EvidenceDimensionState,
+    JobStatusKind,
+    OutcomeStateKind,
     RoleExecutionState,
     TriadRole,
 )
@@ -49,7 +51,7 @@ class RoleArtifactInspector:
         status = raw_status.strip().lower() if isinstance(raw_status, str) else ""
         if status in {
             str(RoleExecutionState.TIMED_OUT_UNKNOWN),
-            "outcome_unknown",
+            str(OutcomeStateKind.OUTCOME_UNKNOWN),
             "unknown",
         }:
             return str(RoleExecutionState.TIMED_OUT_UNKNOWN)
@@ -57,7 +59,7 @@ class RoleArtifactInspector:
             return str(RoleExecutionState.RUNNING)
         if status == RoleExecutionState.QUEUED:
             return str(RoleExecutionState.QUEUED)
-        if status in {str(RoleExecutionState.SUCCEEDED), "completed"}:
+        if status in {str(RoleExecutionState.SUCCEEDED), str(JobStatusKind.COMPLETED)}:
             return (
                 str(RoleExecutionState.SUCCEEDED)
                 if res.get("ok") is True
@@ -85,7 +87,7 @@ class RoleArtifactInspector:
         raw_status = res.get("status")
         return isinstance(raw_status, str) and raw_status.strip().lower() in {
             str(RoleExecutionState.SUCCEEDED),
-            "completed",
+            str(JobStatusKind.COMPLETED),
         }
 
     def extract_artifact(self, res: JsonObject | None) -> JsonObject | None:
@@ -332,7 +334,7 @@ class TriadConsensusAdjudicator:
                         not isinstance(model_id, str)
                         or not model_id.strip()
                         or model_id.strip() != model_id
-                        or model_id == "codex-default"
+                        or model_id == CanonicalModelId.CODEX_DEFAULT
                         or not response_present
                     )
                 )
@@ -351,7 +353,8 @@ class TriadConsensusAdjudicator:
             completed_success = (
                 response_ok is True
                 and isinstance(response_status, str)
-                and response_status in {str(RoleExecutionState.SUCCEEDED), "completed"}
+                and response_status
+                in {str(RoleExecutionState.SUCCEEDED), str(JobStatusKind.COMPLETED)}
             )
 
             artifact_present = role_snapshot.get("review_artifact_present")
@@ -425,7 +428,7 @@ class TriadConsensusAdjudicator:
             role_outputs=role_outputs,
             decision_authority=authority,
         )
-        if json.dumps(saved_adjudication, sort_keys=True) != json.dumps(recomputed, sort_keys=True):
+        if saved_adjudication != recomputed:
             return None
         return recomputed
 

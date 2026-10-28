@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TypedDict
 
+from codex_collab_mcp.collab_enums import AuthContextKind, EngineKind, ProviderKind
 from codex_collab_mcp.routing.contract_dicts import ExternalMcpOAuthWarningDict
 from codex_collab_mcp.schemas import JsonValue
 
@@ -23,7 +24,7 @@ class AgyAuthBoundary:
     """Immutable internal DTO for Antigravity local CSRF authentication boundary metadata."""
 
     antigravity_rpc_connected: bool
-    auth_context: str = "antigravity_local_csrf"
+    auth_context: str = AuthContextKind.ANTIGRAVITY_LOCAL_CSRF
     codex_cli_oauth_affected: bool = False
     auto_credential_refresh_performed: bool = False
 
@@ -62,8 +63,8 @@ class AgyModelConfigEntry:
     placeholder: str
     remaining_quota: float | None
     routable: bool
-    provider: str = "antigravity"
-    engine: str = "antigravity_local_rpc"
+    provider: str = ProviderKind.ANTIGRAVITY
+    engine: str = EngineKind.ANTIGRAVITY_LOCAL_RPC
 
     def to_dict(self) -> AgyModelConfigEntryDict:
         """Serialize the model catalog entry into a TypedDict.
@@ -96,7 +97,7 @@ class CodexCliAuthBoundary:
     """Immutable internal DTO for Codex CLI authentication boundary metadata."""
 
     isolated_external_mcp_oauth_warnings: list[ExternalMcpOAuthWarningDict] | JsonValue
-    auth_context: str = "codex_chatgpt_oauth"
+    auth_context: str = AuthContextKind.CODEX_CHATGPT_OAUTH
     antigravity_rpc_affected: bool = False
     auto_credential_refresh_performed: bool = False
 

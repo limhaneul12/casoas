@@ -10,6 +10,13 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from codex_collab_mcp.collab_enums import (
+    CanonicalModelId,
+    EngineKind,
+    JobStatusKind,
+    OutcomeStateKind,
+    ProviderKind,
+)
 from codex_collab_mcp.evidence.workspace_digests import resolve_workspace_dir
 from codex_collab_mcp.routing.auth_redaction import classify_stderr_and_auth_boundaries
 from codex_collab_mcp.routing.policy_engine import (
@@ -65,7 +72,9 @@ class CodexAuxiliaryRunner:
         req_id = f"cdx-{uuid.uuid4().hex[:10]}"
         call_path = "runner.run_codex_git_review -> subprocess(codex review)"
 
-        route = validate_and_resolve_route("codex_cli", model, "openai_codex", reasoning_effort)
+        route = validate_and_resolve_route(
+            EngineKind.CODEX_CLI, model, ProviderKind.OPENAI_CODEX, reasoning_effort
+        )
         if not route.valid:
             ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             return build_rejected_pre_dispatch_response(
@@ -117,14 +126,14 @@ class CodexAuxiliaryRunner:
                 started_at_iso=started_iso,
                 ended_at_iso=ended_iso,
                 duration_seconds=duration,
-                status="timed_out_unknown",
-                outcome_state="outcome_unknown",
+                status=JobStatusKind.TIMED_OUT_UNKNOWN,
+                outcome_state=OutcomeStateKind.OUTCOME_UNKNOWN,
                 failure_reason=timeout_msg,
             )
             return {
                 "ok": False,
-                "status": "timed_out_unknown",
-                "outcome_state": "outcome_unknown",
+                "status": JobStatusKind.TIMED_OUT_UNKNOWN,
+                "outcome_state": OutcomeStateKind.OUTCOME_UNKNOWN,
                 "request_id": req_id,
                 "workspace_dir": resolved_cwd,
                 "error": timeout_msg,
@@ -149,16 +158,24 @@ class CodexAuxiliaryRunner:
             started_at_iso=started_iso,
             ended_at_iso=ended_iso,
             duration_seconds=duration,
-            status="succeeded" if exit_ok else "failed",
-            outcome_state="confirmed_success" if exit_ok else "confirmed_failure",
+            status=JobStatusKind.SUCCEEDED if exit_ok else JobStatusKind.FAILED,
+            outcome_state=(
+                OutcomeStateKind.CONFIRMED_SUCCESS
+                if exit_ok
+                else OutcomeStateKind.CONFIRMED_FAILURE
+            ),
             output_text=review_out if exit_ok else None,
             failure_reason=sanitized_stderr if not exit_ok else None,
         )
 
         return {
             "ok": exit_ok,
-            "status": "succeeded" if exit_ok else "failed",
-            "outcome_state": "confirmed_success" if exit_ok else "confirmed_failure",
+            "status": JobStatusKind.SUCCEEDED if exit_ok else JobStatusKind.FAILED,
+            "outcome_state": (
+                OutcomeStateKind.CONFIRMED_SUCCESS
+                if exit_ok
+                else OutcomeStateKind.CONFIRMED_FAILURE
+            ),
             "request_id": req_id,
             "exit_code": proc.returncode,
             "workspace_dir": resolved_cwd,
@@ -204,7 +221,7 @@ class CodexAuxiliaryRunner:
         sid = session_id.strip()
         if not sid or sid.startswith("-"):
             raise ValueError("Session ID must be a non-empty string not starting with '-'.")
-        route = validate_and_resolve_route("codex_cli", model, "openai_codex")
+        route = validate_and_resolve_route(EngineKind.CODEX_CLI, model, ProviderKind.OPENAI_CODEX)
         if not route.valid:
             ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             return build_rejected_pre_dispatch_response(
@@ -235,7 +252,7 @@ class CodexAuxiliaryRunner:
                 "-o",
                 str(output_file),
             ]
-            if model and (model_s := model.strip()) and model_s != "codex-default":
+            if model and (model_s := model.strip()) and model_s != CanonicalModelId.CODEX_DEFAULT:
                 if model_s.startswith("-"):
                     raise ValueError("Codex model identifier must not start with '-'.")
                 cmd.extend(["-m", model_s])
@@ -268,14 +285,14 @@ class CodexAuxiliaryRunner:
                     started_at_iso=started_iso,
                     ended_at_iso=ended_iso,
                     duration_seconds=duration,
-                    status="timed_out_unknown",
-                    outcome_state="outcome_unknown",
+                    status=JobStatusKind.TIMED_OUT_UNKNOWN,
+                    outcome_state=OutcomeStateKind.OUTCOME_UNKNOWN,
                     failure_reason=timeout_msg,
                 )
                 return {
                     "ok": False,
-                    "status": "timed_out_unknown",
-                    "outcome_state": "outcome_unknown",
+                    "status": JobStatusKind.TIMED_OUT_UNKNOWN,
+                    "outcome_state": OutcomeStateKind.OUTCOME_UNKNOWN,
                     "request_id": req_id,
                     "mode": subcmd,
                     "parent_session_id": session_id,
@@ -309,16 +326,24 @@ class CodexAuxiliaryRunner:
                 started_at_iso=started_iso,
                 ended_at_iso=ended_iso,
                 duration_seconds=duration,
-                status="succeeded" if exit_ok else "failed",
-                outcome_state="confirmed_success" if exit_ok else "confirmed_failure",
+                status=JobStatusKind.SUCCEEDED if exit_ok else JobStatusKind.FAILED,
+                outcome_state=(
+                    OutcomeStateKind.CONFIRMED_SUCCESS
+                    if exit_ok
+                    else OutcomeStateKind.CONFIRMED_FAILURE
+                ),
                 output_text=raw_response if exit_ok else None,
                 failure_reason=sanitized_stderr if not exit_ok else None,
             )
 
             return {
                 "ok": exit_ok,
-                "status": "succeeded" if exit_ok else "failed",
-                "outcome_state": "confirmed_success" if exit_ok else "confirmed_failure",
+                "status": JobStatusKind.SUCCEEDED if exit_ok else JobStatusKind.FAILED,
+                "outcome_state": (
+                    OutcomeStateKind.CONFIRMED_SUCCESS
+                    if exit_ok
+                    else OutcomeStateKind.CONFIRMED_FAILURE
+                ),
                 "request_id": req_id,
                 "exit_code": proc.returncode,
                 "mode": subcmd,

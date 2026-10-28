@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import uuid
@@ -180,6 +181,10 @@ class CodexHttpFallbackRunner:
                 raise TypeError("HTTP response body is not a JSON object.")
             content = str(body["choices"][0]["message"]["content"])
             reported_model = str(body.get("model") or resolved_model)
+        except asyncio.CancelledError:
+            if job_store is not None:
+                job_store.cancel_job(req_id, reason="HTTP fallback request cancelled.")
+            raise
         except httpx.TimeoutException as exc:
             ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             duration = round(time.monotonic() - started_mono, 2)
@@ -268,7 +273,9 @@ class CodexHttpFallbackRunner:
         parsed: JsonValue = (
             CodexOutputParser.parse_structured_response(content) if output_schema else content
         )
-        structured_obj: JsonObject | None = parsed if isinstance(parsed, dict) else None
+        structured_obj: JsonObject | None = (
+            parsed if isinstance(parsed_data := parsed, dict) else None
+        )
 
         receipt = build_execution_receipt(
             request_id=req_id,
@@ -306,7 +313,7 @@ class CodexHttpFallbackRunner:
             "provider": route.provider,
             "engine": EngineKind.HTTP,
             "model": reported_model,
-            "data": parsed,
+            "data": parsed_data,
             "structured_output": structured_obj,
             "receipt": as_json_object(receipt),
             "budget": as_json_object(budget),

@@ -72,11 +72,10 @@ class WorkspaceDigestCalculator:
             Prefixed `sha256:...` digest string.
         """
         encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return f"sha256:{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
+        return f"sha256:{compute_sha256_hex(encoded)}"
 
     def compute_task_hash(
         self,
-        *,
         task_spec: str,
         target_code_or_context: str,
         invariants_and_rules: str,
@@ -196,3 +195,20 @@ DIGEST_CALCULATOR = WorkspaceDigestCalculator()
 canonical_sha256 = DIGEST_CALCULATOR.canonical_hash
 resolve_workspace_dir = DIGEST_CALCULATOR.resolve_dir
 compute_task_digest = DIGEST_CALCULATOR.compute_task_hash
+
+
+def matches_workspace(record_ws: str, ws_filter: str) -> bool:
+    """Check whether a stored workspace directory matches the resolved filter path.
+
+    Args:
+        record_ws: Workspace directory string stored on a job or handoff record.
+        ws_filter: Resolved absolute workspace directory filter string.
+
+    Returns:
+        True if the workspace paths match, otherwise False.
+    """
+    if record_ws == ws_filter:
+        return True
+    if not record_ws.strip() or Path(record_ws).is_absolute():
+        return False
+    return resolve_workspace_dir(record_ws) == ws_filter

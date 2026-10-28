@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 import codex_collab_mcp.server as server
-from codex_collab_mcp.job_store import JobStore
+from codex_collab_mcp.job_store import CodexJobRecord, JobStore
 from codex_collab_mcp.schemas import JsonObject
 
 
@@ -518,8 +519,6 @@ async def test_readonly_pipeline_reviews_source_not_response_json(
         )
     )
     assert source in captured[0]
-    import hashlib
-
     assert (
         result["evidence_scope"]["inline_context_digest"]
         == "sha256:" + hashlib.sha256(source.encode()).hexdigest()
@@ -561,8 +560,6 @@ async def test_failed_final_write_cannot_certify_cached_completed_record(
     original_persist = server.job_store._persist
 
     def fail_completed_write(record: object) -> None:
-        from codex_collab_mcp.job_store import CodexJobRecord
-
         assert isinstance(record, CodexJobRecord)
         if record.status == "completed":
             raise OSError("simulated final write failure")

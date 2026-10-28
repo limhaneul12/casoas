@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from codex_collab_mcp.collab_enums import JobStatusKind, OutcomeStateKind
+from codex_collab_mcp.evidence.workspace_digests import resolve_workspace_dir
 from codex_collab_mcp.routing.contract_dicts import ExecutionReceiptDict
 from codex_collab_mcp.schemas import JsonObject, JsonValue
 from codex_collab_mcp.storage.job_record import CodexJobRecord
@@ -58,14 +59,14 @@ class JobStore(_JobQueryStore):
         """
         with self._lock:
             rid = (job_id or "").strip() or f"cdx-{uuid.uuid4().hex[:10]}"
-            ws = str(Path(w).expanduser().resolve()) if (w := workspace_dir.strip()) else ""
+            ws = resolve_workspace_dir(workspace_dir) or workspace_dir
             ts = created_at if created_at is not None else time.time()
             rec = CodexJobRecord(
                 job_id=rid,
                 task_type=task_type,
                 status=str(JobStatusKind.RUNNING),
                 created_at=ts,
-                workspace_dir=ws or workspace_dir,
+                workspace_dir=ws,
                 model=model,
                 metadata=metadata or {},
                 outcome_state=str(OutcomeStateKind.IN_FLIGHT),

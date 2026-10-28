@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 
@@ -64,11 +63,7 @@ class AlexandriaDecisionPackService:
 
         cached_record = job_store.get_job(collaboration_id)
         record = job_store.get_persisted_job(collaboration_id)
-        if cached_record is None or record is None:
-            return None
-        cached_state = {k: v for k, v in cached_record.to_dict().items() if k != "elapsed_seconds"}
-        persisted_state = {k: v for k, v in record.to_dict().items() if k != "elapsed_seconds"}
-        if cached_state != persisted_state:
+        if cached_record is None or record is None or cached_record != record:
             return None
         if (
             record.job_id != collaboration_id
@@ -382,11 +377,7 @@ Caller-provided resolution; it has not been verified against the cited run.
             caller_content=caller_content,
             authoritative_evidence=authoritative_evidence,
         )
-        digest = hashlib.sha256(
-            json.dumps(
-                digest_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-        ).hexdigest()[:16]
+        digest = canonical_sha256(digest_payload).removeprefix("sha256:")[:16]
         idempotency_key = f"heterarchy-argon-codex-{digest}"
         title_prefix = (
             "Heterarchy Consensus"

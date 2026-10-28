@@ -180,16 +180,17 @@ class BudgetEnvelope:
         ).to_dict()
 
 
-def compute_sha256_hex(content: str) -> str:
-    """Return a deterministic SHA-256 hex digest of a UTF-8 string.
+def compute_sha256_hex(content: str | bytes) -> str:
+    """Return a deterministic SHA-256 hex digest of a UTF-8 string or raw bytes.
 
     Args:
-        content: Input UTF-8 string to hash.
+        content: Input UTF-8 string or raw bytes to hash.
 
     Returns:
         Lowercase 64-character SHA-256 hexadecimal digest.
     """
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    raw = content if isinstance(content, bytes) else content.encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def compute_output_digest(output_text: str | None) -> str | None:

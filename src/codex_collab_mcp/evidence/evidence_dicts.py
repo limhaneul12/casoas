@@ -18,20 +18,6 @@ class CodegraphIndexSnapshotDict(TypedDict):
     note: str | None
 
 
-class CodegraphSymbolSliceDict(TypedDict):
-    """Serialized representation of a CodegraphSymbolSlice dataclass."""
-
-    name: str
-    qualified_name: str
-    kind: str
-    file_path: str
-    start_line: int
-    end_line: int
-    callers: list[str]
-    callees: list[str]
-    source_excerpt: str
-
-
 class EvidenceDimensionsDict(TypedDict):
     """Verification status across each evidence dimension."""
 

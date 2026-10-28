@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import tempfile
 import time
 import uuid
 from datetime import UTC, datetime
 
+from codex_collab_mcp.collab_enums import (
+    CanonicalModelId,
+    EngineKind,
+    JobStatusKind,
+    OutcomeStateKind,
+)
 from codex_collab_mcp.evidence.workspace_digests import resolve_workspace_dir
 from codex_collab_mcp.job_store import JobStore
 from codex_collab_mcp.routing.auth_redaction import (
@@ -63,7 +70,8 @@ class CodexCliProcessRunner:
             )
         except BaseException:
             if proc.returncode is None:
-                proc.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
                 await proc.wait()
             raise
 
@@ -111,9 +119,9 @@ class CodexCliProcessRunner:
         started_mono = time.monotonic()
         resolved_cwd = str(resolve_workspace_dir(workspace_dir or os.getcwd()))
         call_path = "runner.run_codex_exec -> subprocess(codex exec --json)"
-        default_auth = CodexCommandBuilder.build_auth_boundary()
+        default_auth = as_json_object(CodexCommandBuilder.build_auth_boundary())
 
-        route = validate_and_resolve_route("codex_cli", model, provider, reasoning_effort)
+        route = validate_and_resolve_route(EngineKind.CODEX_CLI, model, provider, reasoning_effort)
         if not route.valid:
             ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
             req_id = (request_id or "").strip() or f"cdx-{uuid.uuid4().hex[:10]}"
@@ -129,8 +137,8 @@ class CodexCliProcessRunner:
                 timeout_seconds=timeout_seconds,
                 extra_fields={
                     "workspace_dir": resolved_cwd,
-                    "model": model or "codex-default",
-                    "auth_boundary": as_json_object(default_auth),
+                    "model": model or CanonicalModelId.CODEX_DEFAULT,
+                    "auth_boundary": default_auth,
                 },
             )
 
@@ -185,31 +193,45 @@ class CodexCliProcessRunner:
         else:
             req_id = (request_id or "").strip() or f"cdx-{uuid.uuid4().hex[:10]}"
 
-        codex_bin = CodexCommandBuilder.resolve_binary(resolve_binary_fn)
+        try:
+            codex_bin = CodexCommandBuilder.resolve_binary(resolve_binary_fn)
+        except Exception as exc:
+            if job_store is not None:
+                job_store.fail_job(req_id, error=redact_sensitive_text(str(exc)))
+            raise
 
         with tempfile.TemporaryDirectory(prefix="codex_mcp_") as tmp_dir:
-            output_file, schema_file_str = CodexOutputParser.prepare_temp_files(
-                tmp_dir,
-                output_schema,
-            )
+            try:
+                output_file, schema_file_str = CodexOutputParser.prepare_temp_files(
+                    tmp_dir,
+                    output_schema,
+                )
 
-            cmd = CodexCommandBuilder.build_exec_command(
-                codex_bin=codex_bin,
-                workspace_dir=resolved_cwd,
-                output_file=str(output_file),
-                schema_file=schema_file_str,
-                sandbox_mode=sandbox_mode,
-                model=model,
-                reasoning_effort=reasoning_effort,
-            )
+                cmd = CodexCommandBuilder.build_exec_command(
+                    codex_bin=codex_bin,
+                    workspace_dir=resolved_cwd,
+                    output_file=str(output_file),
+                    schema_file=schema_file_str,
+                    sandbox_mode=sandbox_mode,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                )
 
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=resolved_cwd,
-            )
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=resolved_cwd,
+                )
+            except asyncio.CancelledError:
+                if job_store is not None:
+                    job_store.cancel_job(req_id, reason="Codex CLI execution cancelled.")
+                raise
+            except Exception as exc:
+                if job_store is not None:
+                    job_store.fail_job(req_id, error=redact_sensitive_text(str(exc)))
+                raise
 
             try:
                 stdout_bytes, stderr_bytes = await cls.communicate_with_cleanup(
@@ -217,6 +239,10 @@ class CodexCliProcessRunner:
                     prompt.encode("utf-8"),
                     timeout_seconds,
                 )
+            except asyncio.CancelledError:
+                if job_store is not None:
+                    job_store.cancel_job(req_id, reason="Codex CLI execution cancelled.")
+                raise
             except TimeoutError:
                 ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
                 duration = round(time.monotonic() - started_mono, 2)
@@ -234,8 +260,8 @@ class CodexCliProcessRunner:
                     started_at_iso=started_iso,
                     ended_at_iso=ended_iso,
                     duration_seconds=duration,
-                    status="timed_out_unknown",
-                    outcome_state="outcome_unknown",
+                    status=JobStatusKind.TIMED_OUT_UNKNOWN,
+                    outcome_state=OutcomeStateKind.OUTCOME_UNKNOWN,
                     attempt_count=attempt_count,
                     result_ref=f"job://{req_id}",
                     failure_reason=timeout_msg,
@@ -253,26 +279,26 @@ class CodexCliProcessRunner:
                         error=timeout_msg,
                         partial_result={
                             "request_id": req_id,
-                            "status": "timed_out_unknown",
-                            "outcome_state": "outcome_unknown",
+                            "status": JobStatusKind.TIMED_OUT_UNKNOWN,
+                            "outcome_state": OutcomeStateKind.OUTCOME_UNKNOWN,
                         },
                         receipt=receipt,
                     )
                 return {
                     "ok": False,
-                    "status": "timed_out_unknown",
-                    "outcome_state": "outcome_unknown",
+                    "status": JobStatusKind.TIMED_OUT_UNKNOWN,
+                    "outcome_state": OutcomeStateKind.OUTCOME_UNKNOWN,
                     "request_id": req_id,
                     "job_id": req_id,
                     "provider": route.provider,
-                    "engine": "codex_cli",
+                    "engine": EngineKind.CODEX_CLI,
                     "workspace_dir": resolved_cwd,
                     "model": route.resolved_model,
                     "duration_seconds": duration,
                     "error": timeout_msg,
                     "receipt": as_json_object(receipt),
                     "budget": as_json_object(budget),
-                    "auth_boundary": as_json_object(default_auth),
+                    "auth_boundary": default_auth,
                 }
 
             stdout_text = stdout_bytes.decode("utf-8", errors="replace")
@@ -309,8 +335,12 @@ class CodexCliProcessRunner:
                 started_at_iso=started_iso,
                 ended_at_iso=ended_iso,
                 duration_seconds=duration,
-                status="succeeded" if exit_ok else "failed",
-                outcome_state="confirmed_success" if exit_ok else "confirmed_failure",
+                status=JobStatusKind.SUCCEEDED if exit_ok else JobStatusKind.FAILED,
+                outcome_state=(
+                    OutcomeStateKind.CONFIRMED_SUCCESS
+                    if exit_ok
+                    else OutcomeStateKind.CONFIRMED_FAILURE
+                ),
                 attempt_count=attempt_count,
                 output_text=raw_response if exit_ok else None,
                 result_ref=f"job://{req_id}",
@@ -342,12 +372,16 @@ class CodexCliProcessRunner:
 
             payload: JsonObject = {
                 "ok": final_ok,
-                "status": "succeeded" if final_ok else "failed",
-                "outcome_state": "confirmed_success" if final_ok else "confirmed_failure",
+                "status": JobStatusKind.SUCCEEDED if final_ok else JobStatusKind.FAILED,
+                "outcome_state": (
+                    OutcomeStateKind.CONFIRMED_SUCCESS
+                    if final_ok
+                    else OutcomeStateKind.CONFIRMED_FAILURE
+                ),
                 "request_id": req_id,
                 "job_id": req_id,
                 "provider": route.provider,
-                "engine": "codex_cli",
+                "engine": EngineKind.CODEX_CLI,
                 "exit_code": proc.returncode,
                 "session_id": session_id,
                 "workspace_dir": resolved_cwd,

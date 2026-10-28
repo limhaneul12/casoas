@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 
 from codex_collab_mcp.agy_bridge import AgyEndpoint
+from codex_collab_mcp.collab_enums import AuthContextKind, RoleExecutionState, TriadRole
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
 from codex_collab_mcp.orchestration.service_dicts import (
@@ -141,7 +143,7 @@ class McpToolDispatcher:
         payload = HandoffCreateResponseDict(
             ok=True,
             ticket=ticket.to_dict(),
-            collaboration_role_state="queued",
+            collaboration_role_state=RoleExecutionState.QUEUED,
             execution_completed=False,
             consensus_eligible=False,
             message=msg,
@@ -247,8 +249,10 @@ class McpToolDispatcher:
             try:
                 stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
             except BaseException:
-                proc.kill()
-                await proc.wait()
+                if proc.returncode is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    await proc.wait()
                 raise
             version_str = stdout_bytes.decode("utf-8", errors="replace").strip()
             cli_ready = proc.returncode == 0
@@ -265,7 +269,7 @@ class McpToolDispatcher:
         advertised_agy_specs = [spec.to_dict() for spec in ANTIGRAVITY_MODEL_SPECS.values()]
         routable_codex_models: list[str] = sorted(CODEX_SUPPORTED_MODELS) if cli_ready else []
         pending_counts = handoff_store.count_pending_by_recipient(
-            ("argon", "sonnet", "opus", "codex")
+            (TriadRole.ARGON, TriadRole.SONNET, TriadRole.OPUS, TriadRole.CODEX)
         )
 
         routing_contract = RoutingContractHealthDict(
@@ -280,14 +284,14 @@ class McpToolDispatcher:
             codex_cli_routable=cli_ready,
         )
         agy_auth = AgyRpcBoundaryHealthDict(
-            auth_context="antigravity_local_csrf",
+            auth_context=AuthContextKind.ANTIGRAVITY_LOCAL_CSRF,
             connected=agy_ep is not None,
             endpoint=agy_ep.base_url if agy_ep else None,
             csrf_token_redacted=True,
             independent_of_codex_cli_oauth=True,
         )
         codex_auth = CodexCliBoundaryHealthDict(
-            auth_context="codex_chatgpt_oauth",
+            auth_context=AuthContextKind.CODEX_CHATGPT_OAUTH,
             cli_binary_ready=cli_ready,
             independent_of_antigravity_rpc=True,
             auto_reauth_enabled=False,
@@ -308,9 +312,9 @@ class McpToolDispatcher:
             routing_contract=routing_contract,
             auth_boundaries=auth_boundaries,
             active_background_jobs=active_background_jobs,
-            pending_argon_handoffs=pending_counts.get("argon", 0),
-            pending_sonnet_handoffs=pending_counts.get("sonnet", 0),
-            pending_opus_handoffs=pending_counts.get("opus", 0),
-            pending_codex_handoffs=pending_counts.get("codex", 0),
+            pending_argon_handoffs=pending_counts.get(TriadRole.ARGON, 0),
+            pending_sonnet_handoffs=pending_counts.get(TriadRole.SONNET, 0),
+            pending_opus_handoffs=pending_counts.get(TriadRole.OPUS, 0),
+            pending_codex_handoffs=pending_counts.get(TriadRole.CODEX, 0),
         )
         return json.dumps(response, ensure_ascii=False, indent=2)

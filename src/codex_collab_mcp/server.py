@@ -13,6 +13,15 @@ from codex_collab_mcp.agy_bridge import (
     list_agy_models,
     run_agy_model_prompt,
 )
+from codex_collab_mcp.collab_enums import (
+    CanonicalModelId,
+    HandoffPriorityKind,
+    HandoffStatusKind,
+    OrchestrationMode,
+    ReasoningTier,
+    SchemaName,
+    TriadRole,
+)
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
 from codex_collab_mcp.orchestration.decision_pack_service import AlexandriaDecisionPackService
@@ -112,7 +121,7 @@ async def codex_adversarial_audit(
     context_notes: str = "",
     workspace_dir: str = ".",
     model: str | None = None,
-    reasoning_effort: str = "xhigh",
+    reasoning_effort: str = ReasoningTier.XHIGH,
     async_background: bool = False,
     engine: str = "cli",
     timeout_seconds: float = 300.0,
@@ -154,7 +163,7 @@ async def codex_adversarial_audit(
         Pretty-printed JSON string containing the adversarial audit findings and receipt.
     """
     p_in = (target_code_or_diff, design_rationale, attack_vectors or [], context_notes)
-    c = ("adversarial_audit", build_adversarial_audit_prompt(*p_in), target_code_or_diff)
+    c = (SchemaName.ADVERSARIAL_AUDIT, build_adversarial_audit_prompt(*p_in), target_code_or_diff)
     e = (
         workspace_dir,
         "read-only",
@@ -180,7 +189,7 @@ async def codex_targeted_synthesize(
     include_unit_tests: bool = True,
     workspace_dir: str = ".",
     model: str | None = None,
-    reasoning_effort: str = "high",
+    reasoning_effort: str = ReasoningTier.HIGH,
     engine: str = "cli",
     timeout_seconds: float = 240.0,
     provider: str | None = None,
@@ -222,7 +231,7 @@ async def codex_targeted_synthesize(
     """
     p_in = (signature, contract_and_constraints, context_types, language, include_unit_tests)
     inline_ctx = f"{signature}\n{contract_and_constraints}\n{context_types}"
-    c = ("targeted_synthesis", build_targeted_synthesis_prompt(*p_in), inline_ctx)
+    c = (SchemaName.TARGETED_SYNTHESIS, build_targeted_synthesis_prompt(*p_in), inline_ctx)
     e = (workspace_dir, "read-only", model, reasoning_effort, False, engine, timeout_seconds)
     rq = (provider, request_id, idempotency_key, retry_same_request, max_input_bytes)
     ev = (files_inspected, symbols_inspected, executed_test_commands)
@@ -239,7 +248,7 @@ async def codex_differential_implementations(
     language: str = "python",
     workspace_dir: str = ".",
     model: str | None = None,
-    reasoning_effort: str = "high",
+    reasoning_effort: str = ReasoningTier.HIGH,
     engine: str = "cli",
     timeout_seconds: float = 300.0,
     provider: str | None = None,
@@ -278,7 +287,7 @@ async def codex_differential_implementations(
     """
     p_in = (problem_spec, optimization_axes or _DEFAULT_AXES, context_types, language)
     c = (
-        "differential_candidates",
+        SchemaName.DIFFERENTIAL_CANDIDATES,
         build_differential_candidates_prompt(*p_in),
         f"{problem_spec}\n{context_types}",
     )
@@ -299,7 +308,7 @@ async def codex_rescue_sandbox(
     workspace_dir: str = ".",
     sandbox_mode: str = "read-only",
     model: str | None = None,
-    reasoning_effort: str = "xhigh",
+    reasoning_effort: str = ReasoningTier.XHIGH,
     async_background: bool = False,
     engine: str = "cli",
     timeout_seconds: float = 300.0,
@@ -368,7 +377,7 @@ async def codex_git_review(
     base_branch: str | None = None,
     commit_sha: str | None = None,
     model: str | None = None,
-    reasoning_effort: str = "high",
+    reasoning_effort: str = ReasoningTier.HIGH,
     timeout_seconds: float = 300.0,
 ) -> str:
     """Run native `codex review` on uncommitted changes, a base branch, or a commit SHA.
@@ -454,10 +463,10 @@ async def codex_job_list(limit: int = 15, workspace_dir: str | None = None) -> s
 async def heterarchy_handoff_create(
     title: str,
     spec_or_payload: str,
-    sender: str = "codex",
-    recipient: str = "argon",
+    sender: str = TriadRole.CODEX,
+    recipient: str = TriadRole.ARGON,
     workspace_dir: str = ".",
-    priority: str = "normal",
+    priority: str = HandoffPriorityKind.NORMAL,
 ) -> str:
     """Create a bidirectional task handoff ticket between GPT/Codex and Antigravity (Argon).
 
@@ -482,7 +491,7 @@ async def heterarchy_handoff_create(
 @mcp.tool()
 async def heterarchy_handoff_inbox(
     recipient: str | None = None,
-    status: str | None = "pending",
+    status: str | None = HandoffStatusKind.PENDING,
     workspace_dir: str | None = None,
     limit: int = 20,
 ) -> str:
@@ -506,7 +515,7 @@ async def heterarchy_handoff_inbox(
 @mcp.tool()
 async def heterarchy_handoff_resolve(
     ticket_id: str,
-    status: str = "completed",
+    status: str = HandoffStatusKind.COMPLETED,
     resolution_note: str = "",
     alexandria_ref: str = "",
 ) -> str:
@@ -587,12 +596,12 @@ async def heterarchy_triad_orchestrate(
     target_code_or_context: str = "",
     invariants_and_rules: str = "",
     language: str = "python",
-    mode: str = "pipeline",
+    mode: str = OrchestrationMode.PIPELINE,
     workspace_dir: str = ".",
     claude_model: str = DEFAULT_CLAUDE_MODEL,
     codex_model: str | None = None,
-    codex_reasoning_effort: str = "xhigh",
-    argon_model: str = "gemini-4-argon-high",
+    codex_reasoning_effort: str = ReasoningTier.XHIGH,
+    argon_model: str = CanonicalModelId.GEMINI_4_ARGON_HIGH,
     invoke_argon_rpc: bool = True,
     argon_handoff_ticket_id: str | None = None,
     timeout_seconds: float = 300.0,

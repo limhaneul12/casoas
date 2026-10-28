@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
 import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -15,9 +17,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Final
 
+from codex_collab_mcp.collab_enums import EngineKind, ProviderKind, ReasoningTier
 from codex_collab_mcp.routing.model_specs import ANTIGRAVITY_MODEL_SPECS
 from codex_collab_mcp.routing.policy_engine import validate_and_resolve_route
-from codex_collab_mcp.schemas import JsonObject, JsonValue
+from codex_collab_mcp.schemas import JsonObject
 from codex_collab_mcp.transports.transport_dicts import (
     AgyAuthBoundary,
     AgyAuthBoundaryDict,
@@ -65,6 +68,7 @@ class AntigravityRpcClient:
     """Low-level Connect-RPC client and local language_server process endpoint discovery."""
 
     _cached_endpoint: tuple[AgyEndpoint, float] | None = None
+    _cache_lock: threading.Lock = threading.Lock()
     _ENDPOINT_CACHE_TTL: float = 15.0
 
     @staticmethod
@@ -103,7 +107,7 @@ class AntigravityRpcClient:
         with urllib.request.urlopen(req, timeout=timeout_seconds, context=ctx) as resp:  # noqa: S310
             raw_text = resp.read().decode("utf-8", errors="replace")
 
-        parsed: JsonValue = json.loads(raw_text) if raw_text.strip() else {}
+        parsed = json.loads(raw_text) if raw_text.strip() else {}
         if isinstance(parsed, dict):
             return parsed
         return {"raw": parsed}
@@ -131,7 +135,8 @@ class AntigravityRpcClient:
             stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=probe_timeout)
         except BaseException as exc:
             if proc.returncode is None:
-                proc.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
                 await proc.wait()
             if isinstance(exc, (TimeoutError, OSError)):
                 return ""
@@ -198,9 +203,11 @@ class AntigravityRpcClient:
         Returns:
             Discovered `AgyEndpoint` instance if a live server responds, otherwise `None`.
         """
-        if rpc_transport is None and cls._cached_endpoint is not None:
-            if (time.monotonic() - cls._cached_endpoint[1]) < cls._ENDPOINT_CACHE_TTL:
-                return cls._cached_endpoint[0]
+        if rpc_transport is None:
+            with cls._cache_lock:
+                cached = cls._cached_endpoint
+            if cached is not None and (time.monotonic() - cached[1]) < cls._ENDPOINT_CACHE_TTL:
+                return cached[0]
 
         transport = rpc_transport or cls.post_connect_rpc_sync
         env_csrf = os.environ.get("ANTIGRAVITY_CSRF_TOKEN", "").strip()
@@ -237,11 +244,13 @@ class AntigravityRpcClient:
                     if res is not None and "clientModelConfigs" in res:
                         endpoint = AgyEndpoint(base_url=base_url, csrf_token=token, pid=pid)
                         if rpc_transport is None:
-                            cls._cached_endpoint = (endpoint, time.monotonic())
+                            with cls._cache_lock:
+                                cls._cached_endpoint = (endpoint, time.monotonic())
                         return endpoint
 
         if rpc_transport is None:
-            cls._cached_endpoint = None
+            with cls._cache_lock:
+                cls._cached_endpoint = None
         return None
 
     @staticmethod
@@ -301,7 +310,7 @@ class AntigravityModelCatalog:
         is_disallowed_claude = (
             spec is not None
             and spec.model_id.startswith("claude-")
-            and spec.reasoning_tier != "medium"
+            and spec.reasoning_tier != ReasoningTier.MEDIUM
         )
         routable = bool(
             placeholder
@@ -349,6 +358,9 @@ class AntigravityModelCatalog:
                 5.0,
             )
         except Exception:
+            if endpoint is None and rpc_transport is None:
+                with AntigravityRpcClient._cache_lock:
+                    AntigravityRpcClient._cached_endpoint = None
             return []
 
         raw_configs = data.get("clientModelConfigs")
@@ -381,9 +393,9 @@ class AntigravityModelCatalog:
             Tuple of `(resolved_model_id, placeholder_token)`.
         """
         route = validate_and_resolve_route(
-            engine="antigravity_local_rpc",
+            engine=EngineKind.ANTIGRAVITY_LOCAL_RPC,
             model=requested_model,
-            provider="antigravity",
+            provider=ProviderKind.ANTIGRAVITY,
             enforce_claude_medium_policy=True,
         )
         if not route.valid:
@@ -428,7 +440,7 @@ class AntigravityModelCatalog:
                 cleaned = fence_match.group(1).strip()
 
         try:
-            parsed: JsonValue = json.loads(cleaned)
+            parsed = json.loads(cleaned)
             if isinstance(parsed, dict):
                 return parsed
         except json.JSONDecodeError:
@@ -436,7 +448,7 @@ class AntigravityModelCatalog:
             end_idx = cleaned.rfind("}")
             if start_idx != -1 and end_idx > start_idx:
                 try:
-                    sub_parsed: JsonValue = json.loads(cleaned[start_idx : end_idx + 1])
+                    sub_parsed = json.loads(cleaned[start_idx : end_idx + 1])
                     if isinstance(sub_parsed, dict):
                         return sub_parsed
                 except json.JSONDecodeError:

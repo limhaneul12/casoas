@@ -265,6 +265,9 @@ class McpExecutionGateway:
                         error=str(res.get("error") or "Rejected pre-dispatch"),
                         receipt=receipt_obj,
                     )
+            except asyncio.CancelledError:
+                job_store.cancel_job(record.job_id, reason="Background task cancelled.")
+                raise
             except Exception as exc:
                 job_store.fail_job(record.job_id, error=redact_sensitive_text(str(exc)))
 

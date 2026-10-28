@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import sqlite3
 import sys
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import httpx
 import pytest
 
 import codex_collab_mcp.server as server_mod
@@ -24,6 +27,7 @@ from codex_collab_mcp.contracts import (
     redact_sensitive_text,
     validate_and_resolve_route,
 )
+from codex_collab_mcp.evidence.codegraph_slicer import slice_codegraph_symbols
 from codex_collab_mcp.handoff_store import HandoffStore
 from codex_collab_mcp.job_store import JobStore
 from codex_collab_mcp.prompts import (
@@ -38,6 +42,7 @@ from codex_collab_mcp.runner import (
     build_codex_review_command,
     parse_jsonl_events_with_model,
     run_codex_exec,
+    run_http_fallback,
 )
 from codex_collab_mcp.schemas import (
     ADVERSARIAL_AUDIT_SCHEMA,
@@ -57,6 +62,16 @@ from codex_collab_mcp.server import (
     heterarchy_triad_orchestrate,
     mcp,
 )
+from codex_collab_mcp.transports.codex_aux_runners import CodexAuxiliaryRunner
+
+
+@pytest.fixture(autouse=True)
+def _isolate_server_stores(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Ensure server-level JobStore and HandoffStore never mutate the user's home directory."""
+    monkeypatch.setattr(server_mod, "job_store", JobStore(state_dir=tmp_path / "_default_jobs"))
+    monkeypatch.setattr(
+        server_mod, "handoff_store", HandoffStore(state_dir=tmp_path / "_default_handoffs")
+    )
 
 
 def _assert_strict_openai_json_schema(schema: JsonObject) -> None:
@@ -1393,9 +1408,6 @@ async def test_bridge_executed_verification_gates_promote_test_execution(
 
 def _seed_test_codegraph_db(ws: Path) -> None:
     """Create a self-contained `.codegraph/codegraph.db` fixture in `ws` for CI and local tests."""
-    import contextlib
-    import sqlite3
-
     src_file = ws / "src" / "codex_collab_mcp" / "domain" / "routing_policy.py"
     src_file.parent.mkdir(parents=True, exist_ok=True)
     src_file.write_text(
@@ -1440,8 +1452,6 @@ def test_codegraph_context_slicer_and_persisted_idempotency_index(
     tmp_path: Path,
 ) -> None:
     """Verify CodeGraph symbol slicing and SQLite WAL `jobs.db` indexed idempotency lookup."""
-    from codex_collab_mcp.evidence.codegraph_slicer import slice_codegraph_symbols
-
     _seed_test_codegraph_db(tmp_path)
     sliced_md = slice_codegraph_symbols(str(tmp_path), ["RoutingPolicyEngine"])
     assert "### CodeGraph Symbol Slices" in sliced_md
@@ -1473,9 +1483,6 @@ async def test_http_fallback_job_store_registration_and_gateway_codegraph_slicin
     tmp_path: Path,
 ) -> None:
     """Verify HTTP fallback registers in JobStore and gateway tools slice CodeGraph symbols."""
-    import httpx
-
-    from codex_collab_mcp.runner import run_http_fallback
 
     class _FakeResponse:
         def raise_for_status(self) -> None:
@@ -1543,9 +1550,9 @@ async def test_http_fallback_job_store_registration_and_gateway_codegraph_slicin
                 "verdict": "PASS",
                 "summary": "Sliced symbol verified.",
                 "crafted_code": "x = 1",
-                "design_decisions": [],
-                "edge_cases_handled": [],
-                "handoff_notes_for_codex": "ok",
+                "design_highlights": ["Clean slice"],
+                "edge_cases_guarded": ["None"],
+                "handoff_notes_for_codex_audit": "ok",
             },
         }
 
@@ -1559,6 +1566,7 @@ async def test_http_fallback_job_store_registration_and_gateway_codegraph_slicin
     )
     craft_res = json.loads(craft_raw)
     assert craft_res["ok"] is True
+    assert craft_res["schema_valid"] is True
     assert len(captured_prompts) == 1
     assert "[CodeGraph Sliced Symbol Context]:" in captured_prompts[0]
     assert "RoutingPolicyEngine" in captured_prompts[0]
@@ -1660,8 +1668,6 @@ async def test_triad_role_snapshot_model_ids_and_job_telemetry(
     assert argon_snap["model_id"] == "gemini-4-argon"
     assert sonnet_snap["model_id"] == "claude-opus-5-5-medium"
     assert codex_snap["model_id"] == "gpt-6.1-sol"
-
-    from codex_collab_mcp.transports.codex_aux_runners import CodexAuxiliaryRunner
 
     for bad_val in ("--help", "-c", " --dangerously-bypass-approvals-and-sandbox "):
         with pytest.raises(ValueError, match="must not start with '-'"):

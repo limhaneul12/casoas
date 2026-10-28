@@ -196,61 +196,71 @@ async def run_agy_model_prompt(
     else:
         req_id = (request_id or "").strip() or f"cdx-{uuid.uuid4().hex[:10]}"
 
-    resolved_ep = endpoint or await discover_agy_endpoint()
-    if resolved_ep is None:
-        ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        duration = round(time.monotonic() - started_mono, 2)
-        err_msg = (
-            "Could not discover a running local Antigravity language_server process. "
-            "Ensure Antigravity IDE / App is open."
-        )
-        receipt = build_execution_receipt(
-            request_id=req_id,
-            idempotency_key=idempotency_key,
-            route=route,
-            actual_model="",
-            call_path=call_path,
-            started_at_iso=started_iso,
-            ended_at_iso=ended_iso,
-            duration_seconds=duration,
-            status=JobStatusKind.FAILED,
-            outcome_state=OutcomeStateKind.CONFIRMED_FAILURE,
-            attempt_count=attempt_count,
-            result_ref=f"job://{req_id}",
-            failure_reason=err_msg,
-        )
-        if job_store is not None:
-            job_store.fail_job(req_id, error=err_msg, receipt=receipt)
-        return {
-            "ok": False,
-            "status": JobStatusKind.FAILED,
-            "outcome_state": OutcomeStateKind.CONFIRMED_FAILURE,
-            "request_id": req_id,
-            "job_id": req_id,
-            "provider": route.provider,
-            "engine": EngineKind.ANTIGRAVITY_LOCAL_RPC,
-            "model_requested": model,
-            "model_id": route.resolved_model,
-            "error": err_msg,
-            "receipt": as_json_object(receipt),
-            "budget": as_json_object(
-                evaluate_budget_envelope(
-                    prompt_text=prompt,
-                    max_input_bytes=max_input_bytes,
-                    timeout_seconds=timeout_seconds,
-                    elapsed_seconds=duration,
-                    termination_reason="endpoint_unavailable",
-                )
-            ),
-            "auth_boundary": as_json_object(AntigravityModelCatalog.build_auth_boundary(False)),
-        }
+    try:
+        resolved_ep = endpoint or await discover_agy_endpoint()
+        if resolved_ep is None:
+            ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            duration = round(time.monotonic() - started_mono, 2)
+            err_msg = (
+                "Could not discover a running local Antigravity language_server process. "
+                "Ensure Antigravity IDE / App is open."
+            )
+            receipt = build_execution_receipt(
+                request_id=req_id,
+                idempotency_key=idempotency_key,
+                route=route,
+                actual_model="",
+                call_path=call_path,
+                started_at_iso=started_iso,
+                ended_at_iso=ended_iso,
+                duration_seconds=duration,
+                status=JobStatusKind.FAILED,
+                outcome_state=OutcomeStateKind.CONFIRMED_FAILURE,
+                attempt_count=attempt_count,
+                result_ref=f"job://{req_id}",
+                failure_reason=err_msg,
+            )
+            if job_store is not None:
+                job_store.fail_job(req_id, error=err_msg, receipt=receipt)
+            return {
+                "ok": False,
+                "status": JobStatusKind.FAILED,
+                "outcome_state": OutcomeStateKind.CONFIRMED_FAILURE,
+                "request_id": req_id,
+                "job_id": req_id,
+                "provider": route.provider,
+                "engine": EngineKind.ANTIGRAVITY_LOCAL_RPC,
+                "model_requested": model,
+                "model_id": route.resolved_model,
+                "error": err_msg,
+                "receipt": as_json_object(receipt),
+                "budget": as_json_object(
+                    evaluate_budget_envelope(
+                        prompt_text=prompt,
+                        max_input_bytes=max_input_bytes,
+                        timeout_seconds=timeout_seconds,
+                        elapsed_seconds=duration,
+                        termination_reason="endpoint_unavailable",
+                    )
+                ),
+                "auth_boundary": as_json_object(AntigravityModelCatalog.build_auth_boundary(False)),
+            }
 
-    resolved_model_id, placeholder = await AntigravityModelCatalog.resolve_model_placeholder(
-        requested_model=model,
-        endpoint=resolved_ep,
-        rpc_transport=rpc_transport,
-        discover_fn=discover_agy_endpoint,
-    )
+        resolved_model_id, placeholder = await AntigravityModelCatalog.resolve_model_placeholder(
+            requested_model=model,
+            endpoint=resolved_ep,
+            rpc_transport=rpc_transport,
+            discover_fn=discover_agy_endpoint,
+        )
+    except asyncio.CancelledError:
+        if job_store is not None:
+            job_store.cancel_job(req_id, reason="Antigravity RPC request cancelled.")
+        raise
+    except Exception as exc:
+        if job_store is not None:
+            job_store.fail_job(req_id, error=redact_sensitive_text(str(exc)))
+        raise
+
     transport = rpc_transport or AntigravityRpcClient.post_connect_rpc_sync
     rpc_payload: JsonObject = {"model": placeholder, "prompt": prompt}
 
@@ -263,9 +273,14 @@ async def run_agy_model_prompt(
             rpc_payload,
             timeout_seconds,
         )
+    except asyncio.CancelledError:
+        if job_store is not None:
+            job_store.cancel_job(req_id, reason="Antigravity RPC request cancelled.")
+        raise
     except Exception as exc:
         if endpoint is None:
-            AntigravityRpcClient._cached_endpoint = None
+            with AntigravityRpcClient._cache_lock:
+                AntigravityRpcClient._cached_endpoint = None
         ended_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         duration = round(time.monotonic() - started_mono, 2)
         is_timeout = AntigravityRpcClient.is_timeout_exception(exc)
