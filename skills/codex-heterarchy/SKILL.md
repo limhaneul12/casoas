@@ -88,18 +88,20 @@ uv run hcodex status
 
 ## 3. 주요 워크플로우별 호출 가이드
 
-### 워크플로우 A: 3극 통합 파이프라인 (`heterarchy_triad_orchestrate`)
-Claude가 코드를 작성/리팩토링하고, Codex가 레드팀 감사를 수행한 뒤, Argon이 최종 심의하는 파이프라인:
+### 워크플로우 A: 3극 통합 파이프라인 & 평의회 (`heterarchy_triad_orchestrate`)
+Claude가 코드를 작성/리팩토링하고, Codex가 레드팀 감사를 수행한 뒤, Argon이 최종 심의하는 파이프라인(`mode="pipeline"`) 또는 3극 병렬 심의·상호 반론 평의회(`mode="council"`):
 ```python
 heterarchy_triad_orchestrate(
-    task_description="비동기 레이트 리미터의 동시성 경합 조건을 수정하고 경계 테스트를 추가하라.",
+    task_spec="비동기 레이트 리미터의 동시성 경합 조건을 수정하고 경계 테스트를 추가하라.",
+    target_code_or_context="<검토·수정 대상 코드 또는 아키텍처 스펙>",
+    invariants_and_rules="락 경합 없이 원자성을 보장하고 타임아웃 누수를 방지할 것",
     workspace_dir="/path/to/workspace",
-    mode="pipeline",  # "pipeline" 또는 병렬 심의 "council"
+    mode="pipeline",  # "pipeline"(순차 구현·감사·심의) 또는 "council"(병렬 심의 + 2라운드 상호 반론)
     claude_model="claude-sonnet-5-5-medium",  # 또는 "claude-opus-5-5-medium"
     codex_model="gpt-5.4",
-    max_rounds=2,  # Codex가 WARN/BLOCK 판정 시 자동 수정·재감사 루프 (1~3)
-    run_verification_gates=True,  # 브리지가 직접 테스트 게이트 실행
-    verification_commands=["pytest -q"],
+    max_rounds=2,  # pipeline: WARN/BLOCK 시 자동 수리·재감사 / council: 의견 충돌 시 2라운드 교차 반론
+    run_verification_gates=True,  # 브리지가 직접 pytest 검증 게이트 실행 (프로세스 그룹 격리)
+    files_inspected=["src/rate_limiter.py"],  # SHA-256 해시 고정 + 무설정 CodeGraph 심볼 자동 추출
 )
 ```
 
@@ -107,10 +109,11 @@ heterarchy_triad_orchestrate(
 중요한 비즈니스 로직이나 보안/동시성 변경사항에 대해 Codex 레드팀 감사를 단독 호출:
 ```python
 codex_adversarial_audit(
-    code_or_diff="<검토할 코드 또는 git diff>",
-    argon_design_rationale="토큰 버킷 상태 갱신 시 락 경합 없이 원자성을 보장해야 함",
+    target_code_or_diff="<검토할 코드 또는 git diff>",
+    design_rationale="토큰 버킷 상태 갱신 시 락 경합 없이 원자성을 보장해야 함",
     workspace_dir="/path/to/workspace",
-    focus_areas=["concurrency", "edge_cases", "security"],
+    attack_vectors="concurrency, edge_cases, security",
+    files_inspected=["src/rate_limiter.py"],
 )
 ```
 
@@ -118,40 +121,46 @@ codex_adversarial_audit(
 명확한 타입 시그니처와 불변식을 주고 Claude Sonnet 5.5 / Opus 5.5 Medium에 구현 위임:
 ```python
 claude_code_craft(
-    task_description="토큰 버킷 레이트 리미터 클래스를 구현하라.",
-    code_context="<기존 인터페이스 및 관련 DTO 정의>",
+    task_spec="토큰 버킷 레이트 리미터 클래스를 구현하라.",
+    target_code_or_context="<기존 인터페이스 및 관련 DTO 정의>",
+    invariants_and_rules="모든 메서드는 명시적 타입 어노테이션과 불변 DTO를 사용할 것",
     workspace_dir="/path/to/workspace",
-    claude_model="claude-sonnet-5-5-medium",
+    claude_model="claude-sonnet-5-5-medium",  # 또는 "claude-opus-5-5-medium" ("opus-5.5")
+    files_inspected=["src/rate_limiter.py"],
 )
 ```
 
-### 워크플로우 D: 타임아웃/비동기 작업 조회 및 이어달리기
+### 워크플로우 D: 타임아웃/비동기 작업 조회 및 체크포인트 이어달리기 (파일 변조 방지 포함)
 1. **타임아웃/비동기 잡 조회**:
    - `codex_job_status(job_id="cdx-...")` 또는 `codex_job_status(idempotency_key="...")`
    - 취소 시: `codex_job_status(job_id="cdx-...", cancel=True)`
-2. **부분 성공(`partial`) 체크포인트 이어달리기**:
+2. **부분 성공(`partial`) 체크포인트 이어달리기 & 파일 드리프트 가드**:
    - 일부 역할만 성공하고 타임아웃이 난 경우, `heterarchy_triad_orchestrate(..., resume_collaboration_id="cdx-...")`를 호출하면 이미 성공한 역할의 산출물은 재사용하고 미완료 역할만 재실행한다.
+   - **Workspace File-Drift Guard**: 체크포인트 시점의 `files_inspected` 목록이나 디스크 상의 파일 SHA-256 해시(`files_inspected_digests`)가 변경된 경우, 오래된 역할 결과를 재사용하지 않고 안전하게 전체 재실행한다.
 
 ---
 
-## 4. 라우팅·영수증·증거 범위 판독 계약
+## 4. 라우팅·영수증·증거 범위·회로 차단기 판독 계약
 
 1. **검증된 라우팅 계약 (`validate_and_resolve_route`)**:
    - `codex_cli` 엔진에는 `CODEX_SUPPORTED_MODELS`(`gpt-6.1-sol`, `gpt-5.4`, `gpt-5-codex` 등)만 허용된다.
    - `antigravity_local_rpc` 엔진에서 Claude 모델은 `medium` 티어(`claude-sonnet-5-5-medium`, `claude-opus-5-5-medium`)만 허용하며, `high`/`low` 요청 시 `error_code="CLAUDE_TIER_POLICY_VIOLATION"`으로 거부한다.
-2. **실행 영수증 (`receipt`)**:
+2. **적응형 회로 차단기(Half-Open Circuit Breaker) & 쿼터 사전 가드**:
+   - Antigravity RPC 호출 전 모델의 잔여 쿼터(`remainingFraction <= 0.0`)가 고갈된 경우 즉시 `error_code="ANTIGRAVITY_QUOTA_EXHAUSTED"`로 사전 차단한다.
+   - 연속 3회 RPC 타임아웃/연결 실패 시 25초간 회로를 개방(`error_code="ANTIGRAVITY_CIRCUIT_OPEN"`)하여 불필요한 대기를 막고, 쿨다운 후 단일 Half-Open 프로브만 허용해 복구를 검증한다.
+3. **실행 영수증 (`receipt`)**:
    - 모든 응답은 `request_id`, `idempotency_key`, `provider`, `engine`, `requested_model`, `actual_model`, `model_mismatch`, `status`, `outcome_state`, `attempt_count`, `output_digest`(`sha256:...`), `result_ref`(`job://...`), `credentials_redacted=true`를 포함한다.
-3. **증거 범위 고정 (`evidence_scope`)**:
+4. **증거 범위 고정 (`evidence_scope`) 및 무설정 CodeGraph 자동 슬라이싱**:
    - 5대 검증 차원(`static_code_review`, `test_generation`, `test_execution`, `integration_verification`, `runtime_confirmation`)을 분리 기록한다.
-   - `run_verification_gates=True`로 브리지가 직접 실행해 통과한 테스트만 `test_execution="verified"` (`test_execution_evidence_origin="bridge_executed"`)로 기록되며, 미실행 테스트는 항상 `"not_run"`으로 남긴다.
-   - 워크스페이스에 `.codegraph/codegraph.db`가 존재할 때 `symbols_inspected`를 전달하면 해당 심볼의 정확한 코드 구간과 1-hop 호출 관계를 자동으로 추출해 프롬프트에 주입한다.
+   - `run_verification_gates=True`로 브리지가 직접 실행해 통과한 테스트만 `test_execution="verified"` (`test_execution_evidence_origin="bridge_executed"`)로 기록되며, 타임아웃 시 프로세스 그룹 전체(`killpg`)를 정리해 고아 프로세스를 방지한다.
+   - 워크스페이스에 `.codegraph/codegraph.db`가 존재하면 `symbols_inspected`를 생략하더라도 `files_inspected`와 입력 코드(`def`/`class` 시그니처)에서 핵심 심볼(최대 12개)을 자동 탐색해 정확한 코드 구간과 1-hop 호출 관계를 프롬프트에 주입한다.
 
 ---
 
 ## 5. `hcodex` CLI 제어 명령어 요약
 
 ```bash
-# 런타임, 플러그인, 스킬 등록 상태, 활성 PID 및 핸드오프 인박스 확인
+# 런타임, 플러그인, 스킬 등록 상태, 활성 PID, 회로 차단기 및 SQLite 텔레메트리 요약 확인
 uv run hcodex status
 
 # 기존 stdio 프로세스 재기동 + 스킬/플러그인/MCP 설정 일괄 갱신
@@ -163,4 +172,7 @@ uv run hcodex off
 
 # 3극 핸드오프 티켓 인박스(Argon / Sonnet / Opus / Codex) 조회
 uv run hcodex inbox
+
+# 완료된 오래된 작업(jobs.db) 및 해결된 티켓(handoffs.db) 정리 + SQLite WAL 체크포인트 압축
+uv run hcodex prune
 ```

@@ -1196,10 +1196,14 @@ async def test_triad_checkpoint_resume_reuses_succeeded_roles(
     monkeypatch.setattr(server_mod, "run_agy_model_prompt", mock_agy_prompt)
     monkeypatch.setattr(server_mod, "_execute_with_engine", mock_codex_engine)
 
+    inspected_file = tmp_path / "inspected_stage.py"
+    inspected_file.write_text("def checkpoint_fn() -> int:\n    return 42\n", encoding="utf-8")
+
     first_raw = await heterarchy_triad_orchestrate(
         task_spec="Implement checkpointable pipeline stage",
         workspace_dir=str(tmp_path),
         mode="pipeline",
+        files_inspected=["inspected_stage.py"],
     )
     first = json.loads(first_raw)
     assert first["collaboration_status"] == "partial"
@@ -1214,6 +1218,7 @@ async def test_triad_checkpoint_resume_reuses_succeeded_roles(
         workspace_dir=str(tmp_path),
         mode="pipeline",
         resume_collaboration_id=collab_id,
+        files_inspected=["inspected_stage.py"],
     )
     second = json.loads(second_raw)
     assert second["ok"] is True
@@ -1225,6 +1230,21 @@ async def test_triad_checkpoint_resume_reuses_succeeded_roles(
     assert sonnet_calls == 1
     assert codex_calls == 1
     assert argon_calls == 2
+
+    # Mutating the inspected file on disk must invalidate checkpoint role reuse (drift guard)
+    inspected_file.write_text("def checkpoint_fn() -> int:\n    return 99\n", encoding="utf-8")
+    drifted_raw = await heterarchy_triad_orchestrate(
+        task_spec="Implement checkpointable pipeline stage",
+        workspace_dir=str(tmp_path),
+        mode="pipeline",
+        resume_collaboration_id=collab_id,
+        files_inspected=["inspected_stage.py"],
+    )
+    drifted = json.loads(drifted_raw)
+    assert "resumed_roles" not in drifted
+    assert sonnet_calls == 2
+    assert codex_calls == 2
+    assert argon_calls == 3
 
 
 @pytest.mark.asyncio
@@ -1745,6 +1765,22 @@ def test_mechanical_and_sqlite_retention_contracts(tmp_path: Path) -> None:
     assert handoffs.get_ticket(resolved_ids[-1]) is not None
 
     env_mgr = _PluginEnvironmentManager(repo_root=repo_root, home_dir=tmp_path)
+    stale_plugin_skill = (
+        tmp_path
+        / ".gemini"
+        / "config"
+        / "plugins"
+        / "heterarchy-codex"
+        / "skills"
+        / "codex-heterarchy"
+    )
+    stale_plugin_skill.mkdir(parents=True, exist_ok=True)
+    (stale_plugin_skill / "SKILL.md").write_text("stale-skill-content", encoding="utf-8")
+    env_mgr.sync_skills()
+    synced_skill_file = tmp_path / ".gemini" / "config" / "skills" / "codex-heterarchy" / "SKILL.md"
+    synced_content = synced_skill_file.read_text(encoding="utf-8")
+    assert "stale-skill-content" not in synced_content
+    assert "heterarchy_triad_orchestrate" in synced_content
     assert HeterarchyCliController(env_mgr=env_mgr).dispatch(["prune"]) == 0
 
 

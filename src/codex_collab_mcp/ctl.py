@@ -169,7 +169,14 @@ class _PluginEnvironmentManager:
                     target.unlink()
 
         target_plugin_skill = agy_active / "skills" / "codex-heterarchy"
-        if target_plugin_skill.is_dir():
+        if agy_active.is_dir():
+            if target_plugin_skill.is_symlink() or target_plugin_skill.exists():
+                if target_plugin_skill.is_dir() and not target_plugin_skill.is_symlink():
+                    shutil.rmtree(target_plugin_skill)
+                else:
+                    target_plugin_skill.unlink()
+            target_plugin_skill.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(skill_src, target_plugin_skill)
             agy_skill.symlink_to(target_plugin_skill)
         else:
             shutil.copytree(skill_src, agy_skill)

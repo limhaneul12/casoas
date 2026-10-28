@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
+import signal
 import sys
 import time
 from collections.abc import Callable, Coroutine
@@ -23,7 +25,11 @@ from codex_collab_mcp.evidence.triad_adjudicator import (
     extract_verdict,
     map_response_to_role_state,
 )
-from codex_collab_mcp.evidence.workspace_digests import canonical_sha256, compute_sha256_hex
+from codex_collab_mcp.evidence.workspace_digests import (
+    DIGEST_CALCULATOR,
+    canonical_sha256,
+    compute_sha256_hex,
+)
 from codex_collab_mcp.job_store import JobStore
 from codex_collab_mcp.prompts import build_adversarial_audit_prompt, build_claude_craft_prompt
 from codex_collab_mcp.schemas import ADVERSARIAL_AUDIT_SCHEMA, JsonObject
@@ -77,6 +83,7 @@ class BridgeVerificationGateRunner:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=workspace_dir,
+            start_new_session=True,
         )
         try:
             stdout_bytes, _stderr_bytes = await asyncio.wait_for(
@@ -86,6 +93,9 @@ class BridgeVerificationGateRunner:
             exit_code = proc.returncode if proc.returncode is not None else -1
         except BaseException as exc:
             if proc.returncode is None:
+                if proc.pid is not None:
+                    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                        os.killpg(proc.pid, signal.SIGKILL)
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
                 await proc.wait()
@@ -113,6 +123,7 @@ class BridgeVerificationGateRunner:
         workspace_dir: str,
         source_task_digest: str,
         job_store: JobStore,
+        files_inspected: list[str] | None = None,
     ) -> dict[str, JsonObject]:
         """Load verified succeeded role responses from a prior triad checkpoint snapshot.
 
@@ -121,6 +132,7 @@ class BridgeVerificationGateRunner:
             workspace_dir: Resolved workspace directory that must match the checkpoint.
             source_task_digest: Canonical task SHA-256 digest that must match the checkpoint.
             job_store: Active JobStore instance containing persisted triad snapshots.
+            files_inspected: Optional inspected file paths to verify against workspace drift.
 
         Returns:
             Mapping of role name (`argon`, `sonnet`, `codex`) to reconstructed role response.
@@ -147,6 +159,23 @@ class BridgeVerificationGateRunner:
         unsigned = {k: v for k, v in result.items() if k != "snapshot_digest"}
         if canonical_sha256(unsigned) != stored_digest:
             return {}
+        stored_scope = result.get("evidence_scope")
+        if isinstance(stored_scope, dict):
+            s_digests = stored_scope.get("files_inspected_digests")
+            s_missing = stored_scope.get("unverified_or_missing_files")
+            if isinstance(s_digests, dict) and isinstance(s_missing, list):
+                stored_files = [*s_digests.keys(), *(str(x) for x in s_missing)]
+                req_files = list(files_inspected) if files_inspected is not None else stored_files
+                if set(req_files) != set(stored_files):
+                    return {}
+                if req_files:
+                    curr_digests, curr_missing = DIGEST_CALCULATOR.hash_files(
+                        workspace_dir, req_files
+                    )
+                    if curr_digests != s_digests or set(curr_missing) != {
+                        str(x) for x in s_missing
+                    }:
+                        return {}
         roles = result.get("roles")
         if not isinstance(roles, dict):
             return {}

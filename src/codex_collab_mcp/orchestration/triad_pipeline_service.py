@@ -81,47 +81,38 @@ class _TriadExecutionContext:
             req.language,
             normalized_mode,
         )
-        has_cg_inputs = bool(
-            req.symbols_inspected or req.files_inspected or req.target_code_or_context.strip()
-        )
-        sliced = (
-            slice_codegraph_symbols(
-                resolved_workspace,
-                req.symbols_inspected,
-                files_inspected=req.files_inspected,
-                inline_text=req.target_code_or_context,
-            )
-            if has_cg_inputs
-            else ""
+        sliced = slice_codegraph_symbols(
+            resolved_workspace,
+            req.symbols_inspected,
+            files_inspected=req.files_inspected,
+            inline_text=req.target_code_or_context,
         )
         effective_target_code = (
             f"{req.target_code_or_context}\n\n[CodeGraph Sliced Symbol Context]:\n{sliced}"
             if sliced
             else req.target_code_or_context
         )
-        sonnet_prompt = build_claude_craft_prompt(
-            req.task_spec,
-            effective_target_code,
-            req.invariants_and_rules,
-            req.language,
-            req.claude_model,
-        )
-        argon_prompt = (
-            "You are Gemini 4 Argon (Macro-Architect) adjudicating a Tri-Polar Heterarchy task.\n"
-            f"[Task Specification]:\n{req.task_spec}\n\n"
-            f"[Invariants & Rules]:\n{req.invariants_and_rules}\n\n"
-            f"[Target Code / Context]:\n{effective_target_code}\n\n"
-            "Respond strictly with a JSON object containing:\n"
-            '{"verdict": "PASS" | "WARN" | "BLOCK", "summary": "...", '
-            '"architectural_risks": ["..."], "final_recommendation": "..."}'
-        )
         return cls(
             req=req,
             normalized_mode=normalized_mode,
             workspace_dir=resolved_workspace,
             effective_target_code=effective_target_code,
-            sonnet_prompt=sonnet_prompt,
-            argon_prompt=argon_prompt,
+            sonnet_prompt=build_claude_craft_prompt(
+                req.task_spec,
+                effective_target_code,
+                req.invariants_and_rules,
+                req.language,
+                req.claude_model,
+            ),
+            argon_prompt=(
+                "You are Gemini 4 Argon (Macro-Architect) adjudicating a Tri-Polar Heterarchy task.\n"
+                f"[Task Specification]:\n{req.task_spec}\n\n"
+                f"[Invariants & Rules]:\n{req.invariants_and_rules}\n\n"
+                f"[Target Code / Context]:\n{effective_target_code}\n\n"
+                "Respond strictly with a JSON object containing:\n"
+                '{"verdict": "PASS" | "WARN" | "BLOCK", "summary": "...", '
+                '"architectural_risks": ["..."], "final_recommendation": "..."}'
+            ),
             source_task_digest=source_task_digest,
             job_store=job_store,
             handoff_store=handoff_store,
@@ -251,13 +242,6 @@ class TriadOrchestrationService:
         consensus_reached = adjudication["consensus_reached"]
         collab_status = adjudication["collaboration_status"]
         req = ctx.req
-        participants: JsonObject = {
-            "macro_architect": req.argon_model,
-            "code_craftsman": sonnet_res.get("model_id", req.claude_model),
-            "red_team_auditor": codex_res.get(
-                "model", req.codex_model or CanonicalModelId.CODEX_DEFAULT
-            ),
-        }
         payload: JsonObject = {
             "ok": collab_status == CollaborationState.COMPLETE and consensus_reached,
             "collaboration_status": collab_status,
@@ -265,7 +249,13 @@ class TriadOrchestrationService:
             "consensus_reached": consensus_reached,
             "triad_consensus_ready": consensus_reached,
             "orchestration_mode": mode,
-            "participants": participants,
+            "participants": {
+                "macro_architect": req.argon_model,
+                "code_craftsman": sonnet_res.get("model_id", req.claude_model),
+                "red_team_auditor": codex_res.get(
+                    "model", req.codex_model or CanonicalModelId.CODEX_DEFAULT
+                ),
+            },
             "adjudication": as_json_object(adjudication),
             "argon_review": argon_res,
             "sonnet_craft": sonnet_res,
@@ -306,7 +296,11 @@ class TriadOrchestrationService:
         """
         req = ctx.req
         resumed = self._gate_runner.load_resumable_roles(
-            req.resume_collaboration_id, ctx.workspace_dir, ctx.source_task_digest, ctx.job_store
+            req.resume_collaboration_id,
+            ctx.workspace_dir,
+            ctx.source_task_digest,
+            ctx.job_store,
+            files_inspected=req.files_inspected,
         )
         codex_audit_prompt = build_adversarial_audit_prompt(
             target_code_or_diff=ctx.effective_target_code or req.task_spec,
@@ -316,8 +310,7 @@ class TriadOrchestrationService:
                 "Parallel Triad Council mode alongside Claude Sonnet 5.5 and Gemini 4 Argon."
             ),
         )
-        sonnet_task: asyncio.Task[JsonObject] | None = None
-        codex_task: asyncio.Task[JsonObject] | None = None
+        sonnet_task = codex_task = None
         argon_task: asyncio.Task[JsonObject | None] | None = None
         async with asyncio.TaskGroup() as tg:
             if TriadRole.SONNET not in resumed:
@@ -379,7 +372,11 @@ class TriadOrchestrationService:
         """
         req = ctx.req
         resumed = self._gate_runner.load_resumable_roles(
-            req.resume_collaboration_id, ctx.workspace_dir, ctx.source_task_digest, ctx.job_store
+            req.resume_collaboration_id,
+            ctx.workspace_dir,
+            ctx.source_task_digest,
+            ctx.job_store,
+            files_inspected=req.files_inspected,
         )
         sonnet_res = (
             resumed[TriadRole.SONNET] if TriadRole.SONNET in resumed else await ctx.invoke_sonnet()
@@ -397,8 +394,11 @@ class TriadOrchestrationService:
                 started_at=ctx.started_at,
             )
 
-        sonnet_struct = sonnet_res.get("structured_output")
-        s_dict = sonnet_struct if isinstance(sonnet_struct, dict) else {}
+        s_dict = (
+            sonnet_struct
+            if isinstance(sonnet_struct := sonnet_res.get("structured_output"), dict)
+            else {}
+        )
         crafted_code = str(s_dict.get("crafted_code", ""))
         sonnet_summary = str(s_dict.get("summary", ""))
         handoff_notes = str(s_dict.get("handoff_notes_for_codex_audit", ""))

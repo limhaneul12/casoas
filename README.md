@@ -29,12 +29,14 @@
 ## 2. 핵심 기술 스택 및 특징 (Architecture & Stack)
 
 - **Python `3.14t` Free-Threading (No-GIL)**
-  - GIL이 비활성화된 Python `3.14t` 런타임에서 `ThreadPoolExecutor`와 `threading.RLock()`을 활용해 다중 파일 SHA-256 증거 해싱과 CodeGraph 심볼 슬라이싱을 병렬 처리합니다.
+  - GIL이 비활성화된 Python `3.14t` 런타임에서 `ThreadPoolExecutor`와 `threading.RLock()`을 활용해 다중 파일 SHA-256 증거 해싱과 무설정(Zero-Config) CodeGraph 심볼 자동 탐색·슬라이싱을 병렬 처리합니다.
 - **Pydantic `v2.14.1` (`>=2.7.0`) 엄격 스키마 검증**
   - 모든 외부 입출력 경계에 `StrictSchemaModel`(`extra="forbid"`, `frozen=True`, `validate_default=True`)을 적용하여 오염된 페이로드나 허용되지 않은 필드를 사전 차단합니다.
-- **SQLite (WAL 모드) 자동 영속화**
-  - MCP 서버 시작 시 `~/.cache/codex-collab-mcp/` 하위에 `jobs.db`와 `handoffs.db`(`WAL` 모드)를 자동 생성·초기화합니다.
-  - 실행 영수증(Receipt), 멱등성 키(`idempotency_key`), 타임아웃 복구 상태(`timed_out_unknown`), 체크포인트 이어달리기(`resume_collaboration_id`)를 안전하게 보존합니다.
+- **적응형 회로 차단기(Half-Open Circuit Breaker) & 쿼터 사전 가드**
+  - Antigravity RPC 호출 전 잔여 쿼터(`remainingFraction <= 0.0`) 고갈을 즉시 감지하고, 연속 장애 시 25초간 회로를 개방(`ANTIGRAVITY_CIRCUIT_OPEN`)한 뒤 단일 Half-Open 프로브로 복구를 검증합니다.
+- **SQLite (WAL 모드) 자동 영속화 · 파일 변조 방지 이어달리기 · 텔레메트리**
+  - MCP 서버 시작 시 `~/.cache/codex-collab-mcp/` 하위에 `jobs.db`와 `handoffs.db`(`WAL` 모드)를 자동 생성·초기화하고, `uv run hcodex prune`으로 완료된 레코드 정리 및 WAL 체크포인트를 수행합니다.
+  - 실행 영수증(Receipt), 멱등성 키(`idempotency_key`), 타임아웃 복구 상태(`timed_out_unknown`), 그리고 디스크 파일 SHA-256 드리프트 검증이 결합된 체크포인트 이어달리기(`resume_collaboration_id`)를 안전하게 보존합니다.
 
 ### 기능별 패키지 구조 (`src/codex_collab_mcp/`)
 
@@ -126,6 +128,9 @@ uv run hcodex status
 ### 로컬 품질 검증 명령어
 
 ```bash
+# 아키텍처·타입·독스트링·크기 기계적 계약 검증 (9 Gates)
+uv run python .agents/python_dev_harness/verify_mechanical_contracts.py
+
 # 코드 포맷 및 린트 검사 (Ruff)
 uv run ruff format --check src tests
 uv run ruff check src tests
@@ -133,6 +138,6 @@ uv run ruff check src tests
 # 정적 타입 체크 (Pyrefly Strict)
 uv run pyrefly check
 
-# 전체 테스트 스위트 실행 (Pytest, 73 tests)
+# 전체 테스트 스위트 실행 (Pytest, 74 tests)
 uv run pytest -v
 ```
