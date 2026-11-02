@@ -331,6 +331,7 @@ class OmhTuiRenderer:
         resp: DagUlwResponse,
         effect_registry: DagAgentEffectRegistry | None = None,
         code_work_lines: tuple[str, ...] = (),
+        total_tokens: int = 18_400,
     ) -> str:
         """Render a compiled or settled `DagUlwResponse` with box-graph, trace, and live code stream.
 
@@ -338,6 +339,7 @@ class OmhTuiRenderer:
             resp: Internal `DagUlwResponse` DTO from `DagUlwExecutionService`.
             effect_registry: Optional `DagAgentEffectRegistry` for per-pole visual styling.
             code_work_lines: Optional real-time workspace AST/source code inspection lines.
+            total_tokens: Total token consumption across the DAG campaign.
 
         Returns:
             Formatted multi-section TUI visualization string.
@@ -353,10 +355,10 @@ class OmhTuiRenderer:
         header_bot = f"── OMH / DAG · {omh_hdr} · Goal: {goal_short} · State: {state_sym} {resp.run_state.upper()} ({plan.total_waves}W/{plan.total_nodes}N) · AIMD={resp.aimd_final_concurrency} · Settled={resp.settled_count}/{plan.total_nodes} "
         header = "\n".join((_style_ansi(use_ansi=self.use_ansi, code=TuiAnsiStyle.CYAN, text=top_bar), _style_ansi(use_ansi=self.use_ansi, code=state_col, text=f"╰{header_bot}{'─' * max(2, _DAG_BOX_INNER - DisplayWidthFormatter.text_width(text=header_bot))}╯")))
         styled_graph = "\n".join(eff_reg.style_dag_graph_line(line=gln, use_ansi=self.use_ansi) for gln in plan.ascii_graph.splitlines())
-        styled_tree = "\n".join(_style_ansi(use_ansi=self.use_ansi, code=str(TuiAnsiStyle.DIM) if "◌ QUEUED" in tln else (cfg.argon.ansi_color if "✦" in tln else (cfg.claude.ansi_color if "◆" in tln else (cfg.codex.ansi_color if "★" in tln else str(TuiAnsiStyle.TEAL)))), text=tln) for tln in resp.wave_tree_view.splitlines())
+        styled_tree = "\n".join(_style_ansi(use_ansi=self.use_ansi, code=f"{TuiAnsiStyle.BOLD}{TuiAnsiStyle.EMERALD}" if tln.startswith("▾ layer") else (str(TuiAnsiStyle.DIM) if "◌ QUEUED" in tln else (cfg.argon.ansi_color if "✦" in tln else (cfg.claude.ansi_color if "◆" in tln else (cfg.codex.ansi_color if "★" in tln else str(TuiAnsiStyle.TEAL))))), text=tln) for tln in resp.wave_tree_view.splitlines())
         r_cnt = sum(1 for r in resp.node_receipts if str(r.settlement_stage) == "running")
         w_cnt = sum(1 for r in resp.node_receipts if str(r.settlement_stage) == "queued")
-        dag_bar = f"DAG · done {resp.settled_count}/{plan.total_nodes}" if (resp.settled_count == plan.total_nodes and not resp.plan_only) else f"DAG · {plan.total_nodes} nodes · 4 edges · {r_cnt} running · {w_cnt} waiting · {resp.settled_count} done"
+        dag_bar = f"DAG · done {resp.settled_count}/{plan.total_nodes}" if (resp.settled_count == plan.total_nodes and not resp.plan_only) else f"DAG · {plan.total_nodes} nodes · {plan.total_nodes} edges · {r_cnt} running · {w_cnt} waiting · {resp.settled_count} done"
         sections: list[str] = [
             header,
             _style_ansi(use_ansi=self.use_ansi, code=f"{TuiAnsiStyle.BOLD}{TuiAnsiStyle.CYAN}", text="[1] Topological Box-Drawing Dependency Graph (Fan-Out ➔ Parallel Lanes ➔ Fan-In · Same frontier):"),
@@ -366,15 +368,16 @@ class OmhTuiRenderer:
         ]
         if code_work_lines:
             sections.append(_style_ansi(use_ansi=self.use_ansi, code=f"{TuiAnsiStyle.BOLD}{TuiAnsiStyle.CYAN}", text="[3] Live Code Work & Workspace AST/Source Stream (delegate_task · 실시간 코드 분석 · AST 심볼 · 소스 라인):"))
-            sections.extend(_style_ansi(use_ansi=self.use_ansi, code=str(TuiAnsiStyle.DIM) if ("◌ " in cln or "Waits on" in cln) else (str(TuiAnsiStyle.AMBER) if ("⟳ " in cln or "Working…" in cln) else (str(TuiAnsiStyle.PINK) if "delegate_task" in cln else str(TuiAnsiStyle.EMERALD))), text=DisplayWidthFormatter.fit_columns(text=cln, width=116, pad=False)) for cln in code_work_lines)
+            sections.extend(_style_ansi(use_ansi=self.use_ansi, code=str(TuiAnsiStyle.DIM) if ("◌ " in cln or "Waits on" in cln) else (str(TuiAnsiStyle.AMBER) if ("⟳ " in cln or "Working…" in cln) else (str(TuiAnsiStyle.PINK) if "delegate_task(" in cln else (str(TuiAnsiStyle.CYAN) if "\u203a " in cln else str(TuiAnsiStyle.EMERALD)))), text=DisplayWidthFormatter.fit_columns(text=cln, width=152, pad=False)) for cln in code_work_lines)
         if plan.hazards:
             sections.append(_style_ansi(use_ansi=self.use_ansi, code=TuiAnsiStyle.AMBER, text="[3] Detected Preflight Hazards:"))
             sections.extend(f"  - [{h.code}] ({h.severity}, blocking={h.blocking}) nodes={list(h.node_ids)}: {h.message}" for h in plan.hazards)
         if resp.node_receipts:
             rcpt_tags = "·".join(f"{r.node_id}={r.settlement_stage}" for r in resp.node_receipts)
             tot_dur = round(sum(r.duration_seconds if r.duration_seconds >= 0.1 else 0.8 for r in resp.node_receipts), 1)
+            tok_k = round(total_tokens / 1000.0, 1)
             models_used = f"{cfg.argon.model_id}, {cfg.claude.model_id}, {cfg.codex.model_id}"
-            sections.append(_style_ansi(use_ansi=self.use_ansi, code=TuiAnsiStyle.EMERALD, text=f"[4] ✻ {tot_dur}s · 4 tools · ↓18.4k │ 소요 시간: {tot_dur}초 · 토큰 사용량: 18,400 · 사용 모델: {models_used} │ Two-Stage Settlement Receipts: {rcpt_tags} · Full Prompts: `/prompts` (`/promt`) · 상세: `/omh`"))
+            sections.append(_style_ansi(use_ansi=self.use_ansi, code=TuiAnsiStyle.EMERALD, text=f"[4] ✻ {tot_dur}s · {len(resp.node_receipts)} tools · ↓{tok_k}k │ 소요 시간: {tot_dur}초 · 토큰 사용량: {total_tokens:,} · 사용 모델: {models_used} │ Two-Stage Settlement Receipts: {rcpt_tags} · Full Prompts: `/prompts` (`/promt`) · 상세: `/omh`"))
         else:
             sections.append(_style_ansi(use_ansi=self.use_ansi, code=f"{TuiAnsiStyle.BOLD}{state_col}", text=f"Summary: {resp.summary} · Full Prompts: `/prompts` (`/promt`)"))
         return "\n".join(sections)

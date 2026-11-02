@@ -92,8 +92,9 @@ def build_triad_nodes(
     campaign_goal: str, argon_model: str | None = None, argon_effort: str | None = None,
     claude_model: str | None = None, claude_effort: str | None = None,
     codex_model: str | None = None, codex_effort: str | None = None,
+    target_files: tuple[str, ...] = (),
 ) -> tuple[DagNodeInputModel, ...]:
-    """Synthesize the canonical 4-node Tri-Polar DAG with optional per-pole model and effort bindings.
+    """Synthesize a workspace-adaptive Tri-Polar DAG (`1->2->1`, `2->2->1`, or `1->3->1`).
 
     Args:
         campaign_goal: High-level engineering objective to decompose.
@@ -103,10 +104,29 @@ def build_triad_nodes(
         claude_effort: Optional reasoning effort tier for Claude craft node.
         codex_model: Optional preferred model ID for Wave 1 Codex audit node.
         codex_effort: Optional reasoning effort tier for Codex audit node.
+        target_files: Optional discovered workspace Python file paths for dynamic topology.
 
     Returns:
-        Tuple of 4 `DagNodeInputModel` specifications spanning Argon, Claude, and Codex.
+        Tuple of `DagNodeInputModel` specifications spanning Argon, Claude, and Codex.
     """
+    if len(target_files) >= 2:
+        f0, f1 = target_files[0], target_files[1]
+        f2 = target_files[2] if len(target_files) > 2 else f0
+        g_low = campaign_goal.lower()
+        is_audit_focus = any(k in g_low for k in ("audit", "security", "sql", "verify", "test", "점검", "감사", "보안", "하네스", "검증"))
+        if is_audit_focus:
+            n1 = DagNodeInputModel(node_id="n1_topology_spec", role=DagNodeRoleKind.TOPOLOGY_PLANNER, task=f"AST & invariant spec on `{f0}`: {campaign_goal}", deliverable=f"Start node · Invariants & AST contract spec for `{f0}`", read_files=(f0,), preferred_model=argon_model, reasoning_effort=argon_effort)
+            n2 = DagNodeInputModel(node_id="n2_interface_craft", role=DagNodeRoleKind.INTERFACE_CONTRACTOR, task=f"Craft strict 3-tier schema & boundary on `{f0}`", deliverable=f"Waits on 1 lane · Crafted `{f0}` (<=430L, <=6m)", read_files=(f0,), depends_on=("n1_topology_spec",), preferred_model=claude_model, reasoning_effort=claude_effort)
+            n3 = DagNodeInputModel(node_id="n3_red_team_audit", role=DagNodeRoleKind.ADVERSARIAL_AUDITOR, task=f"Adversarial WAW/RAW & security audit on `{f1}`", deliverable=f"Waits on 1 lane · Red-team PASS on `{f1}`", read_files=(f1,), depends_on=("n1_topology_spec",), preferred_model=codex_model, reasoning_effort=codex_effort)
+            n3_gate = DagNodeInputModel(node_id="n3_contract_gate", role=DagNodeRoleKind.DISJOINT_BUILDER, task=f"Verify 9/9 mechanical & SQL guards on `{f2}`", deliverable=f"Waits on 1 lane · 9/9 contract gates PASS on `{f2}`", read_files=(f2,), depends_on=("n1_topology_spec",), preferred_model=claude_model, reasoning_effort=claude_effort)
+            n4 = DagNodeInputModel(node_id="n4_verify_fan_in", role=DagNodeRoleKind.VERIFICATION_FAN_IN, node_kind=DagNodeKind.VERIFICATION, task=f"Fan-in 3 lanes & settle SHA-256 manifest (`{f0}`, `{f1}`, `{f2}`)", deliverable="Waits on 3 lanes · Final 3-pole consensus & SHA-256 settlement", read_files=(f0, f1, f2), depends_on=("n2_interface_craft", "n3_red_team_audit", "n3_contract_gate"), preferred_model=argon_model, reasoning_effort=argon_effort)
+            return (n1, n2, n3, n3_gate, n4)
+        n1_a = DagNodeInputModel(node_id="n1_topology_spec", role=DagNodeRoleKind.TOPOLOGY_PLANNER, task=f"AST & architectural spec on `{f0}`: {campaign_goal}", deliverable=f"Start node · Invariants & AST contract spec for `{f0}`", read_files=(f0,), preferred_model=argon_model, reasoning_effort=argon_effort)
+        n1_b = DagNodeInputModel(node_id="n1_boundary_map", role=DagNodeRoleKind.INTERFACE_CONTRACTOR, task=f"3-Tier DTO & call-graph map on `{f1}`: {campaign_goal}", deliverable=f"Start node · Strict boundary & DTO map for `{f1}`", read_files=(f1,), preferred_model=claude_model, reasoning_effort=claude_effort)
+        n2 = DagNodeInputModel(node_id="n2_interface_craft", role=DagNodeRoleKind.INTERFACE_CONTRACTOR, task=f"Surgical code & schema craft on `{f0}` & `{f1}`", deliverable=f"Waits on 2 lanes · Crafted `{f0}` & `{f1}` (<=430L, <=6m)", read_files=(f0, f1), depends_on=("n1_topology_spec", "n1_boundary_map"), preferred_model=claude_model, reasoning_effort=claude_effort)
+        n3 = DagNodeInputModel(node_id="n3_red_team_audit", role=DagNodeRoleKind.ADVERSARIAL_AUDITOR, task=f"Audit WAW/RAW & 9 mechanical contracts on `{f1}`, `{f2}`", deliverable=f"Waits on 2 lanes · Red-team PASS on `{f1}`, `{f2}`", read_files=(f1, f2), depends_on=("n1_topology_spec", "n1_boundary_map"), preferred_model=codex_model, reasoning_effort=codex_effort)
+        n4 = DagNodeInputModel(node_id="n4_verify_fan_in", role=DagNodeRoleKind.VERIFICATION_FAN_IN, node_kind=DagNodeKind.VERIFICATION, task=f"Adjudicate 3-pole consensus & settle SHA-256 (`{f0}`, `{f1}`)", deliverable="Waits on 2 lanes · Final 3-pole consensus & 9/9 gate settlement", read_files=(f0, f1, f2), depends_on=("n2_interface_craft", "n3_red_team_audit"), preferred_model=argon_model, reasoning_effort=argon_effort)
+        return (n1_a, n1_b, n2, n3, n4)
     n1 = DagNodeInputModel(node_id="n1_topology_spec", role=DagNodeRoleKind.TOPOLOGY_PLANNER, task=f"Distill architectural invariants and interface contracts for: {campaign_goal}", deliverable="Compact type & contract specification with zero ambiguity", preferred_model=argon_model, reasoning_effort=argon_effort)
     n2 = DagNodeInputModel(node_id="n2_interface_craft", role=DagNodeRoleKind.INTERFACE_CONTRACTOR, task=f"Craft strict boundary schemas and core implementation for: {campaign_goal}", deliverable="Clean, type-annotated module implementation adhering to 3-tier schema rules", depends_on=("n1_topology_spec",), preferred_model=claude_model, reasoning_effort=claude_effort)
     n3 = DagNodeInputModel(node_id="n3_red_team_audit", role=DagNodeRoleKind.ADVERSARIAL_AUDITOR, task=f"Audit implementation and concurrency/security boundaries for: {campaign_goal}", deliverable="Adversarial red-team verdict (PASS/WARN/BLOCK) with concrete findings", depends_on=("n1_topology_spec",), preferred_model=codex_model, reasoning_effort=codex_effort)
@@ -148,17 +168,18 @@ class DagAgentEffectRegistry:
             codex=DagAgentPoleProfile(pole="codex", model_id=codex_model, reasoning_effort=codex_effort, badge_icon=x_ic, ansi_color=x_col),
         )
 
-    def build_configured_triad_nodes(self, campaign_goal: str) -> tuple[DagNodeInputModel, ...]:
-        """Synthesize the 4-node Tri-Polar DAG stamped with active agent models and efforts.
+    def build_configured_triad_nodes(self, campaign_goal: str, target_files: tuple[str, ...] = ()) -> tuple[DagNodeInputModel, ...]:
+        """Synthesize a Tri-Polar DAG stamped with active agent models, efforts, and workspace files.
 
         Args:
             campaign_goal: High-level engineering objective to decompose.
+            target_files: Optional discovered workspace Python file paths for dynamic topology.
 
         Returns:
-            Tuple of 4 `DagNodeInputModel` instances configured with `self.config`.
+            Tuple of `DagNodeInputModel` instances configured with `self.config`.
         """
         cfg = self.config
-        return build_triad_nodes(campaign_goal=campaign_goal, argon_model=cfg.argon.model_id, argon_effort=cfg.argon.reasoning_effort, claude_model=cfg.claude.model_id, claude_effort=cfg.claude.reasoning_effort, codex_model=cfg.codex.model_id, codex_effort=cfg.codex.reasoning_effort)
+        return build_triad_nodes(campaign_goal=campaign_goal, argon_model=cfg.argon.model_id, argon_effort=cfg.argon.reasoning_effort, claude_model=cfg.claude.model_id, claude_effort=cfg.claude.reasoning_effort, codex_model=cfg.codex.model_id, codex_effort=cfg.codex.reasoning_effort, target_files=target_files)
 
     def apply_effect_command(self, arg: str, use_ansi: bool = True) -> tuple[str, bool]:
         """Parse and apply an `/effect` or `/effort` TUI slash command.
@@ -293,25 +314,26 @@ class DagAgentEffectRegistry:
             use_ansi: Whether ANSI color output is enabled.
 
         Returns:
-            ANSI-styled DAG graph line with independent left/right lane colors.
+            ANSI-styled DAG graph line with independent multi-lane colors.
         """
         if not use_ansi or not line.strip():
             return line
         cfg = self.config
         _, _, _, conn_col = _style_palette(style=cfg.style)
         rst = str(TuiAnsiStyle.RESET)
-        # Parallel Wave 1 boxes sit side-by-side separated by "   " (3 spaces)
-        for sep in ("╮   ╭", "│   │", "╯   ╰"):
-            if sep in line:
-                left_part, right_part = line.split(sep, maxsplit=1)
-                left_box = f"{left_part}{sep[0]}"
-                right_box = f"{sep[-1]}{right_part}"
-                l_col = f"{TuiAnsiStyle.BOLD}{cfg.claude.ansi_color}" if "RUNNING" in left_box else (str(TuiAnsiStyle.DIM) if "◌ QUEUED" in left_box else cfg.claude.ansi_color)
-                r_col = f"{TuiAnsiStyle.BOLD}{cfg.codex.ansi_color}" if "RUNNING" in right_box else (str(TuiAnsiStyle.DIM) if "◌ QUEUED" in right_box else cfg.codex.ansi_color)
-                return f"{l_col}{left_box}{rst}   {r_col}{right_box}{rst}"
-        if "┌─" in line or "└─" in line or (line.strip() == "│"):
+        for sep in ("╮   ╭", "│   │", "╰", "╯   ╰"):
+            if sep in line and ("   ╭" in line or "   │" in line or "   ╰" in line):
+                lead_ws = len(line) - len(line.lstrip(" "))
+                parts = line.lstrip(" ").split("   ")
+                styled_parts: list[str] = []
+                for idx, seg in enumerate(parts):
+                    base_c = cfg.argon.ansi_color if (idx == 0 and ("n1_topology_spec" in seg or "✦" in seg)) else (cfg.codex.ansi_color if ("★" in seg or "n3_red_team" in seg or (idx == 1 and len(parts) == 2 and "n1_boundary" not in seg)) else cfg.claude.ansi_color)
+                    col = f"{TuiAnsiStyle.BOLD}{base_c}" if ("RUNNING" in seg or "Handed out" in seg) else (str(TuiAnsiStyle.DIM) if ("◌ QUEUED" in seg or "Waits on" in seg) else base_c)
+                    styled_parts.append(f"{col}{seg}{rst}")
+                return f"{' ' * lead_ws}" + "   ".join(styled_parts)
+        if any(tok in line for tok in ("┌─", "└─", "├─", "↓")) or (line.strip() == "│"):
             return f"{conn_col}{line}{rst}"
-        a_col = f"{TuiAnsiStyle.BOLD}{cfg.argon.ansi_color}" if "RUNNING" in line else (str(TuiAnsiStyle.DIM) if "◌ QUEUED" in line else cfg.argon.ansi_color)
+        a_col = f"{TuiAnsiStyle.BOLD}{cfg.argon.ansi_color}" if ("RUNNING" in line or "Handed out" in line) else (str(TuiAnsiStyle.DIM) if ("◌ QUEUED" in line or "Waits on" in line) else cfg.argon.ansi_color)
         return f"{a_col}{line}{rst}"
 
     def play_wave_execution_effect(
@@ -437,8 +459,9 @@ def render_dag_prompts_inspector(
     filter_arg: str = "",
     receipts: tuple[DagNodeSettlementReceipt, ...] = (),
     use_ansi: bool = True,
+    target_files: tuple[str, ...] = (),
 ) -> str:
-    """Render the 4-Node 5-Section Standalone Prompt & Synthesis Inspector (`/prompts` or `/trace`).
+    """Render the 5-Section Standalone Prompt & Synthesis Inspector (`/prompts` or `/trace`).
 
     Args:
         effect_registry: Active `DagAgentEffectRegistry` holding pole models and efforts.
@@ -447,12 +470,13 @@ def render_dag_prompts_inspector(
         filter_arg: Optional filter (`n1`, `n2`, `n3`, `n4`, `argon`, `claude`, `codex`).
         receipts: Optional settled `DagNodeSettlementReceipt` tuple from the last DAG run.
         use_ansi: Whether ANSI color codes are enabled.
+        target_files: Optional discovered workspace Python file paths for dynamic nodes.
 
     Returns:
         Formatted multi-line 5-section prompt & synthesis inspection view.
     """
     cfg = effect_registry.config
-    nodes = effect_registry.build_configured_triad_nodes(campaign_goal=campaign_goal)
+    nodes = effect_registry.build_configured_triad_nodes(campaign_goal=campaign_goal, target_files=target_files)
     rcpt_by_id = {r.node_id: r for r in receipts}
     rst = str(TuiAnsiStyle.RESET) if use_ansi else ""
     hdr_c = f"{TuiAnsiStyle.BOLD}{TuiAnsiStyle.CYAN}" if use_ansi else ""
@@ -462,17 +486,11 @@ def render_dag_prompts_inspector(
 
     lines: list[str] = [
         f"{hdr_c}=== ☤ DAG-ULW++ 5-Section Agent Prompting & Synthesis Trace [Goal: {campaign_goal[:36]}] ==={rst}",
-        f"{dim_c}Injected Skills: [{skills_badge}] · Effect Style: {cfg.style} · Filter: {flt or 'all (n1..n4)'}{rst}",
+        f"{dim_c}Injected Skills: [{skills_badge}] · Effect Style: {cfg.style} · Filter: {flt or f'all ({len(nodes)} nodes)'}{rst}",
     ]
-    wave_labels = (
-        "Wave 0 (Root)",
-        "Wave 1 · L1 (Parallel)",
-        "Wave 1 · L2 (Parallel)",
-        "Wave 2 (Fan-In)",
-    )
-    pole_profiles = (cfg.argon, cfg.claude, cfg.codex, cfg.argon)
     for idx, node in enumerate(nodes):
-        prof = pole_profiles[idx]
+        prof = cfg.argon if node.role in (DagNodeRoleKind.TOPOLOGY_PLANNER, DagNodeRoleKind.VERIFICATION_FAN_IN) else (cfg.codex if node.role == DagNodeRoleKind.ADVERSARIAL_AUDITOR else cfg.claude)
+        w_lbl = "Wave 0 (Start Frontier)" if not node.depends_on else ("Wave 2 (Fan-In)" if node.role == DagNodeRoleKind.VERIFICATION_FAN_IN else "Wave 1 (Parallel Frontier)")
         if flt and flt not in (node.node_id.lower(), prof.pole.lower(), f"n{idx + 1}", f"w{idx}"):
             continue
         col = prof.ansi_color if use_ansi else ""
@@ -482,7 +500,7 @@ def render_dag_prompts_inspector(
         out_str = f"● {rcpt.settlement_stage.upper()} ({rcpt.duration_seconds:.2f}s) ➔ {rcpt.output_summary}" if rcpt else "○ READY (run `/dag-ulw <goal>` to execute)"
         lines.extend(
             (
-                f"{col}╭── {prof.badge_icon} {wave_labels[idx]} · [{node.node_id}] ➔ {prof.model_id} @ {ring} ──╮{rst}",
+                f"{col}╭── {prof.badge_icon} {w_lbl} · [{node.node_id}] ➔ {prof.model_id} @ {ring} ──╮{rst}",
                 f"│ 1. TASK & SKILLS : [{skills_badge}] {node.task}",
                 f"│ 2. DELIVERABLE   : {node.deliverable}",
                 f"│ 3. UPSTREAM/SCOPE: depends_on=[{up_str}] · verify={node.verify_cmd or 'schema + SHA-256 manifest gates'}",

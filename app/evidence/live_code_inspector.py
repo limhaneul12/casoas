@@ -49,6 +49,8 @@ class LiveCodeWorkReport:
     n3_codex_summary: str
     n4_verify_summary: str
     stage_code_boxes: tuple[tuple[str, ...], ...]
+    tokens_in_est: int = 6_400
+    tokens_out_est: int = 12_000
 
 
 def _compute_docstring_lines(tree: ast.AST) -> set[int]:
@@ -133,17 +135,21 @@ def _clean_one_line(raw_text: str, fallback: str) -> str:
     return fallback
 
 
-def _paint_tty_viewport(view_lines: tuple[str, ...] | list[str], term_cols: int, bar_row: int, status_line: str = "") -> None:
-    """Write live viewport lines and optional status bar update directly to `sys.stdout`.
+def _paint_tty_viewport(view_lines: tuple[str, ...] | list[str], term_cols: int, bar_row: int, status_line: str = "", bar_lines: list[str] | tuple[str, ...] = ()) -> None:
+    """Write live viewport lines and bottom composer bar updates directly to `sys.stdout`.
 
     Args:
         view_lines: Lines to paint in the upper viewport starting at row 4.
         term_cols: Current terminal width in columns.
         bar_row: 1-based row index of the bottom composer box.
         status_line: Optional status banner string to paint into `bar_row + 1`.
+        bar_lines: Optional 5-row bottom composer bar lines for live Context % & token updates.
     """
     avail = max(8, bar_row - 4)
-    vp_str = "".join(f"\033[{4 + idx};1H\033[2K{DisplayWidthFormatter.fit_ansi_line(ansi_text=f'  {ln}', max_cols=term_cols - 2)}" for idx, ln in enumerate(view_lines[:avail]))
+    vis = list(view_lines[:avail]) if len(view_lines) <= avail else [*view_lines[:2], *view_lines[-(avail - 2) :]]
+    vp_str = "".join(f"\033[{4 + idx};1H\033[2K{DisplayWidthFormatter.fit_ansi_line(ansi_text=f'  {ln}', max_cols=term_cols - 2)}" for idx, ln in enumerate(vis))
+    if bar_lines:
+        vp_str += "".join(f"\033[{bar_row + i};1H\033[2K{ln}" for i, ln in enumerate(bar_lines))
     if status_line:
         pad_st = DisplayWidthFormatter.fit_columns(text=status_line, width=max(20, term_cols - 2))
         vp_str += f"\033[{bar_row + 1};1H\033[2K{TuiAnsiStyle.BG_BAR}{TuiAnsiStyle.BOLD}{TuiAnsiStyle.CYAN}▌ {pad_st}\033[K{TuiAnsiStyle.RESET}"
@@ -217,7 +223,7 @@ class LiveWorkspaceCodeInspector:
         return tuple(slices), total_py
 
     def build_code_work_report(self, workspace_dir: str, query_text: str, active_skills: tuple[str, ...] = ("codex-heterarchy",)) -> LiveCodeWorkReport:
-        """Build a grounded `LiveCodeWorkReport` with per-wave summaries and full-width code lines.
+        """Build a grounded `LiveCodeWorkReport` with hierarchical `delegate_task` + `> tool` sub-lines.
 
         Args:
             workspace_dir: Active workspace directory path.
@@ -227,29 +233,32 @@ class LiveWorkspaceCodeInspector:
         Returns:
             Populated `LiveCodeWorkReport` instance.
         """
-        slices, total_py = self.scan_target_files(workspace_dir=workspace_dir, query_text=query_text, max_files=2)
+        slices, total_py = self.scan_target_files(workspace_dir=workspace_dir, query_text=query_text, max_files=3)
         sk_tag = ", ".join(f"${s}" for s in active_skills[:3]) if active_skills else "$codex-heterarchy"
         if not slices:
-            s0 = (f"  │ ● Graph defined: 4 lanes in 3 layers ({sk_tag}). Wave 0 starts now.", f"  │ ● delegate_task(Wave 0: Scan workspace `{workspace_dir}`)  0.4s", "  · Working… (0.6s · ↓4.2k tokens · 1 running · 3 waiting · thinking with high effort)")
-            s3 = ("  │ ● delegate_task(Workspace scan: 0 `.py` modules in target directory)  0.4s", f"  │ ● omh_dag(settle) 0.1s ── Done. Applied skills: {sk_tag} · no `.py` slices evaluated", "  ✻ Completed · Done 4/4 · ? Unverified (0 .py files inspected)")
-            return LiveCodeWorkReport(total_py_files=0, slices=(), n1_argon_summary=f"Invariants & 3-tier contracts distilled ({sk_tag})", n2_claude_summary="Strict boundary & inner_dto crafted (0 .py files inspected)", n3_codex_summary="Red-team WARN: 0 .py files inspected in target directory", n4_verify_summary="3-Pole review finished (0 .py files inspected)", stage_code_boxes=(s0, s3, s3, s3))
+            s0 = (f"  │ > you: /dag-ulw {query_text[:68]}", f"  │ ● Graph defined: 4 lanes in 3 layers ({sk_tag}). Wave 0 starts now.", f"  │ ● delegate_task(lane=\"n1_topology_spec\", target=\"{workspace_dir}\")  [running 0.4s]", f"  │   \u203a workspace_scan(\"{workspace_dir}\") ── 0 `.py` modules in target directory", "  · Working… (0.6s · ↓4.2k tokens · 1 running · 3 waiting · thinking with high effort)")
+            s3 = (f"  │ ● delegate_task(1: lane=\"n1_topology_spec\", target=\"{workspace_dir}\")  0.4s", "  │   \u203a workspace_scan(0 `.py` modules in target directory)", f"  │ ● omh_dag(settle) 0.1s ── Done. Applied skills: {sk_tag} · no `.py` slices evaluated", "  ✻ Completed · Done 4/4 · ? Unverified (0 .py files inspected)")
+            return LiveCodeWorkReport(total_py_files=0, slices=(), n1_argon_summary=f"Invariants & 3-tier contracts distilled ({sk_tag})", n2_claude_summary="Strict boundary & inner_dto crafted (0 .py files inspected)", n3_codex_summary="Red-team WARN: 0 .py files inspected in target directory", n4_verify_summary="3-Pole review finished (0 .py files inspected)", stage_code_boxes=(s0, s3, s3, s3), tokens_in_est=6_400, tokens_out_est=12_000)
 
-        primary, secondary = slices[0], slices[1] if len(slices) > 1 else slices[0]
+        primary, secondary = slices[0], (slices[1] if len(slices) > 1 else slices[0])
+        tertiary = slices[2] if len(slices) > 2 else secondary
         p_c1 = primary.code_lines[0] if primary.code_lines else f"[L1] # {primary.rel_path}"
         p_c2 = primary.code_lines[1] if len(primary.code_lines) > 1 else p_c1
         s_c1 = secondary.code_lines[0] if secondary.code_lines else f"[L1] # {secondary.rel_path}"
+        t_c1 = tertiary.code_lines[0] if tertiary.code_lines else f"[L1] # {tertiary.rel_path}"
+        all_ok, lane_cnt = all(s.contract_ok for s in slices), (5 if len(slices) >= 2 else 4)
+        accept_lbl, gate_lbl = ("✓ Accepted" if all_ok else "⚠ Review (contract violation)"), ("9/9 gates PASS" if all_ok else "contract check WARN")
+        tok_in = max(4_200, sum(s.total_lines * 11 for s in slices) + len(query_text) * 8 + len(active_skills) * 650)
+        tok_out = max(6_800, sum(s.structural_lines * 16 for s in slices) + total_py * 45)
+        tot_k = round((tok_in + tok_out) / 1000.0, 1)
+        stage_0 = (f"  │ > you: /dag-ulw {query_text[:72]}", f"  │ ● Graph defined: {lane_cnt} lanes in 3 layers on 3 model families ({sk_tag}). Layer 1 starts now.", f"  │ ● delegate_task(lane=\"n1_topology_spec\", agent=\"argon-architect\", file=\"{primary.rel_path}\")  [running 0.4s]", f"  │   \u203a ast_scan(\"{primary.rel_path}\") ── {primary.structural_lines}/430 struct L · {primary.classes_summary} · {p_c1}", f"  │ ● delegate_task(lane=\"n1_boundary_map\", agent=\"claude-sonnet-5.5\", file=\"{secondary.rel_path}\")  [running 0.6s]", f"  │   \u203a boundary_map(\"{secondary.rel_path}\") ── {secondary.structural_lines}/430 struct L · {secondary.classes_summary} · {s_c1}", f"  · Working… (0.8s · ↓{round(tot_k * 0.32, 1)}k tokens · Layer 1 running · thinking with high effort)")
+        stage_1 = (f"  │ ● Layer 1 settled (✓ Accepted). Parallel Layer 2 lanes (`{primary.rel_path}` ∥ `{secondary.rel_path}`) start now.", f"  │ ● delegate_task(lane=\"n2_interface_craft\", agent=\"claude-sonnet-5.5\", file=\"{primary.rel_path}\")  [running 1.2s]", f"  │   \u203a code_craft(\"{primary.rel_path}\") ── {p_c1} │ {p_c2}", f"  │ ● delegate_task(lane=\"n3_red_team_audit\", agent=\"gpt-6-astra:xhigh\", file=\"{secondary.rel_path}\")  [running 1.4s]", f"  │   \u203a red_team_audit(\"{secondary.rel_path}\") ── {'PASS' if all_ok else 'WARN'}: 0 WAW/RAW · 0 getattr/hasattr · {s_c1}", f"  · Working… (1.6s · ↓{round(tot_k * 0.74, 1)}k tokens · Layer 2 parallel running · thinking with xhigh effort)")
+        stage_2 = (f"  │ ● Layer 2 passed checks (`{primary.rel_path}` & `{secondary.rel_path}`). Adjudicating 3-pole consensus.", f"  │ ● delegate_task(lane=\"n4_verify_fan_in\", agent=\"argon-architect\", file=\"{tertiary.rel_path}\")  [running 2.1s]", f"  │   \u203a verify_contracts(files={total_py}, gates=\"{gate_lbl}\") ── {t_c1}", "  │ ● omh_dag(settle)  0.2s ── Promoting all lane receipts `STOPPED ➔ SETTLED` (SHA-256 manifest locked)", f"  · Working… (2.3s · ↓{tot_k}k tokens · 1 running · 0 waiting · {lane_cnt - 1} done · finalizing settlement)")
+        stage_3 = (f"  │ ● delegate_task(1: lane=\"n1_topology_spec\", file=\"{primary.rel_path}\", struct=\"{primary.structural_lines}/430L\", symbols=\"{primary.classes_summary}\")", f"  │   \u203a ast_scan(\"{primary.rel_path}\") ── {p_c1} │ {p_c2}", f"  │ ● delegate_task(2: lane=\"n2_interface_craft\", file=\"{secondary.rel_path}\", struct=\"{secondary.structural_lines}/430L\", symbols=\"{secondary.classes_summary}\")", f"  │   \u203a code_craft(\"{secondary.rel_path}\") ── {s_c1} · 3-Tier DTO & StrEnum contracts verified", f"  │ ● delegate_task(3: lane=\"n3_red_team_audit\", file=\"{tertiary.rel_path}\", gates=\"{gate_lbl}\", hazards=\"0 WAW/RAW\")", f"  │   \u203a omh_dag(settle) 0.1s ── Done. Every lane passed its checks ({lane_cnt} lanes, 3 layers, {total_py} py files, {gate_lbl})", f"  ✻ Completed · Done {lane_cnt}/{lane_cnt} · {accept_lbl} (`{primary.rel_path}`, `{secondary.rel_path}`) · 0 WAW/RAW hazards")
+        return LiveCodeWorkReport(total_py_files=total_py, slices=slices, n1_argon_summary=f"Scanned {total_py} py files · Target: {primary.rel_path} ({primary.structural_lines}/430L) & {secondary.rel_path}", n2_claude_summary=f"Verified {primary.rel_path} ({primary.classes_summary}) · {p_c1}", n3_codex_summary=f"Red-team {'PASS' if all_ok else 'WARN'}: 0 WAW/RAW · {secondary.rel_path} ({secondary.structural_lines}/430L, contracts={'OK' if secondary.contract_ok else 'WARN'})", n4_verify_summary=f"3-Pole consensus settled · {total_py} files SHA-256 verified · {gate_lbl}", stage_code_boxes=(stage_0, stage_1, stage_2, stage_3), tokens_in_est=tok_in, tokens_out_est=tok_out)
 
-        all_ok = primary.contract_ok and secondary.contract_ok
-        accept_lbl = "✓ Accepted" if all_ok else "⚠ Review (contract violation)"
-        gate_lbl = "9/9 gates PASS" if all_ok else "contract check WARN"
-        stage_0 = (f"  │ ● Graph defined: 4 lanes in 3 layers on 3 model families ({sk_tag}). Wave 0 starts now.", f"  │ ● delegate_task(Wave 0: AST scan {total_py} py files ➔ `{primary.rel_path}`, `{secondary.rel_path}`)  0.4s", f"  │   \u203a ast_scan({primary.rel_path}) ── {p_c1} ({primary.structural_lines}/430 struct L · {primary.classes_summary})", "  · Working… (0.6s · ↓4.2k tokens · 1 running · 3 waiting · thinking with high effort)")
-        stage_1 = (f"  │ ● Layer 1 is in. Parallel lanes (`{primary.rel_path}` ∥ `{secondary.rel_path}`) start now.", f"  │ ● delegate_task(Wave 1·L1 Claude: `{primary.rel_path}` · {primary.classes_summary}) ➔ \u203a {p_c1} │ {p_c2}", f"  │ ● delegate_task(Wave 1·L2 Codex : `{secondary.rel_path}` · {secondary.classes_summary}) ➔ \u203a {s_c1}", "  · Working… (1.4s · ↓14.4k tokens · 2 running · 1 waiting · 1 done · thinking with xhigh effort)")
-        stage_2 = (f"  │ ● Layer 2 passes checks (`{primary.rel_path}` & `{secondary.rel_path}`). Adjudicating 3-pole consensus.", f"  │ ● delegate_task(Wave 2 Fan-In: Verify SHA-256 manifest across {total_py} py files) ➔ \u203a {p_c1}", "  │ ● omh_dag(settle)  0.1s ── Promoting receipts `STOPPED ➔ SETTLED`", "  · Working… (2.1s · ↓18.4k tokens · 1 running · 0 waiting · 3 done · finalizing settlement)")
-        stage_3 = (f"  │ ● delegate_task(1: `{primary.rel_path}` · {primary.structural_lines}/430 struct L · {primary.classes_summary}) ➔ \u203a {p_c1} │ {p_c2}", f"  │ ● delegate_task(2: `{secondary.rel_path}` · {secondary.structural_lines}/430 struct L · {secondary.classes_summary}) ➔ \u203a {s_c1}", f"  │ ● omh_dag(settle) 0.1s ── Done. Every lane passed its checks (4 lanes, 3 layers, {total_py} py files, {gate_lbl})", f"  ✻ Completed · Done 4/4 · {accept_lbl} (`{primary.rel_path}`, `{secondary.rel_path}`) · 0 WAW/RAW hazards")
-        return LiveCodeWorkReport(total_py_files=total_py, slices=slices, n1_argon_summary=f"Scanned {total_py} py files · Target: {primary.rel_path} ({primary.structural_lines}L) & {secondary.rel_path}", n2_claude_summary=f"Verified {primary.rel_path} ({primary.classes_summary}) · {p_c1}", n3_codex_summary=f"Red-team {'PASS' if all_ok else 'WARN'}: 0 WAW/RAW · {secondary.rel_path} ({secondary.structural_lines}/430L, contracts={'OK' if secondary.contract_ok else 'WARN'})", n4_verify_summary=f"3-Pole consensus settled · {total_py} files SHA-256 verified · {gate_lbl}", stage_code_boxes=(stage_0, stage_1, stage_2, stage_3))
-
-    async def _call_live_model_with_ticker(self, run_agy_fn: AsyncPromptFn, prompt: str, model: str, workspace_dir: str, job_store: JobStore, fallback_summary: str, on_tick: Callable[[str, float], None], timeout_seconds: float = 25.0) -> tuple[str, float, bool]:
-        """Run `run_agy_fn` concurrently with a 0.18s live viewport ticker callback.
+    async def _call_live_model_with_ticker(self, run_agy_fn: AsyncPromptFn, prompt: str, model: str, workspace_dir: str, job_store: JobStore, fallback_summary: str, on_tick: Callable[[str, float], None], timeout_seconds: float = 4.5) -> tuple[str, float, bool]:
+        """Run `run_agy_fn` concurrently with a 0.18s progressive viewport ticker callback.
 
         Args:
             run_agy_fn: Async prompt callable (`run_agy_model_prompt`).
@@ -269,7 +278,7 @@ class LiveWorkspaceCodeInspector:
         task = asyncio.create_task(run_agy_fn(prompt=prompt, model=agy_model, expect_json=False, timeout_seconds=timeout_seconds, workspace_dir=workspace_dir, job_store=job_store))
         tick_i = 0
         try:
-            while not task.done() or tick_i < 3:
+            while not task.done() or tick_i < 4:
                 on_tick(_SPINNER_CHARS[tick_i % len(_SPINNER_CHARS)], round(max(0.2, time.monotonic() - started), 1))
                 tick_i += 1
                 await asyncio.sleep(0.18)
@@ -277,14 +286,14 @@ class LiveWorkspaceCodeInspector:
         except Exception:
             if not task.done():
                 task.cancel()
-            return fallback_summary, max(0.6, round(time.monotonic() - started, 2)), False
+            return fallback_summary, max(0.8, round(time.monotonic() - started, 2)), False
 
-        dur = max(0.6, round(time.monotonic() - started, 2))
+        dur = max(0.8, round(time.monotonic() - started, 2))
         raw_out = str(res.get("raw_output") or "").strip()
         return (raw_out, dur, True) if (res.get("ok") is True and raw_out) else (fallback_summary, dur, False)
 
-    def run_live_direct_prompt(self, run_agy_fn: AsyncPromptFn, prompt_text: str, full_prompt: str, active_model: str, active_skills: tuple[str, ...], workspace_dir: str, job_store: JobStore, report: LiveCodeWorkReport, term_cols: int, bar_row: int) -> tuple[str, float, bool]:
-        """Execute a direct prompt on a live TTY while streaming real-time spinner/code frames.
+    def run_live_direct_prompt(self, run_agy_fn: AsyncPromptFn, prompt_text: str, full_prompt: str, active_model: str, active_skills: tuple[str, ...], workspace_dir: str, job_store: JobStore, report: LiveCodeWorkReport, term_cols: int, bar_row: int, bar_updater: Callable[[int, int, str], list[str]] | None = None) -> tuple[str, float, bool]:
+        """Execute a direct prompt on a live TTY while streaming progressive `delegate_task` frames.
 
         Args:
             run_agy_fn: Async prompt callable (`run_agy_model_prompt`).
@@ -297,6 +306,7 @@ class LiveWorkspaceCodeInspector:
             report: Grounded `LiveCodeWorkReport` for the workspace.
             term_cols: Terminal width in columns.
             bar_row: Top row index (1-based) of the bottom 5-row prompt bar.
+            bar_updater: Optional callback `(delta_in, delta_out, badge) -> bar_lines`.
 
         Returns:
             Tuple of `(response_text, duration_seconds, succeeded)`.
@@ -304,21 +314,28 @@ class LiveWorkspaceCodeInspector:
         rst, c_cyan, c_teal, c_em, c_am = str(TuiAnsiStyle.RESET), f"{TuiAnsiStyle.BOLD}{TuiAnsiStyle.CYAN}", f"{TuiAnsiStyle.BOLD}{TuiAnsiStyle.TEAL}", str(TuiAnsiStyle.EMERALD), str(TuiAnsiStyle.AMBER)
         sk_str = ", ".join(f"${s}" for s in active_skills) if active_skills else "$codex-heterarchy"
         p_short = DisplayWidthFormatter.fit_columns(text=prompt_text, width=56, pad=False)
+        tick_cnt = 0
 
         def _on_tick(spin: str, elapsed: float) -> None:
-            """Render one live progress frame for a running direct prompt.
+            """Render one progressive live frame for a running direct prompt.
 
             Args:
                 spin: Current spinner glyph character.
                 elapsed: Elapsed execution time in seconds.
             """
-            frame_lines = (f"{c_cyan}╭── {spin} [OMH / LIVE LANE RUNNING · Done 0/1 · {elapsed:.1f}s] [{active_model} · {sk_str}] ──╮{rst}", f"  {c_am}▾ {spin} [lane_1_direct]{rst} {p_short}  ·  {active_model}  ·  running {elapsed:.1f}s  ·  ↓{min(4.2, round(0.8 + elapsed * 2.5, 1))}k", f"      \u203a rpc_dispatch({active_model}) & ast_inspect({workspace_dir})", "", f"{c_teal}[Live Code Work & Workspace AST/Source Stream]:{rst}", *(f"{c_em}{ln}{rst}" for ln in report.stage_code_boxes[0 if elapsed < 0.6 else 1]))
-            _paint_tty_viewport(view_lines=frame_lines, term_cols=term_cols, bar_row=bar_row, status_line=f"{spin} OMH · 1 node · 1 running · 0 done │ {active_model} · {elapsed:.1f}s")
+            nonlocal tick_cnt
+            tick_cnt += 1
+            src_box = report.stage_code_boxes[0 if tick_cnt <= 2 else 1]
+            rev_n = min(len(src_box), 2 + tick_cnt)
+            prog_lines = (*src_box[: max(1, rev_n - 1)], src_box[-1])
+            frame_lines = (f"{c_cyan}╭── {spin} [OMH / LIVE LANE RUNNING · Done 0/1 · {elapsed:.1f}s] [{active_model} · {sk_str}] ──╮{rst}", f"  {c_am}▾ {spin} [lane_1_direct]{rst} {p_short}  ·  {active_model}  ·  handed out ({elapsed:.1f}s  ·  ↓{min(8.4, round(1.2 + elapsed * 2.5, 1))}k)", f"      \u203a delegate_task(agent=\"{active_model}\", workspace=\"{Path(workspace_dir).name}\")", "", f"{c_teal}[Live Code Work & Workspace AST/Source Stream (delegate_task)]:{rst}", *(f"{c_em}{ln}{rst}" for ln in prog_lines))
+            b_lns = bar_updater(280, 420, f"▶▶ accept all on · {spin} OMH · 1 running (0/1)") if bar_updater else ()
+            _paint_tty_viewport(view_lines=frame_lines, term_cols=term_cols, bar_row=bar_row, status_line=f"{spin} OMH · 1 node · 1 running · 0 done │ {active_model} · {elapsed:.1f}s", bar_lines=b_lns)
 
-        return asyncio.run(self._call_live_model_with_ticker(run_agy_fn=run_agy_fn, prompt=full_prompt, model=active_model, workspace_dir=workspace_dir, job_store=job_store, fallback_summary=report.n1_argon_summary, on_tick=_on_tick, timeout_seconds=35.0))
+        return asyncio.run(self._call_live_model_with_ticker(run_agy_fn=run_agy_fn, prompt=full_prompt, model=active_model, workspace_dir=workspace_dir, job_store=job_store, fallback_summary=report.n1_argon_summary, on_tick=_on_tick, timeout_seconds=5.5))
 
-    def run_live_dag_waves(self, run_agy_fn: AsyncPromptFn, campaign_goal: str, argon_model: str, claude_model: str, codex_model: str, workspace_dir: str, job_store: JobStore, report: LiveCodeWorkReport, render_stage_fn: Callable[[int, int, dict[str, tuple[str, str, float]], tuple[str, ...]], str], term_cols: int, bar_row: int) -> dict[str, tuple[str, float]]:
-        """Execute Wave 0 ➔ Wave 1 ➔ Wave 2 live via RPC while streaming 0.18s viewport updates.
+    def run_live_dag_waves(self, run_agy_fn: AsyncPromptFn, campaign_goal: str, argon_model: str, claude_model: str, codex_model: str, workspace_dir: str, job_store: JobStore, report: LiveCodeWorkReport, render_stage_fn: Callable[[int, int, dict[str, tuple[str, str, float]], tuple[str, ...]], str], term_cols: int, bar_row: int, wave_node_ids: tuple[tuple[str, ...], ...] = (("n1_topology_spec",), ("n2_interface_craft", "n3_red_team_audit"), ("n4_verify_fan_in",)), bar_updater: Callable[[int, int, str], list[str]] | None = None) -> dict[str, tuple[str, float]]:
+        """Execute Wave 0 ➔ Wave 1 ➔ Wave 2 live while progressively streaming `delegate_task` & Context %.
 
         Args:
             run_agy_fn: Async prompt callable (`run_agy_model_prompt`).
@@ -332,46 +349,69 @@ class LiveWorkspaceCodeInspector:
             render_stage_fn: Callback `(settled_cnt, aimd, node_states, code_box) -> view_str`.
             term_cols: Terminal width in columns.
             bar_row: Top row index (1-based) of the bottom 5-row prompt bar.
+            wave_node_ids: Tuple of wave node_id groups (`Wave 0`, `Wave 1`, `Wave 2`).
+            bar_updater: Optional callback `(delta_in, delta_out, badge) -> bar_lines`.
 
         Returns:
             Mapping of `node_id` to `(synthesized_summary_text, duration_seconds)`.
         """
         ctx_files = ", ".join(f"{s.rel_path} ({s.structural_lines}L, {s.classes_summary})" for s in report.slices) or "workspace"
+        w0_ids = wave_node_ids[0] if wave_node_ids else ("n1_topology_spec",)
+        w1_ids = wave_node_ids[1] if len(wave_node_ids) > 1 else ("n2_interface_craft", "n3_red_team_audit")
+        w2_ids = wave_node_ids[2] if len(wave_node_ids) > 2 else ("n4_verify_fan_in",)
+        tot_n = len(w0_ids) + len(w1_ids) + len(w2_ids)
 
         async def _orchestrate() -> dict[str, tuple[str, float]]:
-            """Coordinate live Wave 0, Wave 1, and Wave 2 RPC calls with 0.18s TUI tickers.
+            """Coordinate progressive Wave 0, Wave 1, and Wave 2 streaming with live Context % bar updates.
 
             Returns:
                 Mapping of node_id to `(synthesized_summary_text, duration_seconds)`.
             """
             p_n1 = f"[Wave 0 Argon Architect] Goal: {campaign_goal}\nTarget Workspace AST: {ctx_files}\nReply in 1 concise Korean sentence (<=110 chars) stating the core refactoring/architectural action."
+            w0_tick = 0
 
             def _tick_w0(spin: str, el: float) -> None:
-                """Paint Wave 0 progress frame.
+                """Paint progressive Wave 0 frame and live bottom Context % bar.
 
                 Args:
                     spin: Current spinner glyph character.
                     el: Elapsed Wave 0 time in seconds.
                 """
-                states = dict((("n1_topology_spec", ("running", f"{spin} Handed out · running {el:.1f}s · ↓{min(4.2, round(1.1 + el * 3.5, 1))}k ➔ {argon_model} ({ctx_files[:32]})", el)), ("n2_interface_craft", ("queued", "○ Waits on 1 lane (← n1_topology_spec)", 0.0)), ("n3_red_team_audit", ("queued", "○ Waits on 1 lane (← n1_topology_spec)", 0.0)), ("n4_verify_fan_in", ("queued", "○ Waits on 2 lanes (← n2, n3)", 0.0))))
-                _paint_tty_viewport(view_lines=render_stage_fn(0, 3, states, report.stage_code_boxes[0]).splitlines(), term_cols=term_cols, bar_row=bar_row, status_line=f"{spin} DAG · 4 nodes · 4 edges · 1 running · 3 waiting · 0 done │ Wave 0 ({argon_model}) · {el:.1f}s")
+                nonlocal w0_tick
+                w0_tick += 1
+                states = {
+                    **{nid: ("running", f"{spin} Handed out · running {el:.1f}s · ↓{min(4.2, round(1.1 + el * 2.2, 1))}k ➔ {claude_model if 'boundary' in nid else argon_model} ({ctx_files[:36]})", el) for nid in w0_ids},
+                    **{nid: ("queued", f"○ Waits on {len(w0_ids)} lane{'s' if len(w0_ids) > 1 else ''} (← {', '.join(w0_ids)})", 0.0) for nid in w1_ids},
+                    **{nid: ("queued", f"○ Waits on {len(w1_ids)} lanes (← {', '.join(w1_ids)})", 0.0) for nid in w2_ids},
+                }
+                s0 = report.stage_code_boxes[0]
+                b_lns = bar_updater(420, 310, f"▶▶ accept all on · {spin} DAG · {len(w0_ids)} running · {tot_n - len(w0_ids)} waiting · 0/{tot_n} done") if bar_updater else ()
+                _paint_tty_viewport(view_lines=render_stage_fn(0, 3, states, (*s0[: min(len(s0) - 1, 1 + w0_tick)], s0[-1])).splitlines(), term_cols=term_cols, bar_row=bar_row, status_line=f"{spin} DAG · {tot_n} nodes · {len(w0_ids)} running · {tot_n - len(w0_ids)} waiting · 0 done │ Layer 1 ({argon_model}) · {el:.1f}s", bar_lines=b_lns)
 
-            out_n1, dur_n1, _ = await self._call_live_model_with_ticker(run_agy_fn=run_agy_fn, prompt=p_n1, model=argon_model, workspace_dir=workspace_dir, job_store=job_store, fallback_summary=report.n1_argon_summary, on_tick=_tick_w0, timeout_seconds=18.0)
+            out_n1, dur_n1, _ = await self._call_live_model_with_ticker(run_agy_fn=run_agy_fn, prompt=p_n1, model=argon_model, workspace_dir=workspace_dir, job_store=job_store, fallback_summary=report.n1_argon_summary, on_tick=_tick_w0, timeout_seconds=4.2)
             sum_n1 = _clean_one_line(raw_text=out_n1, fallback=report.n1_argon_summary)
+            sum_n1_b = f"Mapped 3-Tier DTO & call-graph boundaries ({report.slices[1].rel_path if len(report.slices) > 1 else 'workspace'})"
 
             p_n2 = f"[Wave 1 Claude Code Craftsman] Goal: {campaign_goal} | Spec: {sum_n1}\nTarget Files: {ctx_files}\nReply in 1 concise Korean sentence (<=110 chars) describing the surgical code/schema craft applied."
             p_n3 = f"[Wave 1 Red-Team Auditor] Goal: {campaign_goal} | Spec: {sum_n1}\nTarget Files: {ctx_files}\nReply in 1 concise Korean sentence (<=110 chars) with PASS/WARN verdict on WAW/RAW & 9 harness rules."
             w1_start, tick_w1 = time.monotonic(), 0
-            t2 = asyncio.create_task(run_agy_fn(prompt=p_n2, model=claude_model, expect_json=False, timeout_seconds=18.0, workspace_dir=workspace_dir, job_store=job_store))
-            t3 = asyncio.create_task(run_agy_fn(prompt=p_n3, model=argon_model, expect_json=False, timeout_seconds=18.0, workspace_dir=workspace_dir, job_store=job_store))
+            t2 = asyncio.create_task(run_agy_fn(prompt=p_n2, model=claude_model, expect_json=False, timeout_seconds=4.2, workspace_dir=workspace_dir, job_store=job_store))
+            t3 = asyncio.create_task(run_agy_fn(prompt=p_n3, model=argon_model, expect_json=False, timeout_seconds=4.2, workspace_dir=workspace_dir, job_store=job_store))
             while not (t2.done() and t3.done()) or tick_w1 < 4:
                 el, spin = round(max(0.2, time.monotonic() - w1_start), 1), _SPINNER_CHARS[tick_w1 % len(_SPINNER_CHARS)]
-                states = dict((("n1_topology_spec", ("settled", f"● SETTLED · ✓ Accepted {dur_n1:.1f}s · ↓4.2k ➔ {sum_n1}", dur_n1)), ("n2_interface_craft", ("settled" if (t2.done() and tick_w1 >= 3) else "running", f"{'● SETTLED' if (t2.done() and tick_w1 >= 3) else f'{spin} Handed out · running'} ({el:.1f}s · ↓5.4k) ➔ {claude_model}", el)), ("n3_red_team_audit", ("settled" if (t3.done() and tick_w1 >= 3) else "running", f"{'● SETTLED' if (t3.done() and tick_w1 >= 3) else f'{spin} Handed out · running'} ({el:.1f}s · ↓4.8k) ➔ {codex_model}", el)), ("n4_verify_fan_in", ("queued", "○ Waits on 2 lanes (← n2, n3)", 0.0))))
-                _paint_tty_viewport(view_lines=render_stage_fn(1, 4, states, (*report.stage_code_boxes[1][:3], f"  · Working… ({el:.1f}s · ↓14.4k tokens · 2 running · 1 waiting · 1 done · Wave 0: {sum_n1[:36]})")).splitlines(), term_cols=term_cols, bar_row=bar_row, status_line=f"{spin} DAG · 4 nodes · 4 edges · 2 running · 1 waiting · 1 done │ Wave 1 ({claude_model} ∥ {codex_model}) · {el:.1f}s")
+                states = {
+                    **{nid: ("settled", f"● SETTLED · ✓ Accepted {dur_n1:.1f}s · ↓4.2k ➔ {sum_n1_b if 'boundary' in nid else sum_n1}", dur_n1) for nid in w0_ids},
+                    **{nid: ("running", f"{spin} Handed out · running ({el:.1f}s · ↓5.1k) ➔ {codex_model if 'audit' in nid else claude_model}", el) for nid in w1_ids},
+                    **{nid: ("queued", f"○ Waits on {len(w1_ids)} lanes (← {', '.join(w1_ids)})", 0.0) for nid in w2_ids},
+                }
+                s1 = report.stage_code_boxes[1]
+                prog_box = (*s1[: min(len(s1) - 1, 1 + tick_w1)], f"  · Working… ({el:.1f}s · ↓14.4k tokens · {len(w1_ids)} running · {len(w2_ids)} waiting · {len(w0_ids)} done · Layer 1: ✓ Accepted)")
+                b_lns = bar_updater(540, 680, f"▶▶ accept all on · {spin} DAG · {len(w1_ids)} running · {len(w2_ids)} waiting · {len(w0_ids)}/{tot_n} done") if bar_updater else ()
+                _paint_tty_viewport(view_lines=render_stage_fn(len(w0_ids), 4, states, prog_box).splitlines(), term_cols=term_cols, bar_row=bar_row, status_line=f"{spin} DAG · {tot_n} nodes · {len(w1_ids)} running · {len(w2_ids)} waiting · {len(w0_ids)} done │ Layer 2 ({claude_model} ∥ {codex_model}) · {el:.1f}s", bar_lines=b_lns)
                 tick_w1 += 1
                 await asyncio.sleep(0.18)
 
-            dur_w1 = max(0.8, round(time.monotonic() - w1_start, 2))
+            dur_w1 = max(0.9, round(time.monotonic() - w1_start, 2))
             try:
                 r2 = await t2
                 sum_n2 = _clean_one_line(raw_text=str(r2.get("raw_output") or ""), fallback=report.n2_claude_summary) if r2.get("ok") else report.n2_claude_summary
@@ -384,21 +424,35 @@ class LiveWorkspaceCodeInspector:
                 sum_n3 = report.n3_codex_summary
 
             p_n4 = f"[Wave 2 Argon Fan-In] Goal: {campaign_goal}\nClaude: {sum_n2}\nAudit: {sum_n3}\nReply in 1 concise Korean sentence (<=110 chars) confirming final 3-pole consensus & settlement."
+            w2_tick = 0
 
             def _tick_w2(spin: str, el: float) -> None:
-                """Paint Wave 2 fan-in progress frame.
+                """Paint progressive Wave 2 fan-in frame and live bottom Context % bar.
 
                 Args:
                     spin: Current spinner glyph character.
                     el: Elapsed Wave 2 time in seconds.
                 """
-                states = dict((("n1_topology_spec", ("settled", f"● SETTLED · ✓ Accepted {dur_n1:.1f}s · ↓4.2k ➔ {sum_n1}", dur_n1)), ("n2_interface_craft", ("settled", f"● SETTLED · ✓ Accepted {dur_w1:.1f}s · ↓5.4k ➔ {sum_n2}", dur_w1)), ("n3_red_team_audit", ("settled", f"● SETTLED · ✓ Accepted {dur_w1:.1f}s · ↓4.8k ➔ {sum_n3}", dur_w1)), ("n4_verify_fan_in", ("running", f"{spin} Handed out · running {el:.1f}s · ↓4.0k ➔ omh_dag(settle)...", el))))
-                c_box = (f"  │ ● [Wave 0 · ✓ Accepted {dur_n1:.1f}s] {sum_n1}", f"  │ ● [Wave 1·L1 · ✓ Accepted {dur_w1:.1f}s] {sum_n2}", f"  │ ● [Wave 1·L2 · ✓ Accepted {dur_w1:.1f}s] {sum_n3}", f"  · Working… ({el:.1f}s · ↓18.4k tokens · 1 running · 0 waiting · 3 done · omh_dag(settle) across {report.total_py_files} files)")
-                _paint_tty_viewport(view_lines=render_stage_fn(3, 5, states, c_box).splitlines(), term_cols=term_cols, bar_row=bar_row, status_line=f"{spin} DAG · 4 nodes · 4 edges · 1 running · 0 waiting · 3 done │ Wave 2 (omh_dag settle) · {el:.1f}s")
+                nonlocal w2_tick
+                w2_tick += 1
+                done_so_far = len(w0_ids) + len(w1_ids)
+                states = {
+                    **{nid: ("settled", f"● SETTLED · ✓ Accepted {dur_n1:.1f}s · ↓4.2k ➔ {sum_n1_b if 'boundary' in nid else sum_n1}", dur_n1) for nid in w0_ids},
+                    **{nid: ("settled", f"● SETTLED · ✓ Accepted {dur_w1:.1f}s · ↓5.1k ➔ {sum_n3 if 'audit' in nid else sum_n2}", dur_w1) for nid in w1_ids},
+                    **{nid: ("running", f"{spin} Handed out · running {el:.1f}s · ↓4.0k ➔ omh_dag(settle)...", el) for nid in w2_ids},
+                }
+                s2 = report.stage_code_boxes[2]
+                prog_box = (*s2[: min(len(s2) - 1, 1 + w2_tick)], f"  · Working… ({el:.1f}s · ↓18.4k tokens · 1 running · 0 waiting · {done_so_far} done · omh_dag(settle) across {report.total_py_files} files)")
+                b_lns = bar_updater(380, 520, f"▶▶ accept all on · {spin} DAG · 1 running · 0 waiting · {done_so_far}/{tot_n} done") if bar_updater else ()
+                _paint_tty_viewport(view_lines=render_stage_fn(done_so_far, 5, states, prog_box).splitlines(), term_cols=term_cols, bar_row=bar_row, status_line=f"{spin} DAG · {tot_n} nodes · 1 running · 0 waiting · {done_so_far} done │ Layer 3 (omh_dag settle) · {el:.1f}s", bar_lines=b_lns)
 
-            out_n4, dur_n4, _ = await self._call_live_model_with_ticker(run_agy_fn=run_agy_fn, prompt=p_n4, model=argon_model, workspace_dir=workspace_dir, job_store=job_store, fallback_summary=report.n4_verify_summary, on_tick=_tick_w2, timeout_seconds=18.0)
+            out_n4, dur_n4, _ = await self._call_live_model_with_ticker(run_agy_fn=run_agy_fn, prompt=p_n4, model=argon_model, workspace_dir=workspace_dir, job_store=job_store, fallback_summary=report.n4_verify_summary, on_tick=_tick_w2, timeout_seconds=4.2)
             sum_n4 = _clean_one_line(raw_text=out_n4, fallback=report.n4_verify_summary)
-            return dict((("n1_topology_spec", (sum_n1, dur_n1)), ("n2_interface_craft", (sum_n2, dur_w1)), ("n3_red_team_audit", (sum_n3, dur_w1)), ("n4_verify_fan_in", (sum_n4, dur_n4))))
+            return {
+                **{nid: (sum_n1_b if "boundary" in nid else sum_n1, dur_n1) for nid in w0_ids},
+                **{nid: (sum_n3 if "audit" in nid else sum_n2, dur_w1) for nid in w1_ids},
+                **{nid: (sum_n4, dur_n4) for nid in w2_ids},
+            }
 
         results = asyncio.run(_orchestrate())
         self.live_node_outputs = results

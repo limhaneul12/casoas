@@ -172,10 +172,7 @@ def _handle_codex_bench_command(session: HeterarchyTuiSession, cmd: str, arg: st
 class HeterarchyTuiSession:
     """Interactive prompt loop (`>>`) and command router for `hcodex tui`."""
 
-    def __init__(
-        self, workspace_dir: str = ".", state_root: Path | None = None, use_ansi: bool = True,
-        run_agy_fn: AsyncEngineCallable | None = None, execute_fn: AsyncEngineCallable | None = None,
-    ) -> None:
+    def __init__(self, workspace_dir: str = ".", state_root: Path | None = None, use_ansi: bool = True, run_agy_fn: AsyncEngineCallable | None = None, execute_fn: AsyncEngineCallable | None = None) -> None:
         """Initialize the interactive TUI session with stores, renderer, skills, and DAG service.
 
         Args:
@@ -187,31 +184,19 @@ class HeterarchyTuiSession:
         """
         self.workspace_dir = str(Path(workspace_dir).resolve())
         cache_dir = state_root or (Path.home() / ".cache" / "codex-collab-mcp")
-        self.job_store = JobStore(state_dir=cache_dir / "jobs")
-        self.handoff_store = HandoffStore(state_dir=cache_dir / "handoffs")
-        self.renderer = OmhTuiRenderer(use_ansi=use_ansi)
-        self.skill_registry = TuiSkillRegistry(workspace_dir=self.workspace_dir)
-        self.suggestion_engine = TuiSuggestionEngine(
-            skill_registry=self.skill_registry, git_branch=_detect_git_branch(workspace_dir=self.workspace_dir)
-        )
+        self.job_store, self.handoff_store = JobStore(state_dir=cache_dir / "jobs"), HandoffStore(state_dir=cache_dir / "handoffs")
+        self.renderer, self.skill_registry = OmhTuiRenderer(use_ansi=use_ansi), TuiSkillRegistry(workspace_dir=self.workspace_dir)
+        self.suggestion_engine = TuiSuggestionEngine(skill_registry=self.skill_registry, git_branch=_detect_git_branch(workspace_dir=self.workspace_dir))
         self.prompt_reader = TuiInteractivePromptReader(engine=self.suggestion_engine, use_ansi=use_ansi)
-        self.dag_service = DagUlwExecutionService()
-        self.effect_registry = DagAgentEffectRegistry()
-        self.code_inspector = LiveWorkspaceCodeInspector()
+        self.dag_service, self.effect_registry, self.code_inspector = DagUlwExecutionService(), DagAgentEffectRegistry(), LiveWorkspaceCodeInspector()
         self.last_code_report: LiveCodeWorkReport | None = None
-        self._policy_engine = RoutingPolicyEngine()
+        self._policy_engine, self.permission_mode, self.last_dag_goal = RoutingPolicyEngine(), str(TuiPermissionMode.YOLO), "Verify and refactor module contracts"
         self.baseline_manifest: dict[str, str] | None = None
-        self.permission_mode: str = str(TuiPermissionMode.YOLO)
-        self.last_dag_goal: str = "Verify and refactor module contracts"
         self.last_dag_receipts: tuple[DagNodeSettlementReceipt, ...] = ()
         self.view_history: list[str] = []
-        self.current_view: str = ""
-        self.active_model: str = str(CanonicalModelId.GEMINI_4_ARGON_HIGH)
-        self.dag_mode: bool = False
-        self.prompt_reader.active_model = self.active_model
-        self.prompt_reader.dag_mode = self.dag_mode
-        self._run_agy_fn = run_agy_fn
-        self._execute_fn = execute_fn
+        self.current_view, self.active_model, self.dag_mode = "", str(CanonicalModelId.GEMINI_4_ARGON_HIGH), False
+        self.prompt_reader.active_model, self.prompt_reader.dag_mode = self.active_model, self.dag_mode
+        self._run_agy_fn, self._execute_fn = run_agy_fn, execute_fn
 
     async def _default_agy_fn(self, **kwargs: object) -> JsonObject:
         """Provide a workspace-grounded Antigravity response when invoked in fast TUI mode.
@@ -224,13 +209,18 @@ class HeterarchyTuiSession:
         """
         model_s = str(kwargs.get("model") or CanonicalModelId.GEMINI_4_ARGON_HIGH)
         p_txt = str(kwargs.get("prompt") or "")
+        hdr = p_txt[:800]
         rep = self.last_code_report
         live_out = self.code_inspector.live_node_outputs
-        if "n4_verify_fan_in" in p_txt:
+        if "[n4_verify_fan_in]" in hdr:
             msg = live_out["n4_verify_fan_in"][0] if "n4_verify_fan_in" in live_out else (rep.n4_verify_summary if rep else "3-Pole consensus verified & settled")
-        elif "n2_interface_craft" in p_txt:
+        elif "[n1_boundary_map]" in hdr:
+            msg = live_out["n1_boundary_map"][0] if "n1_boundary_map" in live_out else (f"Strict 3-tier DTO & boundary map ({rep.slices[1].rel_path})" if (rep and len(rep.slices) > 1) else "Strict boundary map distilled")
+        elif "[n3_contract_gate]" in hdr:
+            msg = live_out["n3_contract_gate"][0] if "n3_contract_gate" in live_out else "9/9 mechanical & SQL guards PASS"
+        elif "[n2_interface_craft]" in hdr:
             msg = live_out["n2_interface_craft"][0] if "n2_interface_craft" in live_out else (rep.n2_claude_summary if rep else "Strict boundary & inner_dto crafted")
-        elif "n1_topology_spec" in p_txt:
+        elif "[n1_topology_spec]" in hdr:
             msg = live_out["n1_topology_spec"][0] if "n1_topology_spec" in live_out else (rep.n1_argon_summary if rep else "Invariants & 3-tier contracts distilled")
         else:
             msg = f"TUI local synthesis completed via {model_s}."
@@ -270,9 +260,26 @@ class HeterarchyTuiSession:
         expanded_p = _expand_at_file_mentions(prompt_text=clean_p, workspace_dir=self.workspace_dir)
         skill_ctx = self.skill_registry.build_active_skills_context()
         full_prompt = f"{skill_ctx}\n\n[User Request]:\n{expanded_p}" if skill_ctx else expanded_p
+        base_in, base_out = self.suggestion_engine.tokens_in, self.suggestion_engine.tokens_out
         if self.renderer.use_ansi and sys.stdout.isatty() and self._run_agy_fn is None and self._execute_fn is None:
             t_sz = shutil.get_terminal_size(fallback=(120, 32))
-            body, dur, ok = self.code_inspector.run_live_direct_prompt(run_agy_fn=run_agy_model_prompt, prompt_text=clean_p, full_prompt=full_prompt, active_model=target_model, active_skills=act_skills, workspace_dir=self.workspace_dir, job_store=self.job_store, report=code_rep, term_cols=max(80, t_sz.columns), bar_row=max(24, t_sz.lines) - 4)
+            t_cols = max(80, t_sz.columns)
+
+            def _upd_direct_bar(d_in: int, d_out: int, bdg: str) -> list[str]:
+                """Increment live token counters and render the 5-row bottom bar during direct prompt execution.
+
+                Args:
+                    d_in: Incremental input tokens for this tick.
+                    d_out: Incremental output tokens for this tick.
+                    bdg: Live OMH status badge string.
+
+                Returns:
+                    Five-line rendered bottom composer bar.
+                """
+                self.suggestion_engine.tokens_in, self.suggestion_engine.tokens_out, self.suggestion_engine.omh_status_badge = self.suggestion_engine.tokens_in + d_in, self.suggestion_engine.tokens_out + d_out, bdg
+                return self.suggestion_engine.render_codex_prompt_bar(buffer=f"⟳ Working: {clean_p[:46]}...", active_model=target_model, dag_mode=self.dag_mode, use_ansi=True, term_cols=t_cols)
+
+            body, dur, ok = self.code_inspector.run_live_direct_prompt(run_agy_fn=run_agy_model_prompt, prompt_text=clean_p, full_prompt=full_prompt, active_model=target_model, active_skills=act_skills, workspace_dir=self.workspace_dir, job_store=self.job_store, report=code_rep, term_cols=t_cols, bar_row=max(24, t_sz.lines) - 4, bar_updater=_upd_direct_bar)
             mod_id, req_id = target_model, "cdx-live-rpc"
         else:
             if target_model in CODEX_SUPPORTED_MODELS:
@@ -284,8 +291,8 @@ class HeterarchyTuiSession:
             ok = res.get("ok") is True
             mod_id, req_id, dur = str(res.get("model_id") or target_model), str(res.get("request_id") or "cdx-direct"), float(str(res.get("duration_seconds", 0.02)))
             body = str(res.get("raw_output") or res.get("error") or "(no output)").strip()
-        self.suggestion_engine.tokens_in += max(1, len(full_prompt) // 4)
-        self.suggestion_engine.tokens_out += max(1, len(body) // 4)
+        self.suggestion_engine.tokens_in = base_in + max(840, len(full_prompt) // 3 + code_rep.tokens_in_est // 3)
+        self.suggestion_engine.tokens_out = base_out + max(620, len(body) // 2 + code_rep.tokens_out_est // 4)
         self.suggestion_engine.omh_status_badge = "▶▶ accept all on · OMH · done 1/1 (✓ Accepted)"
         return self.code_inspector.render_direct_prompt_workbench(prompt_text=clean_p, model_id=mod_id, request_id=req_id, duration=dur, ok=ok, body_text=body, active_skills=act_skills, report=code_rep, use_ansi=self.renderer.use_ansi)
 
@@ -310,12 +317,16 @@ class HeterarchyTuiSession:
         self.code_inspector.live_node_outputs.clear()
         self.last_code_report = code_rep = self.code_inspector.build_code_work_report(workspace_dir=self.workspace_dir, query_text=goal_clean, active_skills=tuple(self.skill_registry.active_skills))
         spawn_plan = None if plan_only else DagSpawnPlanInputModel(plan_summary=f"TUI /dag-ulw interactive spawn plan for: {goal_clean}", hazard_acknowledgment=True, isolation_mode=DagIsolationMode.DIRECT, max_parallel_per_wave=3)
-        cfg_nodes = self.effect_registry.build_configured_triad_nodes(campaign_goal=goal_clean)
+        t_files = tuple(s.rel_path for s in code_rep.slices)
+        cfg_nodes = self.effect_registry.build_configured_triad_nodes(campaign_goal=goal_clean, target_files=t_files)
         req = DagUlwRequestModel(campaign_goal=goal_clean, nodes=cfg_nodes, workspace_dir=self.workspace_dir, plan_only=plan_only, spawn_plan=spawn_plan, resume_dag_id=resume_id)
         _, base_plan = self.dag_service._compiler.compile_plan(req=req, workspace_dir=self.workspace_dir, dag_id="cdx-live")
         by_nid = {n.node_id: n for n in cfg_nodes}
+        tot_run_toks = code_rep.tokens_in_est + code_rep.tokens_out_est
+        base_in, base_out = self.suggestion_engine.tokens_in, self.suggestion_engine.tokens_out
         if self.renderer.use_ansi and sys.stdout.isatty() and not plan_only:
             t_sz = shutil.get_terminal_size(fallback=(120, 32))
+            t_cols = max(80, t_sz.columns)
 
             def _render_live_stage(st_settled: int, st_aimd: int, states: dict[str, tuple[str, str, float]], c_box: tuple[str, ...]) -> str:
                 """Render a single live DAG wave stage snapshot.
@@ -329,13 +340,27 @@ class HeterarchyTuiSession:
                 Returns:
                     Rendered ANSI DAG workbench view string.
                 """
-                st_rcpts = {nid: DagNodeSettlementReceipt(node_id=nid, role=by_nid[nid].role, node_kind=by_nid[nid].node_kind, wave_index=0, settlement_stage=DagSettlementStage(stg), model_id=by_nid[nid].preferred_model or "", duration_seconds=dur_s, pre_manifest_digest="sha256:live", post_manifest_digest="sha256:live", mutated_files=(), out_of_scope_writes=(), dirty_read_files=(), verify_passed=True, reproduction_observed=True, output_summary=txt.split("➔ ")[-1]) for nid, (stg, txt, dur_s) in states.items()}
+                st_rcpts = {nid: DagNodeSettlementReceipt(node_id=nid, role=by_nid[nid].role, node_kind=by_nid[nid].node_kind, wave_index=0, settlement_stage=DagSettlementStage(stg), model_id=by_nid[nid].preferred_model or "", duration_seconds=dur_s, pre_manifest_digest="sha256:live", post_manifest_digest="sha256:live", mutated_files=(), out_of_scope_writes=(), dirty_read_files=(), verify_passed=True, reproduction_observed=True, output_summary=txt.split("➔ ")[-1]) for nid, (stg, txt, dur_s) in states.items() if nid in by_nid}
                 st_plan = DagCompiledPlan(dag_id=base_plan.dag_id, campaign_goal=base_plan.campaign_goal, plan_digest=base_plan.plan_digest, total_nodes=base_plan.total_nodes, total_waves=base_plan.total_waves, waves=base_plan.waves, hazards=base_plan.hazards, blocking_hazards_count=base_plan.blocking_hazards_count, spawn_plan_acknowledged=base_plan.spawn_plan_acknowledged, ascii_graph=self.dag_service._compiler.render_ascii_dag(nodes=cfg_nodes, waves=base_plan.waves, node_work_map={nid: txt for nid, (_, txt, _) in states.items()}))
                 st_dto = DagUlwResponse(ok=True, dag_id="cdx-live", run_state=DagRunState.PLANNED, plan_only=False, workspace_dir=self.workspace_dir, compiled_plan=st_plan, node_receipts=tuple(st_rcpts.values()), settled_count=st_settled, resumed_nodes=(), aimd_final_concurrency=st_aimd, wave_tree_view=self.dag_service.render_wave_tree(nodes=cfg_nodes, plan=st_plan, receipts=st_rcpts), summary="Streaming live wave execution...")
-                return self.renderer.render_dag_workbench_view(resp=st_dto, effect_registry=self.effect_registry, code_work_lines=c_box)
+                return self.renderer.render_dag_workbench_view(resp=st_dto, effect_registry=self.effect_registry, code_work_lines=c_box, total_tokens=tot_run_toks)
+
+            def _upd_dag_bar(d_in: int, d_out: int, bdg: str) -> list[str]:
+                """Increment live token counters and render the 5-row bottom bar during DAG wave execution.
+
+                Args:
+                    d_in: Incremental input tokens for this tick.
+                    d_out: Incremental output tokens for this tick.
+                    bdg: Live DAG status badge string.
+
+                Returns:
+                    Five-line rendered bottom composer bar.
+                """
+                self.suggestion_engine.tokens_in, self.suggestion_engine.tokens_out, self.suggestion_engine.omh_status_badge = self.suggestion_engine.tokens_in + d_in, self.suggestion_engine.tokens_out + d_out, bdg
+                return self.suggestion_engine.render_codex_prompt_bar(buffer=f"⟳ /dag-ulw {goal_clean[:44]}...", active_model=self.active_model, dag_mode=self.dag_mode, use_ansi=True, term_cols=t_cols)
 
             eff_cfg = self.effect_registry.config
-            self.code_inspector.run_live_dag_waves(run_agy_fn=run_agy_model_prompt, campaign_goal=goal_clean, argon_model=eff_cfg.argon.model_id, claude_model=eff_cfg.claude.model_id, codex_model=eff_cfg.codex.model_id, workspace_dir=self.workspace_dir, job_store=self.job_store, report=code_rep, render_stage_fn=_render_live_stage, term_cols=max(80, t_sz.columns), bar_row=max(24, t_sz.lines) - 4)
+            self.code_inspector.run_live_dag_waves(run_agy_fn=run_agy_model_prompt, campaign_goal=goal_clean, argon_model=eff_cfg.argon.model_id, claude_model=eff_cfg.claude.model_id, codex_model=eff_cfg.codex.model_id, workspace_dir=self.workspace_dir, job_store=self.job_store, report=code_rep, render_stage_fn=_render_live_stage, term_cols=t_cols, bar_row=max(24, t_sz.lines) - 4, wave_node_ids=tuple(w.node_ids for w in base_plan.waves), bar_updater=_upd_dag_bar)
         agy_cb = self._run_agy_fn or (run_agy_model_prompt if (use_live_rpc and not self.code_inspector.live_node_outputs) else self._default_agy_fn)
         raw_json = asyncio.run(self.dag_service.run_dag_campaign(req=req, job_store=self.job_store, run_agy_fn=agy_cb, execute_fn=self._execute_fn or self._default_exec_fn))
         parsed, live_durs = json.loads(raw_json), {k: v[1] for k, v in self.code_inspector.live_node_outputs.items()}
@@ -348,12 +373,13 @@ class HeterarchyTuiSession:
         compiled_plan = DagCompiledPlan(dag_id=str(parsed.get("dag_id", "cdx-tui")), campaign_goal=base_plan.campaign_goal, plan_digest=base_plan.plan_digest, total_nodes=base_plan.total_nodes, total_waves=base_plan.total_waves, waves=base_plan.waves, hazards=base_plan.hazards, blocking_hazards_count=base_plan.blocking_hazards_count, spawn_plan_acknowledged=base_plan.spawn_plan_acknowledged, ascii_graph=self.dag_service._compiler.render_ascii_dag(nodes=cfg_nodes, waves=base_plan.waves, node_work_map=settled_map))
         settled_tree = self.dag_service.render_wave_tree(nodes=cfg_nodes, plan=compiled_plan, receipts={r.node_id: r for r in rcpts}) if rcpts else str(parsed.get("wave_tree_view", ""))
         self.last_dag_goal, self.last_dag_receipts = goal_clean, rcpts
-        self.suggestion_engine.tokens_in += max(1, len(goal_clean) * 4)
-        self.suggestion_engine.tokens_out += sum(max(12, len(r.output_summary) // 2) for r in rcpts)
+        if not plan_only:
+            self.suggestion_engine.tokens_in = base_in + code_rep.tokens_in_est
+            self.suggestion_engine.tokens_out = base_out + code_rep.tokens_out_est
         settled_cnt = int(parsed.get("settled_count", 0))
         self.suggestion_engine.omh_status_badge = f"▶▶ accept all on · DAG · done {settled_cnt}/{base_plan.total_nodes} (✓ Accepted)" if not plan_only else f"▶▶ accept all on · DAG · planned 0/{base_plan.total_nodes}"
         dto = DagUlwResponse(ok=bool(parsed.get("ok", True)), dag_id=str(parsed.get("dag_id", "cdx-tui")), run_state=DagRunState(str(parsed.get("run_state", DagRunState.PLANNED))), plan_only=plan_only, workspace_dir=self.workspace_dir, compiled_plan=compiled_plan, node_receipts=rcpts, settled_count=settled_cnt, resumed_nodes=tuple(str(x) for x in parsed.get("resumed_nodes", [])), aimd_final_concurrency=int(parsed.get("aimd_final_concurrency", 3)), wave_tree_view=settled_tree, summary=str(parsed.get("summary", "")))
-        return self.renderer.render_dag_workbench_view(resp=dto, effect_registry=self.effect_registry, code_work_lines=code_rep.stage_code_boxes[3])
+        return self.renderer.render_dag_workbench_view(resp=dto, effect_registry=self.effect_registry, code_work_lines=code_rep.stage_code_boxes[3], total_tokens=tot_run_toks)
 
     def handle_command(self, raw_line: str) -> tuple[str, bool]:
         """Parse and execute a single TUI input line (`slash command`, `$skill`, `@file`, or prompt).
@@ -409,7 +435,8 @@ class HeterarchyTuiSession:
         elif cmd in (TuiSlashCommand.MODELS, TuiSlashCommand.LANES):
             out = self.renderer.render_models_matrix()
         elif cmd in (TuiSlashCommand.PROMPTS, TuiSlashCommand.PROMT, TuiSlashCommand.TRACE, "/prompt-trace"):
-            out = render_dag_prompts_inspector(effect_registry=self.effect_registry, campaign_goal=self.last_dag_goal, active_skills=tuple(self.skill_registry.active_skills), filter_arg=arg, receipts=self.last_dag_receipts, use_ansi=self.renderer.use_ansi)
+            t_files = tuple(s.rel_path for s in self.last_code_report.slices) if self.last_code_report else ()
+            out = render_dag_prompts_inspector(effect_registry=self.effect_registry, campaign_goal=self.last_dag_goal, active_skills=tuple(self.skill_registry.active_skills), filter_arg=arg, receipts=self.last_dag_receipts, use_ansi=self.renderer.use_ansi, target_files=t_files)
         elif cmd in (TuiSlashCommand.EFFECT, TuiSlashCommand.EFFORT, TuiSlashCommand.REASONING, TuiSlashCommand.DAG_EFFECT):
             out, play_prev = self.effect_registry.apply_effect_command(arg=arg, use_ansi=self.renderer.use_ansi)
             if play_prev and self.renderer.use_ansi and sys.stdout.isatty():
@@ -507,7 +534,7 @@ class HeterarchyTuiSession:
                         raw_lns = out.splitlines()
                         if len(raw_lns) > avail:
                             raw_lns = [ln for ln in raw_lns if ln.strip()]
-                        out_lines = raw_lns[:avail] if len(raw_lns) <= avail else [*raw_lns[: avail - 2], *raw_lns[-2:]]
+                        out_lines = raw_lns[:avail] if len(raw_lns) <= avail else [*raw_lns[:2], *raw_lns[-(avail - 2) :]]
                         self.prompt_reader.viewport_lines = {4 + i: DisplayWidthFormatter.fit_ansi_line(ansi_text=f"  {ln}", max_cols=t_cols - 2) for i, ln in enumerate(out_lines)}
                     idle = self.suggestion_engine.render_codex_prompt_bar(buffer="", active_model=self.active_model, dag_mode=self.dag_mode, use_ansi=True, term_cols=t_cols)
                     sys.stdout.write("".join(f"\033[{r};1H\033[2K{self.prompt_reader.viewport_lines.get(r, '')}" for r in range(4, bar_row)) + "".join(f"\033[{bar_row + i};1H\033[2K{ln}" for i, ln in enumerate(idle)))

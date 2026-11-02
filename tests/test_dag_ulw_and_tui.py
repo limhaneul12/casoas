@@ -310,12 +310,19 @@ def test_oh_my_hermes_style_tui_session_and_cli_commands(tmp_path: Path) -> None
     assert "accepted 0.8s · ↓4.2k" in dag_exec_out
     assert "[3] Live Code Work & Workspace AST/Source Stream" in dag_exec_out
     assert "delegate_task(" in dag_exec_out
+    assert "\u203a workspace_scan(" in dag_exec_out
     assert "omh_dag(settle)" in dag_exec_out
+    assert "▾ layer 1 · 1 node · 1 done" in dag_exec_out
+    assert "▾ layer 2 · 2 nodes · 2 done (Same frontier)" in dag_exec_out
+    assert "▾ layer 3 · 1 node · 1 done" in dag_exec_out
     assert "소요 시간:" in dag_exec_out
     assert "토큰 사용량: 18,400" in dag_exec_out
     assert "사용 모델:" in dag_exec_out
     assert "done 4/4" in session.suggestion_engine.omh_status_badge
-    assert len(dag_exec_out.splitlines()) <= 29
+    bar_text = "\n".join(session.suggestion_engine.render_codex_prompt_bar(buffer="", use_ansi=False))
+    assert "Context 90.8% left (ctx 9.2%)" in bar_text
+    assert "6,400 in · 12,000 out" in bar_text
+    assert len(dag_exec_out.splitlines()) <= 35
 
     omh_board_out, _ = session.handle_command(raw_line="/omh")
     assert "OMH / DAG LIVE LANE TREE & EVIDENCE BOARD" in omh_board_out
@@ -738,3 +745,37 @@ def test_sql_files_and_sql_injection_defenses(tmp_path: Path) -> None:
     assert hstore.get_ticket(ticket_id="' OR '1'='1") is None
     listed = hstore.list_tickets(recipient="codex' OR '1'='1", status="pending")
     assert listed == []
+
+
+def test_dynamic_multi_frontier_dag_topologies(tmp_path: Path) -> None:
+    """Verify dynamic 2->2->1 (parallel start frontier) and 1->3->1 (3-lane audit) DAG topologies."""
+    (tmp_path / "alpha.py").write_text(
+        '"""Alpha module."""\n\n\ndef run_alpha(x: int) -> int:\n    """Run alpha."""\n    return x + 1\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "beta.py").write_text(
+        '"""Beta module."""\n\n\ndef run_beta(y: int) -> int:\n    """Run beta."""\n    return y * 2\n',
+        encoding="utf-8",
+    )
+    session = HeterarchyTuiSession(workspace_dir=str(tmp_path), use_ansi=False)
+
+    # 1) Default 2 -> 2 -> 1 topology when >= 2 files exist in workspace
+    out_221, _ = session.handle_command(raw_line="/dag-ulw Refactor alpha and beta")
+    assert "n1_topology_spec" in out_221
+    assert "n1_boundary_map" in out_221
+    assert "├─── · Same frontier ──────┼────── · Same frontier ───┤" in out_221
+    assert "▾ layer 1 · 2 nodes · 2 done (Same frontier)" in out_221
+    assert "▾ layer 2 · 2 nodes · 2 done (Same frontier)" in out_221
+    assert "▾ layer 3 · 1 node · 1 done" in out_221
+    assert "\u203a ast_scan(" in out_221
+    assert "\u203a code_craft(" in out_221
+    assert "Done 5/5" in out_221
+
+    # 2) 1 -> 3 -> 1 topology when an audit / security / SQL goal is given
+    out_131, _ = session.handle_command(raw_line="/dag-ulw Audit SQL security and verify contracts")
+    assert "n3_contract_gate" in out_131
+    assert "▾ layer 1 · 1 node · 1 done" in out_131
+    assert "▾ layer 2 · 3 nodes · 3 done (Same frontier)" in out_131
+    assert "▾ layer 3 · 1 node · 1 done" in out_131
+    assert "Done 5/5" in out_131
+

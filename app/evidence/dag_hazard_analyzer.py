@@ -248,57 +248,43 @@ class DagTopologyCompiler:
         if not waves:
             return "╭──────────────────────────╮\n│  (empty or cyclic graph) │\n╰──────────────────────────╯"
         by_id = {n.node_id: n for n in nodes}
-        target_w = 105
+        target_w = 115
         lines: list[str] = []
         for w_idx, wave in enumerate(waves):
             cnt = len(wave.node_ids)
             has_next = w_idx + 1 < len(waves)
-            box_w = 75 if cnt == 1 else (51 if cnt == 2 else max(28, (target_w - 3 * (cnt - 1)) // cnt))
+            box_w = 85 if cnt == 1 else (56 if cnt == 2 else max(32, (target_w - 3 * (cnt - 1)) // cnt))
             boxes: list[tuple[str, str, str, str]] = []
             for lane_i, nid in enumerate(wave.node_ids):
                 nd = by_id[nid]
                 raw_m = (nd.preferred_model or "").strip()
-                if nd.role in (
-                    DagNodeRoleKind.TOPOLOGY_PLANNER,
-                    DagNodeRoleKind.VERIFICATION_FAN_IN,
-                ):
-                    ic, m_short, eff_s = (
-                        "✦",
-                        ("flash" if "flash" in raw_m else ("argon" if (not raw_m or "argon" in raw_m) else raw_m[:15])),
-                        (nd.reasoning_effort or "high"),
-                    )
-                elif nd.role in (
-                    DagNodeRoleKind.INTERFACE_CONTRACTOR,
-                    DagNodeRoleKind.DISJOINT_BUILDER,
-                ):
-                    ic, m_short, eff_s = (
-                        "◆",
-                        ("opus" if "opus" in raw_m else ("sonnet" if (not raw_m or "sonnet" in raw_m) else raw_m[:15])),
-                        (nd.reasoning_effort or "medium"),
-                    )
+                if nd.role in (DagNodeRoleKind.TOPOLOGY_PLANNER, DagNodeRoleKind.VERIFICATION_FAN_IN):
+                    ic, m_short, eff_s = "✦", ("flash" if "flash" in raw_m else ("argon" if (not raw_m or "argon" in raw_m) else raw_m[:15])), (nd.reasoning_effort or "high")
+                elif nd.role in (DagNodeRoleKind.INTERFACE_CONTRACTOR, DagNodeRoleKind.DISJOINT_BUILDER):
+                    ic, m_short, eff_s = "◆", ("opus" if "opus" in raw_m else ("sonnet" if (not raw_m or "sonnet" in raw_m) else raw_m[:15])), (nd.reasoning_effort or "medium")
                 else:
                     c_lbl = raw_m or "gpt-6-astra"
                     ic, m_short, eff_s = "★", c_lbl[:15], (nd.reasoning_effort or "xhigh")
                 ring_s = format_effort_ring(effort=eff_s)
                 left_h = f" Wave {wave.wave_index}" + (f"·L{lane_i + 1} " if cnt > 1 else f" ({wave.isolation_mode}, w={wave.writer_count}) ")
                 right_h = f" {ic} {m_short}@{ring_s} "
-                mid_i = box_w // 2
-                left_dashes = max(1, mid_i - 1 - len(left_h))
-                conn_ch = "▼" if w_idx > 0 else "─"
+                left_dashes = max(1, (box_w // 2) - 1 - len(left_h))
                 rem_after_mid = max(1, box_w - 2 - len(left_h) - left_dashes - 1)
                 r_fit = DisplayWidthFormatter.fit_columns(text=right_h, width=rem_after_mid, pad=False)
                 right_dashes = max(0, rem_after_mid - DisplayWidthFormatter.text_width(text=r_fit))
-                top_b = f"╭{left_h}{'─' * left_dashes}{conn_ch}{'─' * right_dashes}{r_fit}╮"
+                top_b = f"╭{left_h}{'─' * left_dashes}{'▼' if w_idx > 0 else '─'}{'─' * right_dashes}{r_fit}╮"
                 p_fit = DisplayWidthFormatter.fit_columns(text=f"▸ [{nid}] Prompt: {nd.task}", width=box_w - 4)
                 work_txt = (node_work_map or {}).get(nid) or f"○ Ready ➔ {nd.deliverable}"
                 w_fit = DisplayWidthFormatter.fit_columns(text=f"▸ Work  : {work_txt}", width=box_w - 4)
-                mid_1, mid_2 = f"│ {p_fit} │", f"│ {w_fit} │"
-                if has_next:
-                    half = (box_w - 2) // 2
-                    bot_b = f"╰{'─' * half}┬{'─' * (box_w - 3 - half)}╯"
+                half = (box_w - 2) // 2
+                if cnt > 1 and box_w >= 34:
+                    f_lbl = " · Same frontier "
+                    l_rem = max(1, half - len(f_lbl))
+                    r_rem = max(1, box_w - 3 - l_rem - len(f_lbl))
+                    bot_b = f"╰{'─' * l_rem}{f_lbl}{'┬' if has_next else '─'}{'─' * r_rem}╯"
                 else:
-                    bot_b = f"╰{'─' * (box_w - 2)}╯"
-                boxes.append((top_b, mid_1, mid_2, bot_b))
+                    bot_b = f"╰{'─' * half}┬{'─' * (box_w - 3 - half)}╯" if has_next else f"╰{'─' * (box_w - 2)}╯"
+                boxes.append((top_b, f"│ {p_fit} │", f"│ {w_fit} │", bot_b))
             pad = " " * 15 if cnt == 1 else (" " * max(0, (target_w - (cnt * box_w + (cnt - 1) * 3)) // 2))
             for r_i in range(4):
                 lines.append(pad + "   ".join(b[r_i] for b in boxes))
@@ -308,6 +294,8 @@ class DagTopologyCompiler:
                     lines.append(f"{' ' * 25}┌{'─' * 26}┴{'─' * 26}┐")
                 elif cnt >= 2 and nxt_cnt == 1:
                     lines.append(f"{' ' * 25}└{'─' * 26}┬{'─' * 26}┘")
+                elif cnt >= 2 and nxt_cnt >= 2:
+                    lines.append(f"{' ' * 25}├─── · Same frontier ──────┼────── · Same frontier ───┤")
                 else:
                     lines.append(f"{' ' * 52}│")
         return "\n".join(lines)

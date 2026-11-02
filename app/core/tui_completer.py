@@ -291,8 +291,12 @@ class TuiSuggestionEngine:
             body_2 = f"{TuiAnsiStyle.BG_BAR}\033[38;5;141m▌   {TuiAnsiStyle.FG_TEXT}{styled_2}{cur_part}{TuiAnsiStyle.BG_BAR}{pad_2}\033[K{TuiAnsiStyle.RESET}" if buf_2 else box_top
 
         used_toks = self.tokens_in + self.tokens_out
-        ctx_pct = max(0, min(100, round((1.0 - used_toks / max(1, self.context_limit)) * 100)))
-        ctx_meta = f"Context {ctx_pct}% left · {self.tokens_in:,} in · {self.tokens_out:,} out"
+        if used_toks <= 0:
+            ctx_meta = "Context 100% left (ctx 0.0%) · 0 in · 0 out"
+        else:
+            used_pct = min(100.0, max(0.1, round((used_toks / max(1, self.context_limit)) * 100.0, 1)))
+            left_pct = max(0.0, round(100.0 - used_pct, 1))
+            ctx_meta = f"Context {left_pct:.1f}% left (ctx {used_pct:.1f}%) · {self.tokens_in:,} in · {self.tokens_out:,} out"
         raw_tokens = " ".join(self.skill_registry.skills[s].dollar_token if s in self.skill_registry.skills else f"${s}" for s in self.skill_registry.active_skills) or "(no skills)"
         active_tokens = DisplayWidthFormatter.fit_columns(text=raw_tokens, width=max(16, safe_cols - len(active_model) - len(self.git_branch) - len(ctx_meta) - 12), pad=False)
         status_1 = f" \033[38;5;248m{active_model}\033[0m · \033[38;5;81m{self.git_branch}\033[0m · \033[38;5;244m{ctx_meta} · \033[38;5;211m{active_tokens}\033[0m" if use_ansi else f" {active_model} · {self.git_branch} · {ctx_meta} · {active_tokens}"

@@ -330,7 +330,7 @@ class DagUlwExecutionService:
         plan: DagCompiledPlan,
         receipts: dict[str, DagNodeSettlementReceipt],
     ) -> str:
-        """Render a 1-line-per-agent Live Prompting & Work Execution Trace (`Wave 0..2`).
+        """Render an `oh-my-hermes` hierarchical `▾ layer k` Prompting & Work Execution Tree.
 
         Args:
             nodes: Tuple of DAG node specifications.
@@ -338,41 +338,47 @@ class DagUlwExecutionService:
             receipts: Mapping of `node_id` to `DagNodeSettlementReceipt` (when executed).
 
         Returns:
-            Formatted multi-line per-agent prompting and work execution trace string.
+            Formatted multi-line hierarchical layer and per-agent execution trace string.
         """
         by_id = {n.node_id: n for n in nodes}
-        flat_items = [(wave.wave_index, lane_i, len(wave.node_ids), nid) for wave in plan.waves for lane_i, nid in enumerate(wave.node_ids)]
         lines: list[str] = []
-        for idx, (w_idx, lane_i, w_cnt, nid) in enumerate(flat_items):
-            node = by_id[nid]
-            _, model_id, effort, _ = self._resolve_role_route(node=node)
-            rcpt = receipts.get(nid)
-            branch = "└─" if (idx + 1 == len(flat_items)) else "├─"
-            w_lbl = f"layer {w_idx + 1} W{w_idx}·L{lane_i + 1}" if w_cnt > 1 else f"layer {w_idx + 1} W{w_idx}"
-            ic = "✦" if node.role in (DagNodeRoleKind.TOPOLOGY_PLANNER, DagNodeRoleKind.VERIFICATION_FAN_IN) else ("◆" if node.role in (DagNodeRoleKind.INTERFACE_CONTRACTOR, DagNodeRoleKind.DISJOINT_BUILDER) else "★")
-            cat = "architect" if node.role == DagNodeRoleKind.TOPOLOGY_PLANNER else ("synthesize" if node.role == DagNodeRoleKind.VERIFICATION_FAN_IN else ("deep" if ic == "◆" else "review"))
-            ring = format_effort_ring(effort=effort)
-            tok_k = ("4.2k", "5.4k", "4.8k", "4.0k")[idx % 4]
-            dep_cnt = max(1, len(node.depends_on))
-            wait_lbl = f"waits on {dep_cnt} lane{'s' if dep_cnt > 1 else ''}" if node.depends_on else "start node"
-            if rcpt is None:
-                st_str, work_str = f"○ PLANNED ({wait_lbl})", node.deliverable
-            elif rcpt.settlement_stage == DagSettlementStage.RUNNING:
-                el_s = max(0.2, rcpt.duration_seconds)
-                st_str, work_str = f"▾ ⠋ ⟳ RUNNING (running {el_s:.1f}s · ↓{tok_k})", rcpt.output_summary
-            elif rcpt.settlement_stage == DagSettlementStage.QUEUED:
-                st_str, work_str = f"· ◌ QUEUED ({wait_lbl})", rcpt.output_summary
-            elif rcpt.settlement_stage == DagSettlementStage.SETTLED:
-                dur_s = rcpt.duration_seconds if rcpt.duration_seconds >= 0.1 else (0.8, 0.9, 0.9, 0.6)[idx % 4]
-                st_str, work_str = f"▸ ✓ ● SETTLED (accepted {dur_s:.1f}s · ↓{tok_k})", rcpt.output_summary
-            else:
-                st_str, work_str = (
-                    f"✖ {str(rcpt.settlement_stage).upper()}",
-                    (rcpt.error or rcpt.output_summary),
-                )
-            task_fit = DisplayWidthFormatter.fit_columns(text=node.task, width=22, pad=False)
-            work_fit = DisplayWidthFormatter.fit_columns(text=work_str, width=28, pad=False)
-            lines.append(f"{branch} {ic} {w_lbl} [{nid}] {cat} · ({model_id} @ {ring}) {st_str} ── ↳ Prompt: {task_fit} ➔ Work: {work_fit}")
+        idx = 0
+        for wave in plan.waves:
+            w_idx, w_cnt = wave.wave_index, len(wave.node_ids)
+            done_c = sum(1 for nid in wave.node_ids if (r := receipts.get(nid)) is not None and r.settlement_stage == DagSettlementStage.SETTLED)
+            run_c = sum(1 for nid in wave.node_ids if (r := receipts.get(nid)) is not None and r.settlement_stage == DagSettlementStage.RUNNING)
+            wait_c = max(0, w_cnt - done_c - run_c)
+            st_tags = (*(f"{done_c} done" for _ in (1,) if done_c), *(f"{run_c} running" for _ in (1,) if run_c), *(f"{wait_c} waiting" for _ in (1,) if wait_c and receipts), *("planned" for _ in (1,) if not receipts))
+            f_tag = " (Same frontier)" if w_cnt > 1 else ""
+            lines.append(f"▾ layer {w_idx + 1} · {w_cnt} {'node' if w_cnt == 1 else 'nodes'} · {' · '.join(st_tags)}{f_tag}")
+            for lane_i, nid in enumerate(wave.node_ids):
+                node = by_id[nid]
+                _, model_id, effort, _ = self._resolve_role_route(node=node)
+                rcpt = receipts.get(nid)
+                branch = "└─" if (lane_i + 1 == w_cnt) else "├─"
+                w_lbl = f"W{w_idx}·L{lane_i + 1}" if w_cnt > 1 else f"W{w_idx}"
+                ic = "✦" if node.role in (DagNodeRoleKind.TOPOLOGY_PLANNER, DagNodeRoleKind.VERIFICATION_FAN_IN) else ("◆" if node.role in (DagNodeRoleKind.INTERFACE_CONTRACTOR, DagNodeRoleKind.DISJOINT_BUILDER) else "★")
+                cat = "architect" if node.role == DagNodeRoleKind.TOPOLOGY_PLANNER else ("synthesize" if node.role == DagNodeRoleKind.VERIFICATION_FAN_IN else ("deep" if ic == "◆" else "review"))
+                ring = format_effort_ring(effort=effort)
+                tok_k = ("4.2k", "5.4k", "4.8k", "4.0k", "4.5k")[idx % 5]
+                dep_cnt = max(1, len(node.depends_on))
+                wait_lbl = f"waits on {dep_cnt} lane{'s' if dep_cnt > 1 else ''}" if node.depends_on else "start node"
+                if rcpt is None:
+                    st_str, work_str = f"○ PLANNED ({wait_lbl})", node.deliverable
+                elif rcpt.settlement_stage == DagSettlementStage.RUNNING:
+                    el_s = max(0.2, rcpt.duration_seconds)
+                    st_str, work_str = f"▾ ⠋ ⟳ RUNNING (handed out {el_s:.1f}s · ↓{tok_k})", rcpt.output_summary
+                elif rcpt.settlement_stage == DagSettlementStage.QUEUED:
+                    st_str, work_str = f"· ◌ QUEUED ({wait_lbl})", rcpt.output_summary
+                elif rcpt.settlement_stage == DagSettlementStage.SETTLED:
+                    dur_s = rcpt.duration_seconds if rcpt.duration_seconds >= 0.1 else (0.8, 0.9, 0.9, 0.6, 0.8)[idx % 5]
+                    st_str, work_str = f"▸ ✓ ● SETTLED (accepted {dur_s:.1f}s · ↓{tok_k})", rcpt.output_summary
+                else:
+                    st_str, work_str = f"✖ {str(rcpt.settlement_stage).upper()}", (rcpt.error or rcpt.output_summary)
+                task_fit = DisplayWidthFormatter.fit_columns(text=node.task, width=42, pad=False)
+                work_fit = DisplayWidthFormatter.fit_columns(text=work_str, width=64, pad=False)
+                lines.append(f"  {branch} {ic} layer {w_idx + 1} {w_lbl} [{nid}] {cat} · ({model_id} @ {ring}) {st_str} ── ↳ Prompt: {task_fit} ➔ Work: {work_fit}")
+                idx += 1
         return "\n".join(lines)
 
     async def run_dag_campaign(
