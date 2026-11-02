@@ -98,7 +98,7 @@ heterarchy_triad_orchestrate(
     workspace_dir="/path/to/workspace",
     mode="pipeline",  # "pipeline"(순차 구현·감사·심의) 또는 "council"(병렬 심의 + 2라운드 상호 반론)
     claude_model="claude-sonnet-5-5-medium",  # 또는 "claude-opus-5-5-medium"
-    codex_model="gpt-5.4",
+    codex_model="gpt-6-astra",  # 6 시리즈(gpt-6-terra, gpt-6-luna, gpt-6-sol, gpt-6-astra) 또는 6-1 시리즈(gpt-6.1-terra, gpt-6.1-sol)
     max_rounds=2,  # pipeline: WARN/BLOCK 시 자동 수리·재감사 / council: 의견 충돌 시 2라운드 교차 반론
     run_verification_gates=True,  # 브리지가 직접 pytest 검증 게이트 실행 (프로세스 그룹 격리)
     files_inspected=["src/rate_limiter.py"],  # SHA-256 해시 고정 + 무설정 CodeGraph 심볼 자동 추출
@@ -143,7 +143,7 @@ claude_code_craft(
 ## 4. 라우팅·영수증·증거 범위·회로 차단기 판독 계약
 
 1. **검증된 라우팅 계약 (`validate_and_resolve_route`)**:
-   - `codex_cli` 엔진에는 `CODEX_SUPPORTED_MODELS`(`gpt-6.1-sol`, `gpt-5.4`, `gpt-5-codex` 등)만 허용된다.
+   - `codex_cli` 엔진에는 `CODEX_SUPPORTED_MODELS`(`6` 시리즈: `gpt-6-terra`, `gpt-6-luna`, `gpt-6-sol`, `gpt-6-astra` / `6-1` 시리즈: `gpt-6.1-terra`, `gpt-6.1-sol`)만 허용된다(`5.4`, `5.3` 등 `5.x` 계열은 Deprecated되어 제외됨).
    - `antigravity_local_rpc` 엔진에서 Claude 모델은 `medium` 티어(`claude-sonnet-5-5-medium`, `claude-opus-5-5-medium`)만 허용하며, `high`/`low` 요청 시 `error_code="CLAUDE_TIER_POLICY_VIOLATION"`으로 거부한다.
 2. **적응형 회로 차단기(Half-Open Circuit Breaker) & 쿼터 사전 가드**:
    - Antigravity RPC 호출 전 모델의 잔여 쿼터(`remainingFraction <= 0.0`)가 고갈된 경우 즉시 `error_code="ANTIGRAVITY_QUOTA_EXHAUSTED"`로 사전 차단한다.

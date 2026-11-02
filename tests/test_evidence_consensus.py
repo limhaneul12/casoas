@@ -9,10 +9,10 @@ from pathlib import Path
 
 import pytest
 
-import codex_collab_mcp.server as server
-from codex_collab_mcp.handoff_store import HandoffStore
-from codex_collab_mcp.job_store import CodexJobRecord, JobStore
-from codex_collab_mcp.schemas import JsonObject
+import app.server as server
+from app.repositories.handoff_store import HandoffStore
+from app.repositories.job_store import CodexJobRecord, JobStore
+from app.schemas.boundary_schemas import JsonObject
 
 
 @pytest.fixture(autouse=True)
@@ -341,8 +341,7 @@ async def test_inflight_aggregate_is_unverified(
     job = server.job_store.get_job(str(result["collaboration_id"]))
     assert job is not None
     running_job = dataclasses.replace(job, status="running")
-    server.job_store._cache_put(running_job)
-    server.job_store._persist(running_job)
+    server.job_store._save_job(running_job)
     # The valid snapshot and matching fences remain; only job status differs.
     pack = await pack_from_run(result, tmp_path)
     assert pack["consensus_reached"] is False
@@ -357,7 +356,6 @@ async def test_not_started_role_remains_readable_in_saved_aggregate(
     result = await run_council(
         monkeypatch,
         tmp_path,
-        {role: successful_review() for role in ("argon", "sonnet", "codex")},
         invoke_argon_rpc=False,
     )
     assert result["consensus_status"] == "incomplete_no_consensus"
@@ -371,9 +369,7 @@ async def test_consensus_evidence_changes_decision_key(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    first = await run_council(
-        monkeypatch, tmp_path, {role: successful_review() for role in ("argon", "sonnet", "codex")}
-    )
+    first = await run_council(monkeypatch, tmp_path)
     second = await run_council(
         monkeypatch,
         tmp_path,

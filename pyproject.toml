@@ -11,15 +11,15 @@ dependencies = [
 ]
 
 [project.scripts]
-codex-collab-mcp = "codex_collab_mcp.server:main"
-hcodex = "codex_collab_mcp.ctl:main"
+codex-collab-mcp = "app.server:main"
+hcodex = "app.core.ctl:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/codex_collab_mcp"]
+packages = ["app"]
 
 [dependency-groups]
 dev = [
@@ -38,7 +38,7 @@ target-version = "py314"
 preview = false
 unsafe-fixes = false
 line-length = 100
-src = ["src", "tests"]
+src = ["app", "tests"]
 extend-exclude = [".agents", "node_modules", "frontend", "dist"]
 
 [tool.ruff.lint]
@@ -50,7 +50,7 @@ select = ["E4", "E7", "E9", "F", "I", "B", "UP", "ASYNC", "FAST", "S", "ANN", "R
 extend-immutable-calls = ["fastapi.Depends", "fastapi.Body", "fastapi.Query", "fastapi.Path", "fastapi.Header", "fastapi.Cookie", "fastapi.Security"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["codex_collab_mcp"]
+known-first-party = ["app"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S101"]
@@ -68,9 +68,9 @@ line-ending = "lf"
 [tool.pyrefly]
 preset = "strict"
 python-version = "3.14.7"
-project-includes = ["src/**/*.py", "tests/**/*.py"]
+project-includes = ["app/**/*.py", "tests/**/*.py"]
 project-excludes = [".agents/**", ".venv/**", "node_modules/**"]
-search-path = ["src", ".agents/python_dev_harness"]
+search-path = [".", ".agents/python_dev_harness"]
 min-severity = "warn"
 
 [tool.pyrefly.errors]
@@ -81,4 +81,4 @@ implicit-import = true
 deprecated = true
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["."]

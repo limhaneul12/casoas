@@ -2,55 +2,57 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import json
+import os
+import signal
 import sqlite3
 import sys
 import urllib.error
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
 import pytest
 
-import codex_collab_mcp.server as server_mod
-from codex_collab_mcp.agy_bridge import (
+import app.server as server_mod
+from app.clients.agy_bridge import (
     AgyEndpoint,
     AntigravityCircuitBreaker,
     extract_json_from_model_text,
     run_agy_model_prompt,
 )
-from codex_collab_mcp.ctl import HeterarchyCliController, _PluginEnvironmentManager
-from codex_collab_mcp.evidence.codegraph_slicer import (
-    CodegraphContextSlicer,
-    slice_codegraph_symbols,
-)
-from codex_collab_mcp.evidence.triad_adjudicator import adjudicate_collaboration_and_consensus
-from codex_collab_mcp.handoff_store import HandoffStore
-from codex_collab_mcp.job_store import JobStore
-from codex_collab_mcp.orchestration.verification_gate_runner import BridgeVerificationGateRunner
-from codex_collab_mcp.prompts import (
-    build_adversarial_audit_prompt,
-    build_claude_craft_prompt,
-    build_differential_candidates_prompt,
-    build_rescue_prompt,
-    build_targeted_synthesis_prompt,
-)
-from codex_collab_mcp.routing.auth_redaction import (
-    classify_stderr_and_auth_boundaries,
-    get_python_runtime_info,
-    redact_sensitive_text,
-)
-from codex_collab_mcp.routing.policy_engine import validate_and_resolve_route
-from codex_collab_mcp.runner import (
+from app.clients.codex_aux_runners import CodexAuxiliaryRunner
+from app.clients.codex_cli_executor import CodexCliProcessRunner
+from app.clients.codex_runner import (
     build_codex_exec_command,
     build_codex_review_command,
     parse_jsonl_events_with_model,
     run_codex_exec,
     run_http_fallback,
 )
-from codex_collab_mcp.schemas import (
+from app.core.ctl import HeterarchyCliController, _PluginEnvironmentManager
+from app.core.prompts import (
+    build_adversarial_audit_prompt,
+    build_claude_craft_prompt,
+    build_differential_candidates_prompt,
+    build_rescue_prompt,
+    build_targeted_synthesis_prompt,
+)
+from app.evidence.codegraph_slicer import CodegraphContextSlicer
+from app.evidence.triad_adjudicator import TriadConsensusAdjudicator
+from app.repositories.handoff_store import HandoffStore
+from app.repositories.job_store import JobStore
+from app.routing.auth_redaction import (
+    classify_stderr_and_auth_boundaries,
+    get_python_runtime_info,
+    redact_sensitive_text,
+)
+from app.routing.policy_engine import RoutingPolicyEngine
+from app.schemas.boundary_schemas import (
     ADVERSARIAL_AUDIT_SCHEMA,
     DIFFERENTIAL_CANDIDATES_SCHEMA,
     RESCUE_DIAGNOSIS_SCHEMA,
@@ -59,17 +61,22 @@ from codex_collab_mcp.schemas import (
     JsonValue,
     validate_structured_output,
 )
-from codex_collab_mcp.server import (
+from app.server import (
     claude_code_craft,
     codex_adversarial_audit,
     codex_alexandria_decision_pack,
     codex_bridge_health,
     codex_job_status,
     heterarchy_handoff_create,
+    heterarchy_handoff_resolve,
     heterarchy_triad_orchestrate,
     mcp,
 )
-from codex_collab_mcp.transports.codex_aux_runners import CodexAuxiliaryRunner
+from app.services.verification_gate_runner import BridgeVerificationGateRunner
+
+slice_codegraph_symbols = CodegraphContextSlicer().format_context_block
+adjudicate_collaboration_and_consensus = TriadConsensusAdjudicator().adjudicate
+validate_and_resolve_route = RoutingPolicyEngine().validate_route
 
 
 @pytest.fixture(autouse=True)
@@ -106,6 +113,7 @@ def _codex_audit_response(
     critique: str = "Clean implementation.",
     tests: list[str] | None = None,
     request_id: str = "cdx-codexok",
+    model: str = "gpt-6.1-sol",
 ) -> JsonObject:
     """Build a standard successful Codex adversarial audit response fixture."""
     test_cases: list[JsonValue] = [*(tests or ["def test_edge(): assert True"])]
@@ -114,7 +122,7 @@ def _codex_audit_response(
         "status": "succeeded",
         "outcome_state": "confirmed_success",
         "request_id": request_id,
-        "model": "gpt-6.1-sol",
+        "model": model,
         "structured_output": {
             "verdict": verdict,
             "executive_critique": critique,
@@ -792,18 +800,13 @@ async def test_contract_6_evidence_scope_digests_and_not_run_dimensions(
         output_schema: JsonObject | None,
         **kwargs: object,
     ) -> JsonObject:
-        return {
-            "ok": True,
-            "status": "succeeded",
-            "outcome_state": "confirmed_success",
-            "request_id": "cdx-evid01",
-            "model": "gpt-6.1-sol",
-            "structured_output": {
-                "verdict": "PASS",
-                "executive_critique": "Reviewed the supplied subtraction function and edge cases.",
-                "failing_test_cases": ["def test_compute_delta(): assert compute_delta(5, 3) == 2"],
-            },
-        }
+        return _codex_audit_response(
+            verdict="PASS",
+            critique="Reviewed the supplied subtraction function and edge cases.",
+            tests=["def test_compute_delta(): assert compute_delta(5, 3) == 2"],
+            request_id="cdx-evid01",
+            model="gpt-6.1-sol",
+        )
 
     monkeypatch.setattr(server_mod, "_execute_with_engine", mock_codex_engine)
 
@@ -867,7 +870,6 @@ async def test_alexandria_decision_pack_and_health(
 
     monkeypatch.setattr(server_mod, "discover_agy_endpoint", _no_agy_endpoint)
     monkeypatch.setattr(server_mod, "resolve_codex_binary", _no_codex_binary)
-    monkeypatch.setattr(server_mod, "handoff_store", HandoffStore(state_dir=tmp_path / "handoffs"))
     pack_json = await codex_alexandria_decision_pack(
         project_scope="heterarchy-core",
         topic_title="Lock-free ring buffer audit",
@@ -1530,11 +1532,9 @@ async def test_http_fallback_job_store_registration_and_gateway_codegraph_slicin
 
     async def fake_agy(prompt: str, **kwargs: object) -> JsonObject:
         captured_prompts.append(prompt)
-        return {
-            "ok": True,
-            "status": "succeeded",
-            "outcome_state": "confirmed_success",
-            "structured_output": {
+        return _agy_ok_response(
+            "claude-sonnet-5-5-medium",
+            {
                 "verdict": "PASS",
                 "summary": "Sliced symbol verified.",
                 "crafted_code": "x = 1",
@@ -1542,7 +1542,7 @@ async def test_http_fallback_job_store_registration_and_gateway_codegraph_slicin
                 "edge_cases_guarded": ["None"],
                 "handoff_notes_for_codex_audit": "ok",
             },
-        }
+        )
 
     monkeypatch.setattr(server_mod, "run_agy_model_prompt", fake_agy)
     _seed_test_codegraph_db(tmp_path)
@@ -1566,10 +1566,6 @@ async def test_triad_role_snapshot_model_ids_and_job_telemetry(
     tmp_path: Path,
 ) -> None:
     """Verify triad role snapshots persist `model_id` and `triad_orchestration` job telemetry."""
-    isolated_jobs = JobStore(state_dir=tmp_path / "jobs")
-    isolated_handoffs = HandoffStore(state_dir=tmp_path / "handoffs")
-    monkeypatch.setattr(server_mod, "job_store", isolated_jobs)
-    monkeypatch.setattr(server_mod, "handoff_store", isolated_handoffs)
 
     async def mock_agy_prompt(
         prompt: str,
@@ -1579,30 +1575,21 @@ async def test_triad_role_snapshot_model_ids_and_job_telemetry(
         **kwargs: object,
     ) -> JsonObject:
         if "argon" in model.lower():
-            return {
-                "ok": True,
-                "status": "succeeded",
-                "outcome_state": "confirmed_success",
-                "request_id": "cdx-argon-tel01",
-                "model_id": "gemini-4-argon",
-                "structured_output": {
-                    "verdict": "PASS",
-                    "summary": "Argon macro review verified.",
-                },
-            }
-        return {
-            "ok": True,
-            "status": "succeeded",
-            "outcome_state": "confirmed_success",
-            "request_id": "cdx-opus-tel01",
-            "model_id": "claude-opus-5-5-medium",
-            "structured_output": {
+            return _agy_ok_response(
+                "gemini-4-argon",
+                {"verdict": "PASS", "summary": "Argon macro review verified."},
+                request_id="cdx-argon-tel01",
+            )
+        return _agy_ok_response(
+            "claude-opus-5-5-medium",
+            {
                 "verdict": "PASS",
                 "summary": "Opus 5.5 review verified.",
                 "crafted_code": "def f() -> int: return 1",
                 "handoff_notes_for_codex_audit": "Verify return value",
             },
-        }
+            request_id="cdx-opus-tel01",
+        )
 
     async def mock_codex_engine(
         prompt: str,
@@ -1610,18 +1597,13 @@ async def test_triad_role_snapshot_model_ids_and_job_telemetry(
         output_schema: JsonObject | None,
         **kwargs: object,
     ) -> JsonObject:
-        return {
-            "ok": True,
-            "status": "succeeded",
-            "outcome_state": "confirmed_success",
-            "request_id": "cdx-codex-tel01",
-            "model": "gpt-6.1-sol",
-            "structured_output": {
-                "verdict": "PASS",
-                "executive_critique": "Codex red-team verified.",
-                "failing_test_cases": ["def test_f(): assert f() == 1"],
-            },
-        }
+        return _codex_audit_response(
+            verdict="PASS",
+            critique="Codex red-team verified.",
+            tests=["def test_f(): assert f() == 1"],
+            request_id="cdx-codex-tel01",
+            model="gpt-6.1-sol",
+        )
 
     monkeypatch.setattr(server_mod, "run_agy_model_prompt", mock_agy_prompt)
     monkeypatch.setattr(server_mod, "_execute_with_engine", mock_codex_engine)
@@ -1637,7 +1619,7 @@ async def test_triad_role_snapshot_model_ids_and_job_telemetry(
     res = json.loads(res_raw)
     assert res["ok"] is True
     collab_id = str(res["collaboration_id"])
-    persisted_job = isolated_jobs.get_persisted_job(collab_id)
+    persisted_job = server_mod.job_store.get_persisted_job(collab_id)
     assert persisted_job is not None
     assert persisted_job.provider == "heterarchy_triad"
     assert persisted_job.engine == "council"
@@ -1688,10 +1670,8 @@ async def test_triad_role_snapshot_model_ids_and_job_telemetry(
 
 def test_mechanical_and_sqlite_retention_contracts(tmp_path: Path) -> None:
     """Verify mechanical architecture contracts and SQLite WAL retention pruning + checkpoint."""
-    import ast
-
     repo_root = Path(__file__).resolve().parents[1]
-    src_root = repo_root / "src" / "codex_collab_mcp"
+    src_root = repo_root / "app"
     for pkg_dir in [src_root, *[p for p in src_root.rglob("*") if p.is_dir()]]:
         if pkg_dir.name == "__pycache__":
             continue
@@ -2001,3 +1981,503 @@ async def test_orchestration_enhancements_auto_codegraph_council_round2_circuit_
     assert r2_sonnet["status"] == "timed_out_unknown"
     assert r2_argon is not None and r2_argon["status"] == "succeeded"
     assert r2_codex["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_s1_s2_live_task_cancellation_cas_guard_retry_and_stale_pid_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify [S1] live task cancellation + CAS guards and [S2] cancelled retry + dead-PID cleanup."""
+    isolated_jobs = JobStore(state_dir=tmp_path / "s1_s2_jobs")
+    monkeypatch.setattr(server_mod, "job_store", isolated_jobs)
+
+    task_started = asyncio.Event()
+    task_cancelled = asyncio.Event()
+
+    async def slow_engine(
+        prompt: str,
+        schema_name: str,
+        output_schema: JsonObject | None,
+        **kwargs: object,
+    ) -> JsonObject:
+        task_started.set()
+        try:
+            await asyncio.sleep(60.0)
+        except asyncio.CancelledError:
+            task_cancelled.set()
+            raise
+        return {"ok": True, "status": "succeeded"}
+
+    monkeypatch.setattr(server_mod, "_execute_with_engine", slow_engine)
+
+    bg_raw = await codex_adversarial_audit(
+        target_code_or_diff="def f(): pass",
+        workspace_dir=str(tmp_path),
+        async_background=True,
+        request_id="cdx-cancel0001",
+        idempotency_key="idem-cancel-001",
+    )
+    bg_handle = json.loads(bg_raw)
+    assert bg_handle["async_dispatched"] is True
+    job_id = str(bg_handle["job_id"])
+    assert job_id == "cdx-cancel0001"
+
+    await asyncio.wait_for(task_started.wait(), timeout=5.0)
+
+    cancel_raw = await codex_job_status(job_id=job_id, cancel=True)
+    cancel_payload = json.loads(cancel_raw)
+    assert cancel_payload["ok"] is True
+    assert cancel_payload["cancel_requested"] is True
+    assert cancel_payload["job"]["status"] == "cancelled"
+
+    await asyncio.wait_for(task_cancelled.wait(), timeout=5.0)
+    await asyncio.sleep(0.05)
+
+    # [S1] CAS guard: late complete_job / fail_job / mark_timed_out_unknown must not overwrite cancelled
+    after_complete = isolated_jobs.complete_job(job_id, {"late": True})
+    assert after_complete is not None and after_complete.status == "cancelled"
+    assert after_complete.result is None
+    after_fail = isolated_jobs.fail_job(job_id, "late error")
+    assert after_fail is not None and after_fail.status == "cancelled"
+    after_timeout = isolated_jobs.mark_timed_out_unknown(job_id, "late timeout")
+    assert after_timeout is not None and after_timeout.status == "cancelled"
+
+    # [S2] Cancelled job deduplication vs explicit retry_same_request=True
+    dedup_rec, should_run = isolated_jobs.resolve_or_register_request(
+        task_type="adversarial_audit",
+        workspace_dir=str(tmp_path),
+        request_id=job_id,
+        idempotency_key="idem-cancel-001",
+        retry_same_request=False,
+    )
+    assert should_run is False
+    assert dedup_rec.status == "cancelled"
+
+    retry_rec, should_run_retry = isolated_jobs.resolve_or_register_request(
+        task_type="adversarial_audit",
+        workspace_dir=str(tmp_path),
+        request_id=job_id,
+        idempotency_key="idem-cancel-001",
+        retry_same_request=True,
+    )
+    assert should_run_retry is True
+    assert retry_rec.status == "running"
+    assert retry_rec.cancel_requested is False
+    assert retry_rec.cancelled_at is None
+    assert retry_rec.error is None
+    assert retry_rec.attempt_count == 2
+
+    # [S2] Dead-PID orphan running job reconciliation + owner_pid anti-spoofing
+    orphan = isolated_jobs.create_job(
+        task_type="adversarial_audit",
+        workspace_dir=str(tmp_path),
+        job_id="cdx-orphan0001",
+        metadata={"owner_pid": "0"},
+    )
+    assert orphan.metadata["owner_pid"] == str(os.getpid())
+    # Cross-store cancel must not be overwritten by complete_job on a second JobStore instance
+    peer_store = JobStore(state_dir=isolated_jobs.state_dir)
+    peer_store.cancel_job("cdx-orphan0001")
+    after_cross_complete = isolated_jobs.complete_job("cdx-orphan0001", {"late": True})
+    assert after_cross_complete is not None and after_cross_complete.status == "cancelled"
+    assert peer_store.get_persisted_job("cdx-orphan0001") is not None
+
+    # Overwrite owner_pid to a guaranteed-dead PID in SQLite on a running job
+    orphan2 = isolated_jobs.create_job(
+        task_type="adversarial_audit",
+        workspace_dir=str(tmp_path),
+        job_id="cdx-orphan0002",
+    )
+    isolated_jobs._save_job(replace(orphan2, metadata={"owner_pid": "999999999"}))
+    reconciled_count = isolated_jobs.reconcile_stale_running_jobs()
+    assert reconciled_count >= 1
+    reconciled = isolated_jobs.get_job("cdx-orphan0002")
+    assert reconciled is not None
+    assert reconciled.status == "timed_out_unknown"
+    assert reconciled.outcome_state == "outcome_unknown"
+
+
+@pytest.mark.asyncio
+async def test_s3_s4_process_group_killpg_json_decoder_and_triad_schema_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify [S3] os.killpg cleanup and [S4] raw_decode JSON extraction + triad schema validation."""
+    killed_pgids: list[tuple[int, int]] = []
+
+    def fake_killpg(pgid: int, sig: int) -> None:
+        killed_pgids.append((pgid, sig))
+
+    monkeypatch.setattr(os, "killpg", fake_killpg)
+
+    class _FakeProc:
+        pid = 424242
+        returncode: int | None = None
+
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+            await asyncio.sleep(10.0)
+            return b"", b""
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return -9
+
+    with pytest.raises(TimeoutError):
+        await CodexCliProcessRunner.communicate_with_cleanup(
+            _FakeProc(),  # type: ignore[arg-type]
+            input_bytes=b"hello",
+            timeout_seconds=0.01,
+        )
+    assert (424242, signal.SIGKILL) in killed_pgids
+
+    # [S4] raw_decode JSON extraction with braces in surrounding prose and empty {}
+    noisy_text = (
+        "Here is my analysis of `dict = {}` and `{placeholder}`:\n"
+        '{"verdict": "PASS", "summary": "Extracted via raw_decode", "crafted_code": "x = {1: 2}"}\n'
+        "Trailing note with {braces}."
+    )
+    extracted = extract_json_from_model_text(noisy_text)
+    assert extracted is not None
+    assert extracted["verdict"] == "PASS"
+    assert extracted["summary"] == "Extracted via raw_decode"
+
+    # [S4] Triad schema_valid on sonnet_craft and argon_review
+    async def mock_agy(prompt: str, model: str = "sonnet", **kwargs: object) -> JsonObject:
+        if "argon" in model.lower():
+            return _agy_ok_response(
+                model,
+                {
+                    "verdict": "PASS",
+                    "summary": "Argon validated",
+                    "architectural_risks": ["none"],
+                    "final_recommendation": "proceed",
+                },
+            )
+        return _agy_ok_response(
+            model,
+            {
+                "verdict": "PASS",
+                "summary": "Sonnet validated",
+                "crafted_code": "def ok() -> bool: return True",
+            },
+        )
+
+    async def mock_codex(
+        prompt: str,
+        schema_name: str,
+        output_schema: JsonObject | None,
+        **kwargs: object,
+    ) -> JsonObject:
+        return _codex_audit_response(verdict="PASS")
+
+    monkeypatch.setattr(server_mod, "run_agy_model_prompt", mock_agy)
+    monkeypatch.setattr(server_mod, "_execute_with_engine", mock_codex)
+
+    triad_raw = await heterarchy_triad_orchestrate(
+        task_spec="Validate schema_valid on triad roles",
+        workspace_dir=str(tmp_path),
+    )
+    triad_res = json.loads(triad_raw)
+    assert triad_res["ok"] is True
+    assert triad_res["sonnet_craft"]["schema_valid"] is True
+    assert triad_res["argon_review"]["schema_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_s5_s6_handoff_consensus_resolution_and_council_multi_round_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify [S5] resolved Argon handoff ticket consensus and [S6] multi-round Council loop."""
+    # [S5] Create and resolve an Argon handoff ticket with verdict="PASS"
+    created_raw = await heterarchy_handoff_create(
+        title="Argon review ticket",
+        spec_or_payload="Review module architecture",
+        sender="codex",
+        recipient="argon",
+        workspace_dir=str(tmp_path),
+    )
+    ticket_id = str(json.loads(created_raw)["ticket"]["ticket_id"])
+
+    resolved_raw = await heterarchy_handoff_resolve(
+        ticket_id=ticket_id,
+        status="completed",
+        resolution_note="Architecture invariants verified and approved.",
+        verdict="PASS",
+    )
+    resolved_ticket = json.loads(resolved_raw)["ticket"]
+    assert resolved_ticket["execution_completed"] is True
+
+    async def mock_sonnet(prompt: str, model: str = "sonnet", **kwargs: object) -> JsonObject:
+        return _agy_ok_response(
+            model,
+            {
+                "verdict": "PASS",
+                "summary": "Sonnet craft complete.",
+                "crafted_code": "def v() -> int: return 1",
+            },
+        )
+
+    async def mock_codex(
+        prompt: str,
+        schema_name: str,
+        output_schema: JsonObject | None,
+        **kwargs: object,
+    ) -> JsonObject:
+        return _codex_audit_response(verdict="PASS")
+
+    monkeypatch.setattr(server_mod, "run_agy_model_prompt", mock_sonnet)
+    monkeypatch.setattr(server_mod, "_execute_with_engine", mock_codex)
+
+    handoff_triad_raw = await heterarchy_triad_orchestrate(
+        task_spec="Verify resolved Argon handoff reaches consensus_verified",
+        workspace_dir=str(tmp_path),
+        invoke_argon_rpc=False,
+        argon_handoff_ticket_id=ticket_id,
+    )
+    handoff_triad = json.loads(handoff_triad_raw)
+    assert handoff_triad["ok"] is True
+    assert handoff_triad["collaboration_status"] == "complete"
+    assert handoff_triad["consensus_status"] == "consensus_verified"
+    assert handoff_triad["consensus_reached"] is True
+    assert handoff_triad["argon_review"]["schema_valid"] is True
+
+    # [S6] Council mode multi-round adjudication (max_rounds=3, converges on Round 3)
+    council_codex_calls = 0
+
+    async def council_3round_agy(
+        prompt: str, model: str = "sonnet", **kwargs: object
+    ) -> JsonObject:
+        return _agy_ok_response(
+            model,
+            {
+                "verdict": "PASS",
+                "summary": "Pole pass",
+                "crafted_code": "def r3() -> int: return 3",
+            },
+        )
+
+    async def council_3round_codex(
+        prompt: str,
+        schema_name: str,
+        output_schema: JsonObject | None,
+        **kwargs: object,
+    ) -> JsonObject:
+        nonlocal council_codex_calls
+        council_codex_calls += 1
+        verdict = "WARN" if council_codex_calls < 3 else "PASS"
+        return _codex_audit_response(
+            verdict=verdict,
+            critique=f"Round {council_codex_calls} critique ({verdict})",
+        )
+
+    monkeypatch.setattr(server_mod, "run_agy_model_prompt", council_3round_agy)
+    monkeypatch.setattr(server_mod, "_execute_with_engine", council_3round_codex)
+
+    c3_raw = await heterarchy_triad_orchestrate(
+        task_spec="Council 3-round convergence test",
+        workspace_dir=str(tmp_path),
+        mode="council",
+        max_rounds=3,
+    )
+    c3_res = json.loads(c3_raw)
+    assert c3_res["ok"] is True
+    assert c3_res["repair_rounds_executed"] == 2
+    assert c3_res["consensus_status"] == "consensus_verified"
+    assert council_codex_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_f1_f2_f3_f4_f5_multi_gate_decision_pack_diff_slicer_session_and_async_triad(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Verify [F1] multi-gate, [F2] decision pack verification, [F3] diff slicer, [F4] session continuity, [F5] async triad."""
+    # [F1] Multi-gate verification with pyproject.toml + test file
+    gate_ws = tmp_path / "gate_ws"
+    gate_ws.mkdir(parents=True, exist_ok=True)
+    (gate_ws / "pyproject.toml").write_text("[tool.ruff]\nline-length = 100\n", encoding="utf-8")
+    (gate_ws / "test_ok.py").write_text(
+        "def test_ok() -> None:\n    assert 1 + 1 == 2\n",
+        encoding="utf-8",
+    )
+    gate_receipts = await BridgeVerificationGateRunner().run_allowlisted_gates(str(gate_ws))
+    assert len(gate_receipts) == 2
+    assert all(r["passed"] is True for r in gate_receipts)
+    assert "pytest" in str(gate_receipts[0]["command"])
+    assert "ruff" in str(gate_receipts[1]["command"])
+
+    # [F3] Unified diff hunk line-range symbol discovery without def/class keywords
+    _seed_test_codegraph_db(tmp_path)
+    diff_only_hunk = (
+        "--- a/src/codex_collab_mcp/domain/routing_policy.py\n"
+        "+++ b/src/codex_collab_mcp/domain/routing_policy.py\n"
+        "@@ -2,2 +2,2 @@\n"
+        "-        return True\n"
+        "+        return False\n"
+    )
+    diff_syms = CodegraphContextSlicer().discover_symbols(
+        str(tmp_path),
+        symbols=None,
+        inline_text=diff_only_hunk,
+    )
+    assert "RoutingPolicyEngine" in diff_syms
+
+    # [F4] Session continuity & findings checklist in Pipeline auto-repair Round 2
+    captured_audit_prompts: list[str] = []
+    pipeline_codex_calls = 0
+
+    async def f4_agy(prompt: str, model: str = "sonnet", **kwargs: object) -> JsonObject:
+        store = kwargs.get("job_store")
+        req_id = "cdx-argonf4001" if "argon" in model.lower() else "cdx-sonnetf401"
+        struct: JsonObject = (
+            {
+                "verdict": "PASS",
+                "summary": "Argon architectural intent approved.",
+                "final_recommendation": "Adopt the CAS-guarded implementation.",
+            }
+            if "argon" in model.lower()
+            else {
+                "verdict": "PASS",
+                "summary": "Sonnet surgical craft summary.",
+                "crafted_code": "def cas_guard() -> bool:\n    return True\n",
+                "handoff_notes_for_codex_audit": "Verify CAS",
+            }
+        )
+        res = _agy_ok_response(model, struct, request_id=req_id)
+        if isinstance(store, JobStore):
+            rec = store.get_job(req_id) or store.create_job(
+                task_type="role_job",
+                workspace_dir=str(tmp_path),
+                job_id=req_id,
+            )
+            store.complete_job(rec.job_id, res)
+        return res
+
+    async def f4_codex(
+        prompt: str,
+        schema_name: str,
+        output_schema: JsonObject | None,
+        **kwargs: object,
+    ) -> JsonObject:
+        nonlocal pipeline_codex_calls
+        pipeline_codex_calls += 1
+        captured_audit_prompts.append(prompt)
+        if pipeline_codex_calls == 1:
+            return {
+                "ok": True,
+                "status": "succeeded",
+                "outcome_state": "confirmed_success",
+                "request_id": "cdx-codexf4001",
+                "session_id": "thr_continuity_001",
+                "structured_output": {
+                    "verdict": "BLOCK",
+                    "executive_critique": "Initial race condition found.",
+                    "findings": [
+                        {
+                            "severity": "critical",
+                            "category": "concurrency",
+                            "location": "job_store.py:92",
+                            "flaw_description": "Missing CAS guard on cancelled status",
+                            "minimal_fix": "Check status == CANCELLED",
+                        }
+                    ],
+                    "failing_test_cases": ["def test_cas(): pass"],
+                    "alexandria_decision_summary": "Block on CAS",
+                },
+            }
+        res: JsonObject = {
+            "ok": True,
+            "status": "succeeded",
+            "outcome_state": "confirmed_success",
+            "request_id": "cdx-codexf4002",
+            "session_id": "thr_continuity_001",
+            "structured_output": {
+                "verdict": "PASS",
+                "executive_critique": "Codex audit verified CAS fix.",
+                "findings": [],
+                "failing_test_cases": ["def test_cas(): assert True"],
+                "alexandria_decision_summary": "CAS verified",
+            },
+        }
+        rec = server_mod.job_store.get_job("cdx-codexf4002") or server_mod.job_store.create_job(
+            task_type="adversarial_audit",
+            workspace_dir=str(tmp_path),
+            job_id="cdx-codexf4002",
+        )
+        server_mod.job_store.complete_job(rec.job_id, res)
+        return res
+
+    monkeypatch.setattr(server_mod, "run_agy_model_prompt", f4_agy)
+    monkeypatch.setattr(server_mod, "_execute_with_engine", f4_codex)
+
+    pipe_raw = await heterarchy_triad_orchestrate(
+        task_spec="Verify F4 session continuity and F2 decision pack resolution_verified",
+        workspace_dir=str(tmp_path),
+        mode="pipeline",
+        max_rounds=2,
+    )
+    pipe_res = json.loads(pipe_raw)
+    assert pipe_res["ok"] is True
+    assert pipe_res["repair_rounds_executed"] == 1
+    assert len(captured_audit_prompts) == 2
+    assert "session_id=thr_continuity_001" in captured_audit_prompts[1]
+    assert (
+        "[critical/concurrency @ job_store.py:92] Missing CAS guard on cancelled status"
+        in captured_audit_prompts[1]
+    )
+
+    # [F2] Decision pack verifies caller role summaries & final_resolution against JobStore artifacts
+    collab_id = str(pipe_res["collaboration_id"])
+    scope_digest = str(pipe_res["evidence_scope"]["scope_digest"])
+    pack_raw = await codex_alexandria_decision_pack(
+        project_scope="codex-collab-mcp",
+        topic_title="CAS Guard Decision",
+        argon_architecture_intent="Argon architectural intent approved.",
+        sonnet_craft_or_review_summary="Sonnet surgical craft summary.",
+        codex_audit_or_synthesis_summary="Codex audit verified CAS fix.",
+        final_resolution="Adopt the CAS-guarded implementation.",
+        collaboration_id=collab_id,
+        workspace_dir=str(tmp_path),
+        expected_scope_digest=scope_digest,
+    )
+    pack_res = json.loads(pack_raw)
+    assert pack_res["ok"] is True
+    assert pack_res["consensus_reached"] is True
+    assert pack_res["resolution_verified"] is True
+
+    # [F5] Async background execution for claude_code_craft and heterarchy_triad_orchestrate
+    craft_bg_raw = await claude_code_craft(
+        task_spec="Background craft test",
+        workspace_dir=str(tmp_path),
+        async_background=True,
+        request_id="cdx-bgcraft001",
+    )
+    craft_bg = json.loads(craft_bg_raw)
+    assert craft_bg["async_dispatched"] is True
+    assert craft_bg["job_id"] == "cdx-bgcraft001"
+
+    triad_bg_raw = await heterarchy_triad_orchestrate(
+        task_spec="Background triad test",
+        workspace_dir=str(tmp_path),
+        async_background=True,
+        request_id="cdx-b071ad0001",
+    )
+    triad_bg = json.loads(triad_bg_raw)
+    assert triad_bg["async_dispatched"] is True
+    assert triad_bg["job_id"] == "cdx-b071ad0001"
+
+    if server_mod._background_tasks:
+        await asyncio.gather(*list(server_mod._background_tasks))
+
+    craft_status = json.loads(await codex_job_status(job_id="cdx-bgcraft001"))
+    assert craft_status["job"]["status"] == "completed"
+    assert craft_status["job"]["result"]["schema_valid"] is True
+
+    triad_status = json.loads(await codex_job_status(job_id="cdx-b071ad0001"))
+    assert triad_status["job"]["status"] == "completed"
+    assert triad_status["job"]["metadata"]["current_stage"] == "completed"
+    assert triad_status["job"]["result"]["collaboration_id"] == "cdx-b071ad0001"
