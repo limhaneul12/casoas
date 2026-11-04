@@ -268,6 +268,7 @@ async fn antigravity_success_exposes_only_selected_catalog_placeholder() -> crat
         .await?;
     server.await??;
     assert_eq!(result.receipt.status, ReceiptStatus::Completed);
+    assert_eq!(result.receipt.owned_processes_closed, None);
     assert_eq!(
         result.placeholder.as_deref(),
         Some("MODEL_PLACEHOLDER_M404")
@@ -519,6 +520,53 @@ async fn real_subprocess_jsonl_proves_identity_and_tokens() -> crate::Result<()>
         (9, 4)
     );
     assert_eq!(result.session_id.as_deref(), Some("thr_test"));
+    assert_eq!(result.receipt.owned_processes_closed, Some(true));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn completed_cli_reports_live_background_group_instead_of_cleanup_permission()
+-> crate::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Ok(body) = std::fs::read_to_string(&self.0)
+                && let Ok(pid) = body.trim().parse::<u32>()
+            {
+                let _ = std::process::Command::new("/bin/kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+        }
+    }
+    let workspace = tempfile::tempdir()?;
+    let binary = workspace.path().join("background-codex");
+    let _owned_background = Cleanup(workspace.path().join("background-pid"));
+    std::fs::write(
+        &binary,
+        concat!(
+            "#!/bin/sh\ncat >/dev/null\n",
+            "sleep 30 </dev/null >/dev/null 2>&1 & printf '%s' \"$!\" > background-pid\n",
+            "printf '%s\\n' '{\"model\":\"gpt-6.1-sol\",\"message\":\"{\\\"verdict\\\":\\\"PASS\\\"}\"}'\nexit 0\n"
+        ),
+    )?;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))?;
+    let options = ExecutionOptions {
+        workspace_dir: Some(workspace.path().to_path_buf()),
+        max_input_bytes: 1024,
+        ..ExecutionOptions::default()
+    };
+    let result = execute_codex_with_binary_and_options(
+        codex_request(workspace.path()),
+        Duration::from_secs(5),
+        &binary,
+        &options,
+    )
+    .await?;
+    assert_eq!(result.receipt.status, ReceiptStatus::Completed);
+    assert_eq!(result.receipt.owned_processes_closed, Some(false));
     Ok(())
 }
 

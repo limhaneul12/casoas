@@ -20,6 +20,7 @@ pub use recovery::RecoveryRecord;
 
 const DEFAULT_MAX_RETAINED: usize = 1_000;
 const STALE_RUNNING_SECONDS: f64 = 3_600.0;
+const REQUEST_MODEL_IDENTITY: &str = "request_model_identity";
 
 pub struct Store {
     jobs: Mutex<Connection>,
@@ -81,25 +82,9 @@ impl Store {
         validate_new_job(&request)?;
         let mut connection = lock(&self.jobs)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let explicit_id = request
-            .job_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty());
-        let mut existing = explicit_id
-            .map(|id| load_job_by_id(&transaction, &self.job_sql, id))
-            .transpose()?
-            .flatten();
-        if existing.is_none()
-            && let Some(key) = request
-                .idempotency_key
-                .as_deref()
-                .map(str::trim)
-                .filter(|key| !key.is_empty())
-        {
-            existing = load_job_by_idempotency(&transaction, &self.job_sql, key)?;
-        }
+        let existing = load_request_identity(&transaction, &self.job_sql, &request)?;
         if let Some(mut record) = existing {
+            let request_identity_verified = validate_request_identity(&record, &request)?;
             if record.status == JobStatus::Running {
                 if !running_record_is_stale(&record, now_seconds()) {
                     transaction.commit()?;
@@ -115,12 +100,14 @@ impl Store {
                     Some("Orphaned running job reconciled as timed_out_unknown.".to_owned());
                 self.update_job_on(&transaction, &record)?;
             }
-            if !retry_same_request
-                && (matches!(
+            let retryable = retry_same_request
+                && matches!(
                     record.status,
-                    JobStatus::TimedOutUnknown | JobStatus::Completed | JobStatus::Cancelled
-                ) || record.cancel_requested)
-            {
+                    JobStatus::RejectedPreDispatch | JobStatus::InputBudgetExceeded
+                )
+                && !record.cancel_requested
+                && request_identity_verified;
+            if !retryable {
                 transaction.commit()?;
                 return Ok(JobRegistration {
                     record,
@@ -143,6 +130,103 @@ impl Store {
             return Ok(JobRegistration {
                 record,
                 should_dispatch: true,
+            });
+        }
+        let record = build_job_record(request)?;
+        self.insert_job_on(&transaction, &record)?;
+        transaction.commit()?;
+        Ok(JobRegistration {
+            record,
+            should_dispatch: true,
+        })
+    }
+
+    /// Persist one DAG checkpoint atomically. Exact replay is a no-op; any
+    /// changed identity or result conflicts with the immutable checkpoint.
+    pub(crate) fn complete_checkpoint_once(
+        &self,
+        request: NewJob,
+        result: Value,
+    ) -> crate::Result<JobRecord> {
+        validate_new_job(&request)?;
+        if request.task_type != "dag_checkpoint"
+            || request.job_id.as_deref().is_none_or(str::is_empty)
+            || request.idempotency_key.as_deref().is_none_or(str::is_empty)
+        {
+            return Err("invalid DAG checkpoint identity".into());
+        }
+        let mut connection = lock(&self.jobs)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(record) = load_request_identity(&transaction, &self.job_sql, &request)? {
+            validate_checkpoint_identity(&record, &request)?;
+            if record.status == JobStatus::Completed
+                && record.outcome_state == OutcomeState::ConfirmedSuccess
+                && record.result.as_ref() == Some(&result)
+            {
+                transaction.commit()?;
+                return Ok(record);
+            }
+            return Err("DAG checkpoint content conflicts with existing record".into());
+        }
+
+        let mut record = build_job_record(request)?;
+        record.status = JobStatus::Completed;
+        record.outcome_state = OutcomeState::ConfirmedSuccess;
+        record.completed_at = Some(now_seconds());
+        record.result = Some(result);
+        self.insert_job_on(&transaction, &record)?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    /// Worktree runs never redispatch an existing identity, including failed ones.
+    /// Validate scope before any mutation, inside the same registration transaction.
+    pub(crate) fn register_worktree_campaign(
+        &self,
+        request: NewJob,
+    ) -> crate::Result<JobRegistration> {
+        validate_new_job(&request)?;
+        if request.task_type != "dag_ulw"
+            || !["config_identity", "plan_identity"]
+                .iter()
+                .all(|key| request.metadata.contains_key(*key))
+        {
+            return Err("invalid worktree campaign registration".into());
+        }
+        let mut connection = lock(&self.jobs)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut old = request
+            .job_id
+            .as_deref()
+            .map(|id| load_job_by_id(&transaction, &self.job_sql, id))
+            .transpose()?
+            .flatten();
+        if old.is_none()
+            && let Some(key) = request.idempotency_key.as_deref()
+        {
+            old = load_job_by_idempotency(&transaction, &self.job_sql, key)?;
+        }
+        if let Some(record) = old {
+            if record.task_type != request.task_type
+                || record.workspace_dir != request.workspace_dir
+                || record.idempotency_key != request.idempotency_key
+                || request
+                    .job_id
+                    .as_ref()
+                    .is_some_and(|id| id != &record.job_id)
+                || ["config_identity", "plan_identity"]
+                    .iter()
+                    .any(|key| record.metadata.get(*key) != request.metadata.get(*key))
+            {
+                return Err(
+                    "existing worktree campaign identity has different workspace/configuration"
+                        .into(),
+                );
+            }
+            transaction.commit()?;
+            return Ok(JobRegistration {
+                record,
+                should_dispatch: false,
             });
         }
         let record = build_job_record(request)?;
@@ -625,6 +709,165 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn attach_worktree_state(
+        &self,
+        job_id: &str,
+        state_path: &Path,
+    ) -> crate::Result<()> {
+        validate_text(job_id, "job ID")?;
+        let path = state_path.to_str().ok_or("non-UTF8 worktree state path")?;
+        validate_text(path, "worktree state path")?;
+        if !state_path.is_absolute() {
+            return Err("worktree state path must be absolute".into());
+        }
+        let mut connection = lock(&self.jobs)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut record = load_job_by_id(&transaction, &self.job_sql, job_id)?
+            .ok_or("worktree campaign missing")?;
+        if record.task_type != "dag_ulw"
+            || record.status != JobStatus::Running
+            || record.cancel_requested
+        {
+            return Err("worktree campaign no longer admits dispatch".into());
+        }
+        if record
+            .metadata
+            .get("worktree_state_path")
+            .is_some_and(|old| old != path)
+        {
+            return Err("worktree campaign state identity conflict".into());
+        }
+        record
+            .metadata
+            .insert("worktree_state_path".into(), path.into());
+        self.update_job_on(&transaction, &record)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Pin an immutable owner and a safe worktree frontier in the existing job
+    /// transaction. Exact replay is a no-op; a stale frontier never wins.
+    pub(crate) fn pin_worktree_frontier(
+        &self,
+        job_id: &str,
+        owner_campaign: &str,
+        owner_sha256: &str,
+        state_path: &Path,
+        previous: Option<&str>,
+        next: &str,
+    ) -> crate::Result<()> {
+        for value in [job_id, owner_campaign, owner_sha256, next] {
+            validate_text(value, "worktree frontier identity")?;
+        }
+        if !state_path.is_absolute() {
+            return Err("worktree state path must be absolute".into());
+        }
+        let path = state_path.to_str().ok_or("non-UTF8 worktree state path")?;
+        let mut connection = lock(&self.jobs)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut record = load_job_by_id(&transaction, &self.job_sql, job_id)?
+            .ok_or("worktree campaign missing")?;
+        if record.task_type != "dag_ulw"
+            || record.status != JobStatus::Running
+            || record.cancel_requested
+        {
+            return Err("worktree frontier campaign does not admit effects".into());
+        }
+        for (key, value) in [
+            ("worktree_state_path", path),
+            ("worktree_owner_campaign", owner_campaign),
+            ("worktree_owner_sha256", owner_sha256),
+        ] {
+            if record.metadata.get(key).is_some_and(|old| old != value) {
+                return Err("worktree owner identity conflict".into());
+            }
+        }
+        let current = record
+            .metadata
+            .get("worktree_frontier_sha256")
+            .map(String::as_str);
+        if current == Some(next) {
+            transaction.commit()?;
+            return Ok(());
+        }
+        if current != previous {
+            return Err("worktree frontier revision conflict".into());
+        }
+        for (key, value) in [
+            ("worktree_state_path", path),
+            ("worktree_owner_campaign", owner_campaign),
+            ("worktree_owner_sha256", owner_sha256),
+            ("worktree_frontier_sha256", next),
+        ] {
+            record.metadata.insert(key.into(), value.into());
+        }
+        self.update_job_on(&transaction, &record)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Record exact local export intent before creating/completing its job row.
+    pub(crate) fn prepare_worktree_export(
+        &self,
+        job_id: &str,
+        frontier: &str,
+        export_id: &str,
+        export_sha256: &str,
+    ) -> crate::Result<()> {
+        validate_text(export_sha256, "worktree export digest")?;
+        let mut connection = lock(&self.jobs)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut root = load_job_by_id(&transaction, &self.job_sql, job_id)?
+            .ok_or("worktree export owner missing")?;
+        if root.task_type != "dag_ulw"
+            || root.status != JobStatus::Running
+            || root.cancel_requested
+            || root
+                .metadata
+                .get("worktree_frontier_sha256")
+                .map(String::as_str)
+                != Some(frontier)
+            || !root.metadata.contains_key("worktree_owner_sha256")
+            || export_id != format!("ckp-{job_id}-worktree-export")
+        {
+            return Err("worktree export intent identity mismatch".into());
+        }
+        for (key, value) in [
+            ("worktree_export_id", export_id),
+            ("worktree_export_sha256", export_sha256),
+            ("worktree_export_frontier_sha256", frontier),
+        ] {
+            if root.metadata.get(key).is_some_and(|old| old != value) {
+                return Err("worktree export immutable intent conflict".into());
+            }
+        }
+        if root.metadata.get("worktree_export_id").map(String::as_str) == Some(export_id)
+            && root
+                .metadata
+                .get("worktree_export_sha256")
+                .map(String::as_str)
+                == Some(export_sha256)
+            && root
+                .metadata
+                .get("worktree_export_frontier_sha256")
+                .map(String::as_str)
+                == Some(frontier)
+        {
+            transaction.commit()?;
+            return Ok(());
+        }
+        for (key, value) in [
+            ("worktree_export_id", export_id),
+            ("worktree_export_sha256", export_sha256),
+            ("worktree_export_frontier_sha256", frontier),
+        ] {
+            root.metadata.insert(key.into(), value.into());
+        }
+        self.update_job_on(&transaction, &root)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn transition_job(
         &self,
         job_id: &str,
@@ -819,6 +1062,9 @@ fn build_job_record(request: NewJob) -> crate::Result<JobRecord> {
     validate_new_job(&request)?;
     let mut metadata = request.metadata;
     metadata.insert("owner_pid".to_owned(), std::process::id().to_string());
+    if let Some(model) = normalize_optional(request.model.clone()) {
+        metadata.insert(REQUEST_MODEL_IDENTITY.to_owned(), model);
+    }
     Ok(JobRecord {
         job_id: normalize_id(request.job_id, "cdx", 10),
         task_type: request.task_type,
@@ -866,6 +1112,89 @@ fn load_job_by_idempotency(
         .query_row(query, params![idempotency_key.trim()], |row| row.get(0))
         .optional()?;
     raw.map(|json| deserialize(&json, "job record")).transpose()
+}
+
+fn load_request_identity(
+    connection: &Connection,
+    catalog: &SqlCatalog,
+    request: &NewJob,
+) -> crate::Result<Option<JobRecord>> {
+    let by_id = request
+        .job_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| load_job_by_id(connection, catalog, id))
+        .transpose()?
+        .flatten();
+    let by_key = request
+        .idempotency_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(|key| load_job_by_idempotency(connection, catalog, key))
+        .transpose()?
+        .flatten();
+    if let (Some(id_record), Some(key_record)) = (&by_id, &by_key)
+        && id_record.job_id != key_record.job_id
+    {
+        return Err("job ID and idempotency key select different records".into());
+    }
+    let existing = by_id.or(by_key);
+    if let (Some(requested_id), Some(record)) = (
+        request
+            .job_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty()),
+        &existing,
+    ) && requested_id != record.job_id
+    {
+        return Err("job ID conflicts with the idempotency owner".into());
+    }
+    Ok(existing)
+}
+
+fn validate_request_identity(record: &JobRecord, request: &NewJob) -> crate::Result<bool> {
+    let workspace = normalize_workspace(&request.workspace_dir);
+    let stored_request_model = record
+        .metadata
+        .get(REQUEST_MODEL_IDENTITY)
+        .cloned()
+        .or_else(|| record.model.clone());
+    let identity_matches = record.task_type == request.task_type
+        && workspace_matches(&record.workspace_dir, &workspace)
+        && stored_request_model == normalize_optional(request.model.clone())
+        && record.provider == normalize_optional(request.provider.clone())
+        && record.engine == normalize_optional(request.engine.clone())
+        && record.idempotency_key == normalize_optional(request.idempotency_key.clone());
+    if !identity_matches {
+        return Err("existing job identity has different immutable scope".into());
+    }
+    let stored_digest = record.metadata.get("request_identity");
+    let requested_digest = request.metadata.get("request_identity");
+    match (stored_digest, requested_digest) {
+        (Some(stored), Some(requested)) if stored == requested => Ok(true),
+        (None, _) => Ok(false),
+        (Some(_), None) => Err("new request omitted the persisted request identity".into()),
+        (Some(_), Some(_)) => {
+            Err("existing job request identity differs from the new request".into())
+        }
+    }
+}
+
+fn validate_checkpoint_identity(record: &JobRecord, request: &NewJob) -> crate::Result<()> {
+    let _request_identity_verified = validate_request_identity(record, request)?;
+    let stored = record
+        .metadata
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "owner_pid" | REQUEST_MODEL_IDENTITY))
+        .collect::<BTreeMap<_, _>>();
+    let requested = request.metadata.iter().collect::<BTreeMap<_, _>>();
+    if stored != requested {
+        return Err("DAG checkpoint metadata conflicts with existing record".into());
+    }
+    Ok(())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> crate::Result<MutexGuard<'_, T>> {

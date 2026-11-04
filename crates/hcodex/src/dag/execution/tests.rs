@@ -75,6 +75,8 @@ async fn aimd_uses_transport_feedback_and_never_admits_above_the_reduced_capacit
                 max_input_bytes: 256_000,
                 force_serial: false,
                 resumed: BTreeMap::new(),
+                worktrees: None,
+                checkpoints: None,
             },
             None,
             move |node, wave, handoffs| {
@@ -166,6 +168,8 @@ async fn ready_descendant_runs_before_unrelated_slow_presentation_peer() -> Resu
                 max_input_bytes: 256_000,
                 force_serial: false,
                 resumed: BTreeMap::new(),
+                worktrees: None,
+                checkpoints: None,
             },
             None,
             move |node, wave_index, handoffs| {
@@ -224,6 +228,8 @@ async fn resumed_dependency_receipts_reach_only_their_direct_descendants() -> Re
             max_input_bytes: 256_000,
             force_serial: false,
             resumed: BTreeMap::from([(upstream.id.clone(), settled_receipt(&upstream, 0))]),
+            worktrees: None,
+            checkpoints: None,
         },
         None,
         |node, wave_index, handoffs| async move {
@@ -275,6 +281,8 @@ async fn shared_workspace_writer_has_exclusive_admission() -> Result<()> {
             max_input_bytes: 256_000,
             force_serial: false,
             resumed: BTreeMap::new(),
+            worktrees: None,
+            checkpoints: None,
         },
         None,
         move |node, wave_index, _| {
@@ -332,6 +340,8 @@ async fn execution_error_drains_admitted_nodes_before_returning() -> Result<()> 
                 max_input_bytes: 256_000,
                 force_serial: false,
                 resumed: BTreeMap::new(),
+                worktrees: None,
+                checkpoints: None,
             },
             None,
             move |node, wave_index, _| {
@@ -437,6 +447,59 @@ async fn rejected_provider_execution_never_settles_nodes() -> Result<()> {
 }
 
 #[tokio::test]
+async fn provider_grounding_distinguishes_new_writes_from_missing_reads() -> Result<()> {
+    let workspace = tempdir()?;
+    let state = tempdir()?;
+    fs::write(workspace.path().join("module.rs"), "pub fn module() {}\n")?;
+    let manifest = DagSettlementVerifier::capture(workspace.path())?;
+    let mut node = scheduler_node("writer", &[]);
+    node.role = NodeRole::InterfaceBuilder;
+    node.model = "invalid-model".to_owned();
+    node.read_files = vec![PathBuf::from("module.rs")];
+    node.write_files = vec![PathBuf::from("module.rs"), PathBuf::from("created.rs")];
+    let args = node_arguments(
+        &node,
+        workspace.path(),
+        Duration::from_secs(5),
+        256_000,
+        &manifest,
+        &[],
+    )?;
+    assert_eq!(args["files_inspected"], json!(["module.rs"]));
+    assert!(
+        args["target_code_or_context"]
+            .as_str()
+            .is_some_and(|text| text.contains("write `created.rs` · ABSENT"))
+    );
+    let gateway = Gateway::new(state.path().to_path_buf());
+    let response = gateway.execute_tool(tool_name(&node), &args).await?;
+    assert_eq!(response["status"], "rejected_pre_dispatch");
+    assert!(!workspace.path().join("created.rs").exists());
+
+    node.read_files.push(PathBuf::from("missing.rs"));
+    let missing = node_arguments(
+        &node,
+        workspace.path(),
+        Duration::from_secs(5),
+        256_000,
+        &manifest,
+        &[],
+    )?;
+    let error = gateway
+        .execute_tool(tool_name(&node), &missing)
+        .await
+        .err()
+        .ok_or("missing declared read should fail grounding")?;
+    assert!(
+        error
+            .to_string()
+            .contains("source reference missing.rs unavailable")
+    );
+    gateway.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn observer_reports_stopped_before_settlement() -> Result<()> {
     let workspace = tempdir()?;
     let state = tempdir()?;
@@ -494,6 +557,45 @@ fn detects_declared_read_mutation_since_wave_baseline() -> Result<()> {
         dirty_read_files(node, &baseline, &current),
         [PathBuf::from("module.rs")]
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn nonzero_gate_with_live_owned_group_has_no_reproduction_proof() -> Result<()> {
+    let root = tempdir()?;
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace)?;
+    let pid_file = root.path().join("background.pid");
+    let args = [
+        "-c",
+        "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > \"$1\"; exit 7",
+        "fixture",
+        pid_file.to_str().ok_or("nonUTF8 fixture")?,
+    ];
+    let result = execute_gate_command(
+        &workspace,
+        Duration::from_secs(5),
+        "fixture nonzero background".into(),
+        "/bin/sh",
+        &args,
+        false,
+    )
+    .await;
+    // This exact child was spawned by the controlled script; dispose it before assertions.
+    if let Ok(pid) = fs::read_to_string(&pid_file) {
+        let pid = pid.trim();
+        if !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()) {
+            let _ = std::process::Command::new("/bin/kill")
+                .args(["-KILL", pid])
+                .status()?;
+        }
+    }
+    let proof = result?;
+    assert!(proof.executed);
+    assert_eq!(proof.exit_code, None);
+    assert_eq!(proof.stdout_digest, None);
+    assert!(!proof.passed());
     Ok(())
 }
 

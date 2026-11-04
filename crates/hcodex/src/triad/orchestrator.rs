@@ -5,7 +5,9 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::gateway::{Gateway, optional, text, workspace};
+use crate::gateway::{
+    Gateway, optional, text, triad_mode, triad_model_set, triad_request_identity, workspace,
+};
 use crate::storage::{HandoffPriority, HandoffStatus, JobStatus, NewHandoff, NewJob, TriadRole};
 
 use super::adjudication::{REQUIRED_ROLES, adjudicate, canonical_digest, inspect_role};
@@ -19,13 +21,24 @@ pub async fn orchestrate(gateway: &Gateway, args: &Value) -> crate::Result<Value
         return Err("Workspace directory must resolve to an existing directory.".into());
     }
     let mut scope = evidence_scope(&workspace_path, args)?;
-    let aggregate_start = aggregate_start(gateway, args).await?;
+    let aggregate_start = aggregate_start(gateway, args, &workspace_path, &task_digest).await?;
     if let AggregateStart::Deduplicated(result) = aggregate_start {
         return Ok(result);
     }
+    let AggregateStart::Reserved(aggregate_id) = &aggregate_start else {
+        return Err("triad aggregate reservation was not retained".into());
+    };
+    let aggregate_id = aggregate_id.clone();
     let resume_id = optional(args, "resume_collaboration_id");
     let mut resumed = if let Some(identifier) = resume_id.as_deref() {
-        load_resumable_roles(gateway, identifier, &workspace_path, &task_digest, &scope).await?
+        match load_resumable_roles(gateway, identifier, &workspace_path, &task_digest, &scope).await
+        {
+            Ok(resumed) => resumed,
+            Err(error) => {
+                fail_reserved_aggregate(gateway, &aggregate_id, &error).await?;
+                return Err(error);
+            }
+        }
     } else {
         BTreeMap::new()
     };
@@ -36,7 +49,13 @@ pub async fn orchestrate(gateway: &Gateway, args: &Value) -> crate::Result<Value
     } else {
         execute_pipeline(gateway, args, &mut resumed).await
     };
-    let (sonnet, codex, argon, repair_rounds) = role_execution?;
+    let (sonnet, codex, argon, repair_rounds) = match role_execution {
+        Ok(execution) => execution,
+        Err(error) => {
+            fail_reserved_aggregate(gateway, &aggregate_id, &error).await?;
+            return Err(error);
+        }
+    };
     let argon_review = argon.clone();
     let sonnet_craft = sonnet.clone();
     let codex_audit = codex.clone();
@@ -50,7 +69,10 @@ pub async fn orchestrate(gateway: &Gateway, args: &Value) -> crate::Result<Value
     let gates = if args["run_verification_gates"].as_bool().unwrap_or(false) {
         match gates::run(&workspace_path, timeout_duration(args)).await {
             Ok(receipts) => Some(receipts),
-            Err(error) => return Err(error),
+            Err(error) => {
+                fail_reserved_aggregate(gateway, &aggregate_id, &error).await?;
+                return Err(error);
+            }
         }
     } else {
         None
@@ -151,125 +173,93 @@ pub async fn orchestrate(gateway: &Gateway, args: &Value) -> crate::Result<Value
         "resumed_roles": resumed_roles,
         "resumed_from_collaboration_id": resume_id,
     });
-    persist_aggregate(
-        gateway,
-        args,
-        &workspace_path,
-        &task_digest,
-        &mut result,
-        aggregate_start,
-    )
-    .await;
+    persist_aggregate(gateway, args, &task_digest, &mut result, aggregate_start).await;
     Ok(result)
 }
 
+async fn fail_reserved_aggregate(
+    gateway: &Gateway,
+    aggregate_id: &str,
+    error: &crate::Error,
+) -> crate::Result<()> {
+    let job_id = aggregate_id.to_owned();
+    let message = error.to_string();
+    gateway
+        .database(move |store| {
+            store
+                .fail_job(&job_id, message, None)?
+                .ok_or("reserved triad aggregate disappeared before failure persistence")?;
+            Ok(())
+        })
+        .await
+}
+
 enum AggregateStart {
-    New,
     Reserved(String),
     Deduplicated(Value),
 }
 
-async fn aggregate_start(gateway: &Gateway, args: &Value) -> crate::Result<AggregateStart> {
-    let request_id = optional(args, "request_id");
-    let idempotency_key = optional(args, "idempotency_key");
-    if request_id.is_none() && idempotency_key.is_none() {
-        return Ok(AggregateStart::New);
-    }
+async fn aggregate_start(
+    gateway: &Gateway,
+    args: &Value,
+    workspace: &Path,
+    task_digest: &str,
+) -> crate::Result<AggregateStart> {
     let retry = args["retry_same_request"].as_bool().unwrap_or(false);
     let background_reserved = args["_background_reserved"].as_bool().unwrap_or(false);
-    let existing = gateway
-        .database(move |store| {
-            if let Some(identifier) = request_id.as_deref()
-                && let Some(record) = store.get_job(identifier)?
-            {
-                return Ok(Some(record));
-            }
-            idempotency_key
-                .as_deref()
-                .map(|key| store.find_job_by_idempotency_key(key))
-                .transpose()
-                .map(Option::flatten)
-        })
-        .await?;
-    let Some(record) = existing else {
-        return Ok(AggregateStart::New);
+    let mut metadata = BTreeMap::from([
+        ("current_stage".to_owned(), "running".to_owned()),
+        ("schema_version".to_owned(), "2".to_owned()),
+        ("source_task_digest".to_owned(), task_digest.to_owned()),
+    ]);
+    metadata.insert("request_identity".to_owned(), triad_request_identity(args)?);
+    let request = NewJob {
+        task_type: "triad_orchestration".to_owned(),
+        workspace_dir: workspace.to_path_buf(),
+        model: Some(triad_model_set(args)),
+        metadata,
+        job_id: optional(args, "request_id"),
+        idempotency_key: optional(args, "idempotency_key"),
+        provider: Some("heterarchy_triad".to_owned()),
+        engine: Some(triad_mode(args)),
+        created_at: None,
     };
-    if !retry
-        && record.status == JobStatus::Completed
-        && let Some(result) = record.result
-    {
-        return Ok(AggregateStart::Deduplicated(result));
+    let registration = gateway
+        .database(move |store| store.resolve_or_register(request, retry))
+        .await?;
+    if registration.should_dispatch {
+        return Ok(AggregateStart::Reserved(registration.record.job_id));
     }
+    let record = registration.record;
     if background_reserved && record.status == JobStatus::Running {
         return Ok(AggregateStart::Reserved(record.job_id));
     }
     if record.status == JobStatus::Running {
         return Err("triad collaboration request is already running".into());
     }
-    Ok(AggregateStart::New)
+    record.result.map_or_else(
+        || Err("triad collaboration request is terminal without a durable result".into()),
+        |result| Ok(AggregateStart::Deduplicated(result)),
+    )
 }
 
 async fn persist_aggregate(
     gateway: &Gateway,
     args: &Value,
-    workspace: &Path,
     task_digest: &str,
     result: &mut Value,
     start: AggregateStart,
 ) {
     let reserved_id = match start {
-        AggregateStart::Reserved(identifier) => Some(identifier),
-        AggregateStart::New => None,
+        AggregateStart::Reserved(identifier) => identifier,
         AggregateStart::Deduplicated(_) => return,
     };
-    let request = NewJob {
-        task_type: "triad_orchestration".to_owned(),
-        workspace_dir: workspace.to_path_buf(),
-        model: Some(format!(
-            "{}+{}+{}",
-            text(args, "argon_model"),
-            text(args, "claude_model"),
-            optional(args, "codex_model").unwrap_or_else(|| "gpt-6-astra".to_owned())
-        )),
-        metadata: BTreeMap::from([
-            ("schema_version".to_owned(), "2".to_owned()),
-            ("source_task_digest".to_owned(), task_digest.to_owned()),
-            ("current_stage".to_owned(), "completed".to_owned()),
-        ]),
-        job_id: reserved_id.clone().or_else(|| optional(args, "request_id")),
-        idempotency_key: optional(args, "idempotency_key"),
-        provider: Some("heterarchy_triad".to_owned()),
-        engine: Some(text(args, "mode")),
-        created_at: None,
-    };
-    let retry = args["retry_same_request"].as_bool().unwrap_or(false);
-    let record = if let Some(identifier) = reserved_id {
-        let lookup = identifier.clone();
-        match gateway.database(move |store| store.get_job(&lookup)).await {
-            Ok(Some(record)) => record,
-            _ => {
-                mark_persistence_failure(result, Some(identifier));
-                return;
-            }
-        }
-    } else {
-        match gateway
-            .database(move |store| store.resolve_or_register(request, retry))
-            .await
-        {
-            Ok(registration) if registration.should_dispatch => registration.record,
-            Ok(registration) => {
-                if let Some(existing) = registration.record.result {
-                    *result = existing;
-                } else {
-                    mark_persistence_failure(result, Some(registration.record.job_id));
-                }
-                return;
-            }
-            Err(_) => {
-                mark_persistence_failure(result, None);
-                return;
-            }
+    let lookup = reserved_id.clone();
+    let record = match gateway.database(move |store| store.get_job(&lookup)).await {
+        Ok(Some(record)) => record,
+        _ => {
+            mark_persistence_failure(result, Some(reserved_id));
+            return;
         }
     };
     let collaboration_id = record.job_id;
@@ -959,6 +949,72 @@ mod tests {
             source_task_digest(&pipeline)?,
             source_task_digest(&council)?
         );
+        assert_eq!(
+            triad_request_identity(&base)?,
+            triad_request_identity(&pipeline)?
+        );
+        assert_eq!(
+            triad_request_identity(&council)?,
+            triad_request_identity(&padded_council)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_identity_is_reserved_before_roles_and_rejects_changed_request()
+    -> crate::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let gateway = Gateway::new(temporary.path().join("state"));
+        let args = json!({
+            "workspace_dir":workspace, "task_spec":"review source",
+            "request_id":"cdx-triad-identity", "mode":"council",
+        });
+        let task_digest = source_task_digest(&args)?;
+        let start = aggregate_start(&gateway, &args, &workspace, &task_digest).await?;
+        assert!(matches!(start, AggregateStart::Reserved(ref id) if id == "cdx-triad-identity"));
+        let stored = gateway
+            .database(|store| store.get_job("cdx-triad-identity"))
+            .await?
+            .ok_or("triad reservation missing")?;
+        assert_eq!(stored.status, JobStatus::Running);
+        assert!(stored.metadata.contains_key("request_identity"));
+
+        let mut changed = args;
+        changed["task_spec"] = Value::String("different request".to_owned());
+        let changed_digest = source_task_digest(&changed)?;
+        assert!(
+            aggregate_start(&gateway, &changed, &workspace, &changed_digest)
+                .await
+                .is_err()
+        );
+        gateway.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reserved_aggregate_failure_is_persisted() -> crate::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace)?;
+        let gateway = Gateway::new(temporary.path().join("state"));
+        let args = json!({
+            "workspace_dir":workspace, "task_spec":"controlled failure",
+            "request_id":"cdx-triad-failed-resume",
+        });
+        let task_digest = source_task_digest(&args)?;
+        let start = aggregate_start(&gateway, &args, &workspace, &task_digest).await?;
+        assert!(matches!(start, AggregateStart::Reserved(_)));
+        let error: crate::Error = std::io::Error::other("controlled failure").into();
+        fail_reserved_aggregate(&gateway, "cdx-triad-failed-resume", &error).await?;
+        let stored = gateway
+            .database(|store| store.get_job("cdx-triad-failed-resume"))
+            .await?
+            .ok_or("failed triad reservation missing")?;
+        assert_eq!(stored.status, JobStatus::Failed);
+        assert_eq!(stored.attempt_count, 1);
+        gateway.shutdown().await?;
         Ok(())
     }
 

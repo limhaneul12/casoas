@@ -495,31 +495,40 @@ pub(super) fn prompt_inspection_lines(
     lines
 }
 
-pub(super) fn extract_dag_goal(value: &Value) -> Option<String> {
-    [
-        &["job", "result", "compiled_plan", "goal"][..],
-        &["job", "result", "plan", "goal"][..],
-        &["result", "compiled_plan", "goal"][..],
-        &["compiled_plan", "goal"][..],
-    ]
-    .into_iter()
-    .find_map(|path| {
-        value_at(value, path)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
+pub(super) fn latest_dag_checkpoint(value: &Value, workspace: &Path) -> Option<String> {
+    value["jobs"].as_array()?.iter().find_map(|job| {
+        if Path::new(job["workspace_dir"].as_str()?) != workspace {
+            return None;
+        }
+        match job["task_type"].as_str()? {
+            "dag_ulw" if job["result"]["plan_only"] != true => {
+                job["job_id"].as_str().map(str::to_owned)
+            }
+            "dag_checkpoint"
+                if job["status"] == "completed" && job["metadata"]["checkpoint_kind"] == "plan" =>
+            {
+                let campaign = job["metadata"]["campaign_id"].as_str()?;
+                (job["job_id"] == format!("ckp-{campaign}-plan")).then(|| campaign.to_owned())
+            }
+            _ => None,
+        }
     })
 }
 
-pub(super) fn latest_dag_checkpoint(value: &Value) -> Option<(String, String)> {
-    value["jobs"].as_array()?.iter().find_map(|job| {
-        let task = job["task_type"].as_str().unwrap_or_default();
-        if !task.contains("dag") {
-            return None;
-        }
-        let id = job["job_id"].as_str()?.to_owned();
-        let goal = extract_dag_goal(&json!({"job":job}))?;
-        Some((id, goal))
-    })
+pub(super) fn inline_resume_id(input: &str) -> Result<Option<&str>> {
+    let mut parts = input.split_whitespace();
+    let mut command = parts.next();
+    if command == Some("--live") {
+        command = parts.next();
+    }
+    if command != Some("--resume") {
+        return Ok(None);
+    }
+    let id = parts.next().ok_or("--resume requires a campaign ID")?;
+    if parts.next().is_some() {
+        return Err("resume uses the stored plan; a replacement goal is not accepted".into());
+    }
+    Ok(Some(id))
 }
 
 pub(super) fn provider_stage(output: &Value) -> String {
@@ -1053,13 +1062,15 @@ pub(super) fn status_summary(health: &Value, jobs: &Value, inbox: &Value) -> Vec
     let status = health["status"].as_str().unwrap_or("unknown");
     let job_count = jobs["jobs"].as_array().map_or(0, Vec::len);
     let handoff_count = inbox["handoffs"].as_array().map_or(0, Vec::len);
-    vec![
+    let mut lines = vec![
         format!(
             "Operational Status Page [6:Status] · Bridge: {status} · Jobs: {job_count} · Handoffs: {handoff_count}"
         ),
         "────────────────────────────────────────────────────────────────────────────────────────"
             .to_owned(),
-    ]
+    ];
+    lines.extend(runtime_identity_summary(&health["runtime_identity"]));
+    lines
 }
 
 pub(super) fn inbox_summary(inbox: &Value) -> Vec<String> {
@@ -1071,6 +1082,202 @@ pub(super) fn inbox_summary(inbox: &Value) -> Vec<String> {
     ]
 }
 
+pub(super) fn workboard_summary(board: &Value) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Organization Workboard · Workspace: {} · Records: {}",
+        board["workspace_dir"].as_str().unwrap_or("unknown"),
+        board["count"].as_u64().unwrap_or(0)
+    )];
+    lines.push(
+        "────────────────────────────────────────────────────────────────────────────────────────"
+            .to_owned(),
+    );
+    lines.extend(runtime_identity_summary(&board["runtime_identity"]));
+    for item in board["items"].as_array().into_iter().flatten() {
+        let detail = &item["detail"];
+        let kind = detail["kind"].as_str().unwrap_or("record");
+        let mut line = format!(
+            "{} · {} · {} · {}",
+            item["job_id"].as_str().unwrap_or("unknown"),
+            item["task_type"].as_str().unwrap_or("unknown"),
+            item["status"].as_str().unwrap_or("unknown"),
+            kind
+        );
+        if kind == "node" {
+            line.push_str(&format!(
+                " · node={} · handoff={}",
+                detail["node_id"].as_str().unwrap_or("unknown"),
+                detail["handoff_status"].as_str().unwrap_or("unavailable")
+            ));
+            if let Some(summary) = detail["handoff"]["summary"].as_str()
+                && !summary.is_empty()
+            {
+                line.push_str(&format!(" · {}", truncate_utf8(summary, 240)));
+            }
+        } else if kind == "review_council" {
+            line.push_str(&format!(
+                " · council={} · approved={}",
+                detail["consensus_status"].as_str().unwrap_or("unknown"),
+                detail["review_approved"].as_bool().unwrap_or(false)
+            ));
+        }
+        lines.push(line);
+    }
+    if board["items"].as_array().is_none_or(Vec::is_empty) {
+        lines.push(
+            "No persisted campaigns, handoffs, or Review Councils in this workspace.".to_owned(),
+        );
+    }
+    lines
+}
+
+fn runtime_identity_summary(identity: &Value) -> Vec<String> {
+    if !identity.is_object() {
+        return Vec::new();
+    }
+    let text = |value: &Value| {
+        truncate_utf8(value.as_str().unwrap_or("unknown"), 128)
+            .chars()
+            .flat_map(char::escape_debug)
+            .collect::<String>()
+    };
+    let source = &identity["source"];
+    let dirty = source["dirty"]
+        .as_bool()
+        .map_or("unknown", |dirty| if dirty { "dirty" } else { "clean" });
+    let processes = identity["registered_mcp"].as_array();
+    let mismatched = processes.map_or(0, |rows| {
+        rows.iter()
+            .filter(|row| row["installed_comparison"] == "different_recorded_disk_hash")
+            .count()
+    });
+    let unknown = processes.map_or(0, |rows| {
+        rows.iter().filter(|row| row["state"] == "unknown").count()
+    });
+    let registered = if identity["registry_observation"] == "observed" {
+        format!(
+            "Registered MCP startup observations · disk mismatch={mismatched} · unknown={unknown} · registry=observed"
+        )
+    } else {
+        format!(
+            "Registered MCP startup observations · unavailable · registry={}",
+            text(&identity["registry_observation"])
+        )
+    };
+    vec![
+        format!(
+            "Source identity · {} · {dirty} · HEAD={} · scope={}",
+            text(&source["state"]),
+            text(&source["head"]),
+            text(&source["scope"])
+        ),
+        format!(
+            "Installed CLI disk · {} · {}",
+            text(&identity["installed_cli"]["state"]),
+            text(&identity["installed_cli"]["sha256"])
+        ),
+        format!(
+            "Current process · package={} · loaded image unverified",
+            text(&identity["current_process"]["package_version"])
+        ),
+        registered,
+        "Source-to-binary linkage unverified; CI evidence not supplied by this observation."
+            .to_owned(),
+    ]
+}
+
+pub(super) fn votes_summary(votes: &Value) -> Vec<String> {
+    let source_status = votes["source_status"]["status"]
+        .as_str()
+        .unwrap_or("unknown");
+    let mut lines = vec![format!(
+        "Review Council {} · source={} · historical_approved={} · current_approved={}",
+        votes["collaboration_id"].as_str().unwrap_or("unknown"),
+        source_status,
+        votes["historical_review_approved"]
+            .as_bool()
+            .unwrap_or(false),
+        votes["current_review_approved"].as_bool().unwrap_or(false)
+    )];
+    lines.push("Role · Actual model · Verdict · Validity".to_owned());
+    lines.push(
+        "────────────────────────────────────────────────────────────────────────────────────────"
+            .to_owned(),
+    );
+    for ballot in votes["ballots"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "{} · {} · {} · {} ({})",
+            ballot["role"].as_str().unwrap_or("unknown"),
+            ballot["actual_model"].as_str().unwrap_or("unknown"),
+            ballot["verdict"].as_str().unwrap_or("missing"),
+            if ballot["valid"].as_bool().unwrap_or(false) {
+                "valid"
+            } else {
+                "invalid"
+            },
+            ballot["reason"].as_str().unwrap_or("unknown")
+        ));
+    }
+    lines
+}
+
+pub(super) fn recovery_summary(report: &Value) -> Vec<String> {
+    let text = |value: &Value| {
+        truncate_utf8(value.as_str().unwrap_or("unknown"), 240)
+            .chars()
+            .flat_map(char::escape_debug)
+            .collect::<String>()
+    };
+    let mut lines = vec![
+        format!(
+            "Recovery {} · {} ({})",
+            text(&report["job_id"]),
+            text(&report["observation"]),
+            text(&report["reason"])
+        ),
+        "Read-only observations; no cleanup, retry, or resume authorization.".to_owned(),
+    ];
+    let job = &report["job"];
+    if job.is_object() {
+        lines.push(format!(
+            "Recorded job · {} · {} · model={}",
+            text(&job["status"]),
+            text(&job["outcome_state"]),
+            text(&job["model"])
+        ));
+    }
+    let worktrees = &report["worktrees"];
+    if worktrees.is_object() {
+        lines.push(format!(
+            "Worktrees · {} ({})",
+            text(&worktrees["observation"]),
+            text(&worktrees["reason"])
+        ));
+        lines.push(format!("State path · {}", text(&worktrees["state_path"])));
+        for node in worktrees["nodes"].as_array().into_iter().flatten() {
+            let flag = |key: &str| {
+                node[key]
+                    .as_bool()
+                    .map_or("unknown", |value| if value { "true" } else { "false" })
+            };
+            lines.push(format!(
+                "{} · observed={} · path={} · Git={}",
+                text(&node["node_id"]),
+                text(&node["observation"]),
+                text(&node["filesystem"]),
+                text(&node["git_registration"])
+            ));
+            lines.push(format!(
+                "  Recorded only · verified={} · removed={} · {}",
+                flag("recorded_verified"),
+                flag("recorded_removed"),
+                text(&node["path"])
+            ));
+        }
+    }
+    lines
+}
+
 pub(super) fn help_lines() -> Vec<String> {
     vec![
         "Workbench Pages (press 1..7 inside any view when composer is empty):".to_owned(),
@@ -1078,7 +1285,7 @@ pub(super) fn help_lines() -> Vec<String> {
         "────────────────────────────────────────────────────────────────────────────────────────".to_owned(),
         "/skills [core|default|clear] · interactive Skills Configuration Page (● active / ○ deactivate)".to_owned(),
         "/skill <name...> · toggle registered skills; $skill or /registered-skill prefixes activate inline".to_owned(),
-        "/dag-ulw [/dag-run|/dag|/triad] <goal> · compile and execute a dynamic graph".to_owned(),
+        "/dag-run [--worktree] <goal> · compile and execute a dynamic graph".to_owned(),
         "/dag-plan <goal> · compile only; nothing runs".to_owned(),
         "/prompts [/promt|/prompt-trace] [node_id|argon|claude|codex] · inspect actual node task/context/output/gates".to_owned(),
         "/models · provider routing health".to_owned(),
@@ -1088,6 +1295,10 @@ pub(super) fn help_lines() -> Vec<String> {
         "/permissions [/approvals] · read-only, auto-edit, or yolo sandbox".to_owned(),
         "/resume [dag_id] · resume a matching durable DAG checkpoint".to_owned(),
         "/triad-review <goal> · actual Argon + Claude + Codex review pipeline".to_owned(),
+        "/board [limit] · persisted campaign, node handoff and Review Council workboard (no model call)".to_owned(),
+        "/council [--file relative/path ... --] <proposal> · run the Review Council; quoted paths are CLI-only".to_owned(),
+        "/votes <collaboration_id> · actual role ballots, receipts and scoped source freshness".to_owned(),
+        "/recovery <job_id> · read-only job and worktree observations; no cleanup or retry".to_owned(),
         "/compact · compact local view/prompt history without rewriting receipt usage".to_owned(),
         "/theme [name] · inspect or change the active rendered palette".to_owned(),
         "/diff · SHA-256 changes since session baseline, including non-Git/untracked files".to_owned(),
@@ -1096,4 +1307,64 @@ pub(super) fn help_lines() -> Vec<String> {
         "/back · return from a detail view".to_owned(),
         "/quit · cancel active terminal actions and exit".to_owned(),
     ]
+}
+/// Consume only a leading mode flag; a flag-like word inside a goal is content.
+pub(super) fn worktree_goal(input: &str) -> (String, bool) {
+    let input = input.trim();
+    if input == "--worktree" {
+        (String::new(), true)
+    } else if let Some(rest) = input.strip_prefix("--worktree")
+        && rest.starts_with(char::is_whitespace)
+    {
+        (rest.trim().to_owned(), true)
+    } else {
+        (input.to_owned(), false)
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn identity_views_show_uncertainty_and_keep_empty_board_message() {
+        let identity = json!({
+            "source":{"state":"observed","dirty":true,"head":"abc123","scope":"git_listed_rust_sql_cargo_toolchain"},
+            "installed_cli":{"state":"observed","sha256":"sha256:fixture"},
+            "current_process":{"package_version":"0.3.0\u{1b}[31m"},
+            "registry_observation":"observed",
+            "registered_mcp":[
+                {"state":"observed","installed_comparison":"different_recorded_disk_hash"},
+                {"state":"unknown","installed_comparison":"unknown"}
+            ]
+        });
+        let board = workboard_summary(&json!({"items":[],"runtime_identity":identity}));
+        assert!(board.iter().any(|line| line.contains("dirty")));
+        assert!(
+            board
+                .iter()
+                .any(|line| line.contains("disk mismatch=1 · unknown=1"))
+        );
+        assert!(
+            board
+                .iter()
+                .any(|line| line.contains("No persisted campaigns"))
+        );
+        assert!(
+            board
+                .iter()
+                .any(|line| line.contains("Source-to-binary linkage unverified"))
+        );
+        assert!(board.iter().all(|line| !line.contains('\u{1b}')));
+        let status = status_summary(
+            &json!({"runtime_identity":identity}),
+            &json!({}),
+            &json!({}),
+        );
+        assert!(
+            status
+                .iter()
+                .any(|line| line.contains("CI evidence not supplied"))
+        );
+    }
 }

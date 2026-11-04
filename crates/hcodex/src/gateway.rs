@@ -7,6 +7,7 @@ use crate::storage::{AuditVerdict, HandoffFilter, JobStatus, NewHandoff, NewJob,
 use crate::supervisor::Supervisor;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -21,12 +22,24 @@ use grounding::{
     boundary_schema, build_route_request, grounded_prompt, normalize_boundary, structured_prompt,
 };
 
+#[cfg(test)]
+type TestProvider = std::sync::Arc<
+    dyn Fn(
+            &RouteRequest,
+            &crate::runtime::ExecutionOptions,
+        ) -> crate::Result<crate::runtime::ExecutionResult>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone)]
 pub struct Gateway {
     pub state_root: PathBuf,
     supervisor: Supervisor,
     codex_binary: Option<PathBuf>,
     sandbox_mode: crate::routing::SandboxMode,
+    #[cfg(test)]
+    test_provider: Option<TestProvider>,
 }
 
 struct ProviderInvocation {
@@ -38,6 +51,13 @@ struct ProviderInvocation {
     options: crate::runtime::ExecutionOptions,
     schema: Option<Value>,
 }
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealthArguments {
+    #[serde(default)]
+    workspace_dir: Option<PathBuf>,
+}
 impl Gateway {
     pub fn new(state_root: PathBuf) -> Self {
         Self {
@@ -45,6 +65,8 @@ impl Gateway {
             supervisor: Supervisor::new(8),
             codex_binary: None,
             sandbox_mode: crate::routing::SandboxMode::ReadOnly,
+            #[cfg(test)]
+            test_provider: None,
         }
     }
     pub fn with_sandbox(mut self, mode: crate::routing::SandboxMode) -> Self {
@@ -54,6 +76,22 @@ impl Gateway {
     #[cfg(test)]
     pub(crate) fn with_codex_binary(mut self, binary: PathBuf) -> Self {
         self.codex_binary = Some(binary);
+        self
+    }
+    /// Test-only replacement of the external provider transport. Routing,
+    /// grounding, reservation and persistence remain the real application path.
+    #[cfg(test)]
+    pub(crate) fn with_test_provider<F>(mut self, provider: F) -> Self
+    where
+        F: Fn(
+                &RouteRequest,
+                &crate::runtime::ExecutionOptions,
+            ) -> crate::Result<crate::runtime::ExecutionResult>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.test_provider = Some(std::sync::Arc::new(provider));
         self
     }
     pub async fn shutdown(&self) -> crate::Result<()> {
@@ -82,7 +120,7 @@ impl Gateway {
             .await?;
         receiver.await?
     }
-    async fn bridge_health(&self) -> crate::Result<Value> {
+    async fn bridge_health(&self, args: HealthArguments) -> crate::Result<Value> {
         let (mut health, antigravity_models) = crate::runtime::health_with_models().await?;
         let (telemetry, pending) = self
             .database(|store| Ok((store.job_telemetry()?, store.pending_handoff_counts()?)))
@@ -165,6 +203,11 @@ impl Gateway {
         health["routing_contract"]["verified_at_utc"] = health["verified_at_utc"].clone();
         health["routing_contract"]["codex_cli_routable"] = Value::Bool(codex_ready);
         health["ok"] = Value::Bool(codex_ready);
+        let workspace = args
+            .workspace_dir
+            .map(Ok)
+            .unwrap_or_else(std::env::current_dir)?;
+        health["runtime_identity"] = crate::lifecycle::runtime_identity(&workspace).await;
         Ok(health)
     }
     pub async fn database<T, F>(&self, operation: F) -> crate::Result<T>
@@ -317,7 +360,7 @@ impl Gateway {
                 .await
             }
             "heterarchy_dag_ulw" => crate::dag::handle_request(self, &args).await,
-            "codex_bridge_health" => self.bridge_health().await,
+            "codex_bridge_health" => self.bridge_health(serde_json::from_value(args)?).await,
             "heterarchy_triad_orchestrate" => crate::triad::orchestrate(self, &args).await,
             "codex_alexandria_decision_pack" => crate::triad::decision_pack(self, &args).await,
             _ => self.execute_tool(name, &args).await,
@@ -338,7 +381,11 @@ impl Gateway {
             } else {
                 "triad_orchestration"
             };
-            let mode = optional(&args, "mode").unwrap_or_else(|| "pipeline".to_owned());
+            let mode = if name == "heterarchy_triad_orchestrate" {
+                triad_mode(&args)
+            } else {
+                optional(&args, "mode").unwrap_or_else(|| "pipeline".to_owned())
+            };
             let source_task_digest = crate::routing::digest_output(
                 args.get("task_spec")
                     .and_then(Value::as_str)
@@ -348,25 +395,25 @@ impl Gateway {
             let model = if name == "heterarchy_dag_ulw" {
                 "dag-ulw".to_owned()
             } else {
-                format!(
-                    "{}+{}+{}",
-                    optional(&args, "argon_model")
-                        .unwrap_or_else(|| "gemini-4-argon-high".to_owned()),
-                    optional(&args, "claude_model")
-                        .unwrap_or_else(|| "claude-sonnet-5-5-medium".to_owned()),
-                    optional(&args, "codex_model").unwrap_or_else(|| "gpt-6-astra".to_owned()),
-                )
+                triad_model_set(&args)
             };
+            let mut metadata = BTreeMap::from([
+                ("current_stage".to_owned(), "queued".to_owned()),
+                ("mode".to_owned(), mode.clone()),
+                ("schema_version".to_owned(), "2".to_owned()),
+                ("source_task_digest".to_owned(), source_task_digest),
+            ]);
+            if name == "heterarchy_triad_orchestrate" {
+                metadata.insert(
+                    "request_identity".to_owned(),
+                    triad_request_identity(&args)?,
+                );
+            }
             let request = NewJob {
                 task_type: task_type.to_owned(),
                 workspace_dir: workspace(&args),
                 model: Some(model),
-                metadata: BTreeMap::from([
-                    ("current_stage".to_owned(), "queued".to_owned()),
-                    ("mode".to_owned(), mode.clone()),
-                    ("schema_version".to_owned(), "2".to_owned()),
-                    ("source_task_digest".to_owned(), source_task_digest),
-                ]),
+                metadata,
                 job_id: Some(request_id.clone()),
                 idempotency_key: idempotency_key.clone(),
                 provider: Some("heterarchy_triad".to_owned()),
@@ -397,15 +444,39 @@ impl Gateway {
                 route_request.model.clone_from(&configured.model);
             }
             if let Err(error) = crate::routing::validate_route(&route_request) {
+                let sandbox_mode = args
+                    .get("sandbox_mode")
+                    .filter(|value| !value.is_null())
+                    .map(|value| serde_json::from_value(value.clone()))
+                    .transpose()?
+                    .unwrap_or(self.sandbox_mode);
+                let duration = Duration::from_secs_f64(
+                    args["timeout_seconds"]
+                        .as_f64()
+                        .unwrap_or(3600.0)
+                        .clamp(0.01, 86_400.0),
+                );
+                let max_input_bytes =
+                    usize::try_from(args["max_input_bytes"].as_u64().unwrap_or(256_000))?;
+                let stored_model = if configured_default.is_some() {
+                    "codex-default".to_owned()
+                } else {
+                    route_request.model.clone()
+                };
+                let request_identity = provider_request_identity(
+                    name,
+                    &semantic_request_arguments(&args),
+                    &route_request,
+                    &stored_model,
+                    sandbox_mode,
+                    duration,
+                    max_input_bytes,
+                )?;
                 let registration_request = NewJob {
                     task_type: name.to_owned(),
                     workspace_dir: workspace(&args),
-                    model: Some(if configured_default.is_some() {
-                        "codex-default".to_owned()
-                    } else {
-                        route_request.model.clone()
-                    }),
-                    metadata: BTreeMap::new(),
+                    model: Some(stored_model),
+                    metadata: BTreeMap::from([("request_identity".to_owned(), request_identity)]),
                     job_id: Some(request_id.clone()),
                     idempotency_key: idempotency_key.clone(),
                     provider: Some(
@@ -586,6 +657,10 @@ impl Gateway {
         &self,
         invocation: ProviderInvocation,
     ) -> crate::Result<crate::runtime::ExecutionResult> {
+        #[cfg(test)]
+        if let Some(provider) = &self.test_provider {
+            return provider(&invocation.request, &invocation.options);
+        }
         let ProviderInvocation {
             name,
             args,
@@ -697,7 +772,11 @@ impl Gateway {
         );
         let max_input_bytes = usize::try_from(args["max_input_bytes"].as_u64().unwrap_or(256_000))?;
         let root = workspace(args);
-        let context_args = args.clone();
+        let request_id = optional(args, "request_id");
+        let key = optional(args, "idempotency_key");
+        let retry = args["retry_same_request"].as_bool().unwrap_or(false);
+        let identity_args = semantic_request_arguments(args);
+        let context_args = identity_args.clone();
         let tool = name.to_owned();
         let (normalized_args, prompt) =
             tokio::task::spawn_blocking(move || grounded_prompt(&tool, &context_args, &root))
@@ -721,9 +800,6 @@ impl Gateway {
             .clone()
             .unwrap_or_else(|| request.model.clone());
         let route_validation = crate::routing::validate_route(&request);
-        let request_id = optional(args, "request_id");
-        let key = optional(args, "idempotency_key");
-        let retry = args["retry_same_request"].as_bool().unwrap_or(false);
         let mut metadata = BTreeMap::new();
         if let Some(configured) = &configured {
             metadata.insert("codex_default_model".to_owned(), configured.model.clone());
@@ -734,6 +810,18 @@ impl Gateway {
                 );
             }
         }
+        metadata.insert(
+            "request_identity".to_owned(),
+            provider_request_identity(
+                name,
+                &identity_args,
+                &request,
+                &model,
+                sandbox_mode,
+                duration,
+                max_input_bytes,
+            )?,
+        );
         let new_job = NewJob {
             task_type: name.into(),
             workspace_dir: workspace(args),
@@ -974,6 +1062,131 @@ impl Gateway {
             }
         }
     }
+}
+
+const TRANSPORT_ARGUMENTS: [&str; 5] = [
+    "_background_reserved",
+    "async_background",
+    "idempotency_key",
+    "request_id",
+    "retry_same_request",
+];
+
+const PROVIDER_NORMALIZED_ARGUMENTS: [&str; 9] = [
+    "engine",
+    "max_input_bytes",
+    "model",
+    "claude_model",
+    "provider",
+    "reasoning_effort",
+    "sandbox_mode",
+    "timeout_seconds",
+    "workspace_dir",
+];
+
+const TRIAD_NORMALIZED_ARGUMENTS: [&str; 11] = [
+    "argon_model",
+    "claude_model",
+    "codex_model",
+    "codex_reasoning_effort",
+    "invoke_argon_rpc",
+    "max_input_bytes",
+    "max_rounds",
+    "mode",
+    "run_verification_gates",
+    "timeout_seconds",
+    "workspace_dir",
+];
+
+fn semantic_request_arguments(args: &Value) -> Value {
+    let mut semantic = args.clone();
+    if let Some(object) = semantic.as_object_mut() {
+        for key in TRANSPORT_ARGUMENTS {
+            object.remove(key);
+        }
+    }
+    semantic
+}
+
+fn without_normalized_arguments(args: &Value, normalized: &[&str]) -> Value {
+    let mut semantic = semantic_request_arguments(args);
+    if let Some(object) = semantic.as_object_mut() {
+        for key in normalized {
+            object.remove(*key);
+        }
+    }
+    semantic
+}
+
+fn request_identity_digest(value: &Value) -> crate::Result<String> {
+    let encoded = serde_json::to_vec(value)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+}
+
+fn provider_request_identity(
+    name: &str,
+    args: &Value,
+    request: &RouteRequest,
+    stored_model: &str,
+    sandbox_mode: crate::routing::SandboxMode,
+    duration: Duration,
+    max_input_bytes: usize,
+) -> crate::Result<String> {
+    request_identity_digest(&json!({
+        "tool": name,
+        "arguments": without_normalized_arguments(args, &PROVIDER_NORMALIZED_ARGUMENTS),
+        "route": {
+            "provider": request.provider,
+            "engine": request.engine,
+            "resolved_model": request.model,
+            "stored_model": stored_model,
+            "reasoning_effort": request.effort,
+        },
+        "execution": {
+            "sandbox_mode": sandbox_mode,
+            "timeout_seconds": duration.as_secs_f64(),
+            "max_input_bytes": max_input_bytes,
+        },
+    }))
+}
+
+pub(crate) fn triad_mode(args: &Value) -> String {
+    let mode = optional(args, "mode")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if mode.is_empty() {
+        "pipeline".to_owned()
+    } else {
+        mode
+    }
+}
+
+pub(crate) fn triad_model_set(args: &Value) -> String {
+    format!(
+        "{}+{}+{}",
+        optional(args, "argon_model").unwrap_or_else(|| "gemini-4-argon-high".to_owned()),
+        optional(args, "claude_model").unwrap_or_else(|| "claude-sonnet-5-5-medium".to_owned()),
+        optional(args, "codex_model").unwrap_or_else(|| "gpt-6-astra".to_owned()),
+    )
+}
+
+pub(crate) fn triad_request_identity(args: &Value) -> crate::Result<String> {
+    request_identity_digest(&json!({
+        "tool": "heterarchy_triad_orchestrate",
+        "arguments": without_normalized_arguments(args, &TRIAD_NORMALIZED_ARGUMENTS),
+        "orchestration": {
+            "mode": triad_mode(args),
+            "model_set": triad_model_set(args),
+            "codex_reasoning_effort": optional(args, "codex_reasoning_effort")
+                .unwrap_or_else(|| "xhigh".to_owned()),
+            "invoke_argon_rpc": args["invoke_argon_rpc"].as_bool().unwrap_or(true),
+            "timeout_seconds": args["timeout_seconds"].as_f64().unwrap_or(3600.0),
+            "max_input_bytes": args["max_input_bytes"].as_u64().unwrap_or(256_000),
+            "max_rounds": args["max_rounds"].as_u64().unwrap_or(1).clamp(1, 3),
+            "run_verification_gates": args["run_verification_gates"].as_bool().unwrap_or(false),
+        },
+    }))
 }
 
 fn pending_count(health: &Value, role: &str) -> Value {

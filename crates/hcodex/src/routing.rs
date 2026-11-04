@@ -185,6 +185,9 @@ pub struct Receipt {
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_context_tokens: Option<u64>,
+    /// Local process-group absence observed after owned child completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_processes_closed: Option<bool>,
     pub result_ref: String,
     pub credentials_redacted: bool,
     pub error: Option<String>,
@@ -458,6 +461,7 @@ pub fn new_receipt_with_context(
         tokens_out: 0,
         context_window: None,
         current_context_tokens: None,
+        owned_processes_closed: None,
         credentials_redacted: true,
         error: None,
         failure_reason: None,
@@ -518,6 +522,7 @@ pub fn rejected_receipt(
         tokens_out: 0,
         context_window: None,
         current_context_tokens: None,
+        owned_processes_closed: None,
         result_ref: format!("job://{request_id}"),
         credentials_redacted: true,
         error: Some(message.clone()),

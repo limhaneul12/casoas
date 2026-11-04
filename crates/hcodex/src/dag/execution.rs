@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -56,6 +57,8 @@ pub(crate) struct DagExecutionOptions {
     pub max_input_bytes: u64,
     pub force_serial: bool,
     pub resumed: BTreeMap<String, SettlementReceipt>,
+    pub worktrees: Option<Arc<super::worktrees::WorktreeCampaign>>,
+    pub checkpoints: Option<Arc<super::checkpoint::CheckpointContext>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -138,6 +141,8 @@ pub async fn execute_with_observer(
             max_parallel: DEFAULT_MAX_PARALLEL_NODES,
             max_input_bytes: 256_000,
             force_serial: false,
+            worktrees: None,
+            checkpoints: None,
             resumed: BTreeMap::new(),
         },
         observer,
@@ -161,16 +166,33 @@ pub(crate) async fn execute_with_options(
     let execution_workspace = workspace.clone();
     let execution_observer = observer.clone();
     let max_input_bytes = options.max_input_bytes;
+    let checkpoint_context = options.checkpoints.clone();
+    let worktree_context = if let Some(campaign) = options.worktrees.clone() {
+        let initial = capture(&workspace).await?;
+        campaign.verify_final(&initial).await?;
+        Some((campaign, Arc::new(tokio::sync::Mutex::new(initial))))
+    } else {
+        None
+    };
     let (mut receipts, outputs, aimd_final_concurrency) = execute_ready_nodes(
         &plan,
         options,
         observer,
-        move |node, wave_index, handoffs| {
+        move |mut node, wave_index, handoffs| {
             let gateway = execution_gateway.clone();
             let workspace = execution_workspace.clone();
             let observer = execution_observer.clone();
+            let worktree_context = worktree_context.clone();
+            let checkpoint_context = checkpoint_context.clone();
             async move {
-                let baseline = capture(&workspace).await?;
+                let node_id = node.id.clone();
+                let baseline = if let Some((campaign, expected)) = &worktree_context {
+                    let baseline = expected.lock().await.clone();
+                    campaign.verify_original(&baseline).await?;
+                    baseline
+                } else {
+                    capture(&workspace).await?
+                };
                 if handoffs
                     .iter()
                     .any(|receipt| receipt.state != NodeState::Settled)
@@ -183,20 +205,41 @@ pub(crate) async fn execute_with_options(
                         },
                     )
                     .await;
+                    if let Some(context) = &checkpoint_context {
+                        context.wait(&node_id, timeout).await?;
+                    }
                     return Ok((receipt, json!({"ok": false, "blocked_upstream": true})));
                 }
-                execute_one(
-                    &gateway,
-                    node,
-                    &workspace,
-                    timeout,
-                    max_input_bytes,
-                    wave_index,
-                    &baseline,
-                    &handoffs,
-                    &observer,
-                )
-                .await
+                if let Some(context) = &checkpoint_context {
+                    let inherited = context.inherit(&node, timeout).await?;
+                    node.task.push_str(&inherited);
+                }
+                let result =
+                    if let Some((campaign, expected)) = worktree_context {
+                        let dispatcher = gateway.clone();
+                        super::worktree_execution::execute_node(
+                        node, &workspace, timeout, max_input_bytes, wave_index,
+                        &baseline, &handoffs, &observer, &campaign, &expected,
+                        move |name, args| async move { dispatcher.execute_tool(name, &args).await },
+                    ).await
+                    } else {
+                        execute_one(
+                            &gateway,
+                            node,
+                            &workspace,
+                            timeout,
+                            max_input_bytes,
+                            wave_index,
+                            &baseline,
+                            &handoffs,
+                            &observer,
+                        )
+                        .await
+                    }?;
+                if let Some(context) = &checkpoint_context {
+                    context.wait(&node_id, timeout).await?;
+                }
+                Ok(result)
             }
         },
     )
@@ -414,6 +457,39 @@ async fn execute_one(
     handoffs: &[SettlementReceipt],
     observer: &Option<mpsc::Sender<DagExecutionEvent>>,
 ) -> Result<(SettlementReceipt, Value)> {
+    let dispatcher = gateway.clone();
+    execute_one_with_dispatch(
+        node,
+        workspace,
+        timeout,
+        max_input_bytes,
+        wave_index,
+        wave_baseline,
+        handoffs,
+        observer,
+        false,
+        move |name, args| async move { dispatcher.execute_tool(name, &args).await },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn execute_one_with_dispatch<F, Fut>(
+    node: DagNode,
+    workspace: &Path,
+    timeout: Duration,
+    max_input_bytes: u64,
+    wave_index: usize,
+    wave_baseline: &WorkspaceManifest,
+    handoffs: &[SettlementReceipt],
+    observer: &Option<mpsc::Sender<DagExecutionEvent>>,
+    isolated_build: bool,
+    dispatch: F,
+) -> Result<(SettlementReceipt, Value)>
+where
+    F: FnOnce(&'static str, Value) -> Fut + Send,
+    Fut: Future<Output = Result<Value>> + Send,
+{
     let started = Instant::now();
     emit(
         observer,
@@ -504,7 +580,7 @@ async fn execute_one(
     };
     // The provider runtime owns its timeout and persists that exact outcome. An
     // outer timeout would drop the waiter before that durable write completes.
-    let mut output = match gateway.execute_tool(tool_name(&node), &args).await {
+    let mut output = match dispatch(tool_name(&node), args).await {
         Ok(value) => value,
         Err(error) => json!({"ok": false, "error": error.to_string()}),
     };
@@ -563,6 +639,7 @@ async fn execute_one(
             timeout,
             &pre_gate.digest,
             node.node_kind,
+            isolated_build,
         )
         .await
         {
@@ -607,7 +684,9 @@ async fn execute_one(
     };
     let reproduction_observed = node.node_kind == NodeKind::Reproduction
         && if node.reproduction_expected_exit_nonzero {
-            gate.executed && gate.exit_code.is_some_and(|code| code != 0)
+            gate.executed
+                && gate.stdout_digest.is_some()
+                && gate.exit_code.is_some_and(|code| code != 0)
         } else {
             gate.passed()
         };
@@ -664,7 +743,7 @@ fn dirty_read_files(
         .collect()
 }
 
-fn extract_actual_model(output: &Value) -> Option<String> {
+pub(super) fn extract_actual_model(output: &Value) -> Option<String> {
     [
         "/result/receipt/actual_model",
         "/receipt/actual_model",
@@ -718,12 +797,7 @@ fn node_arguments(
     pre_manifest: &WorkspaceManifest,
     handoffs: &[SettlementReceipt],
 ) -> Result<Value> {
-    let files: Vec<String> = node
-        .read_files
-        .iter()
-        .chain(&node.write_files)
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect();
+    let files = grounded_node_files(node, pre_manifest)?;
     let task = format!("{}{}", node.task, dependency_context(handoffs)?);
     let invariants = "Return structured_output.crafted_code as strict JSON: {\"edits\":[{\"path\":\"declared/relative/path\",\"preimage_sha256\":\"sha256:<exact>\",\"new_content\":\"complete replacement text\"}]}. Unknown fields, omitted preimages, prose, markdown fences, partial snippets, and undeclared paths are rejected. Do not mutate files directly. Each edit's new_content replaces the entire file; use the COMPLETE source blocks in target_code_or_context and preserve all lines and tests outside your intended changes.";
     let contract_value = if node.role == NodeRole::InterfaceBuilder {
@@ -771,6 +845,26 @@ fn node_arguments(
         }
     }
     Ok(args)
+}
+
+/// Ground declared reads and existing write preimages. A write path absent
+/// from the manifest is an intended creation described by the typed patch
+/// contract and complete target context, not an existing source attachment.
+fn grounded_node_files(node: &DagNode, pre_manifest: &WorkspaceManifest) -> Result<Vec<String>> {
+    let mut files = BTreeSet::new();
+    for path in &node.read_files {
+        files.insert(normalize_relative(path)?);
+    }
+    for path in &node.write_files {
+        let relative = normalize_relative(path)?;
+        if pre_manifest.files.contains_key(&relative) {
+            files.insert(relative);
+        }
+    }
+    Ok(files
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect())
 }
 
 fn node_target_context(
@@ -937,7 +1031,7 @@ fn dependency_context(handoffs: &[SettlementReceipt]) -> Result<String> {
     ))
 }
 
-fn extract_patch_artifact(output: &Value) -> Result<PatchArtifact> {
+pub(super) fn extract_patch_artifact(output: &Value) -> Result<PatchArtifact> {
     let crafted = [
         "/result/structured_output/crafted_code",
         "/structured_output/crafted_code",
@@ -953,7 +1047,10 @@ fn extract_patch_artifact(output: &Value) -> Result<PatchArtifact> {
     Ok(serde_json::from_str(trimmed)?)
 }
 
-async fn emit(observer: &Option<mpsc::Sender<DagExecutionEvent>>, event: DagExecutionEvent) {
+pub(super) async fn emit(
+    observer: &Option<mpsc::Sender<DagExecutionEvent>>,
+    event: DagExecutionEvent,
+) {
     if let Some(sender) = observer {
         let _ignored_closed_receiver = sender.send(event).await;
     }
@@ -962,17 +1059,18 @@ async fn emit(observer: &Option<mpsc::Sender<DagExecutionEvent>>, event: DagExec
 static CARGO_GATE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-type GateCacheKey = (PathBuf, String, String);
+type GateCacheKey = (PathBuf, String, String, bool);
 
 static GATE_PROOF_CACHE: std::sync::LazyLock<std::sync::Mutex<BTreeMap<GateCacheKey, GateProof>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
 
-async fn run_gate_for_manifest(
+pub(super) async fn run_gate_for_manifest(
     workspace: &Path,
     requested: Option<&str>,
     timeout: Duration,
     manifest_digest: &str,
     node_kind: NodeKind,
+    isolated_build: bool,
 ) -> Result<GateProof> {
     let command = default_gate_command(workspace, requested);
     let cacheable = node_kind != NodeKind::Reproduction && !manifest_digest.is_empty();
@@ -982,6 +1080,7 @@ async fn run_gate_for_manifest(
             .unwrap_or_else(|_| workspace.to_path_buf()),
         manifest_digest.to_owned(),
         command.clone(),
+        isolated_build,
     );
     if cacheable
         && let Ok(guard) = GATE_PROOF_CACHE.lock()
@@ -1008,8 +1107,15 @@ async fn run_gate_for_manifest(
     {
         return Ok(cached);
     }
-    let mut proof =
-        execute_gate_command(workspace, timeout, command.clone(), program, arguments).await?;
+    let mut proof = execute_gate_command(
+        workspace,
+        timeout,
+        command.clone(),
+        program,
+        arguments,
+        isolated_build,
+    )
+    .await?;
     if cacheable
         && !proof.passed()
         && program == "cargo"
@@ -1021,7 +1127,15 @@ async fn run_gate_for_manifest(
             .await
             .is_ok_and(|after| after.digest == manifest_digest)
     {
-        proof = execute_gate_command(workspace, timeout, command, program, arguments).await?;
+        proof = execute_gate_command(
+            workspace,
+            timeout,
+            command,
+            program,
+            arguments,
+            isolated_build,
+        )
+        .await?;
     }
     if cacheable
         && proof.passed()
@@ -1055,7 +1169,7 @@ async fn run_gate(
     } else {
         None
     };
-    execute_gate_command(workspace, timeout, command, program, arguments).await
+    execute_gate_command(workspace, timeout, command, program, arguments, false).await
 }
 
 fn default_gate_command(workspace: &Path, requested: Option<&str>) -> String {
@@ -1076,16 +1190,22 @@ async fn execute_gate_command(
     command: String,
     program: &str,
     arguments: &[&str],
+    isolated_build: bool,
 ) -> Result<GateProof> {
-    let proof = crate::verification::run(workspace, timeout, program, arguments).await?;
-    let completed = proof.outcome == crate::verification::GateOutcome::Completed;
+    let proof = if isolated_build {
+        crate::verification::run_isolated(workspace, timeout, program, arguments).await?
+    } else {
+        crate::verification::run(workspace, timeout, program, arguments).await?
+    };
+    let completed = proof.outcome == crate::verification::GateOutcome::Completed
+        && proof.owned_processes_closed;
     // Evidence covers both streams without retaining unbounded child output.
     // Hashing the ordered stream digests intentionally replaces raw concatenation.
     let digest = serde_json::to_vec(&[proof.stdout_digest, proof.stderr_digest])?;
     Ok(GateProof {
         command,
         executed: true,
-        exit_code: proof.exit_code,
+        exit_code: if completed { proof.exit_code } else { None },
         stdout_digest: completed.then(|| format!("sha256:{:x}", Sha256::digest(digest))),
     })
 }

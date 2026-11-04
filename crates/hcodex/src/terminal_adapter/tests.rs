@@ -7,6 +7,271 @@ use crate::tui::TuiTheme;
 use std::path::Path;
 
 #[test]
+fn council_file_scope_is_bound_into_the_review_request_without_dispatch() -> crate::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    std::fs::write(workspace.path().join("review.rs"), "fn review() {}\n")?;
+    let request = crate::workbench::parse_council_request(
+        "--file review.rs -- verify current source",
+        workspace.path(),
+    )?;
+    assert_eq!(request["task_spec"], "verify current source");
+    assert_eq!(request["files_inspected"], json!(["review.rs"]));
+    assert_eq!(request["mode"], "council");
+    assert_eq!(request["run_verification_gates"], false);
+    Ok(())
+}
+
+#[test]
+fn organization_views_render_operator_facts_instead_of_raw_json() {
+    let board = json!({"workspace_dir":"/repo","count":2,"items":[
+        {"job_id":"ckp-c1-n1","task_type":"dag_checkpoint","status":"completed","detail":{
+            "kind":"node","node_id":"n1","handoff_status":"available","handoff":{"summary":"kept API stable"}}},
+        {"job_id":"council-1","task_type":"triad_orchestration","status":"completed","detail":{
+            "kind":"review_council","consensus_status":"blocked_by_red_team","review_approved":false}}
+    ]});
+    let board_lines = workboard_summary(&board);
+    assert!(
+        board_lines
+            .iter()
+            .any(|line| line.contains("handoff=available"))
+    );
+    assert!(
+        board_lines
+            .iter()
+            .any(|line| line.contains("blocked_by_red_team"))
+    );
+
+    let votes = json!({"collaboration_id":"council-1","source_status":{"status":"current_scoped"},
+    "historical_review_approved":false,"current_review_approved":false,"ballots":[
+        {"role":"codex","actual_model":"gpt-6.1-sol","verdict":"BLOCK","valid":true,"reason":"verified_role_receipt"}
+    ]});
+    let vote_lines = votes_summary(&votes);
+    assert!(vote_lines[0].contains("current_scoped"));
+    assert!(
+        vote_lines
+            .iter()
+            .any(|line| line.contains("codex · gpt-6.1-sol · BLOCK · valid"))
+    );
+}
+
+#[tokio::test]
+async fn recovery_view_reads_missing_state_without_initializing_or_dispatching() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let parent = tempfile::tempdir()?;
+    let state = parent.path().join("missing-state");
+    let updates = command(
+        workspace.path().to_path_buf(),
+        state.clone(),
+        "/recovery cdx-missing".to_owned(),
+    )
+    .await?;
+    assert!(!state.exists());
+    let body = updates
+        .iter()
+        .find_map(|update| match update {
+            TuiUpdate::View { title, body } if title == "Recovery observations" => Some(body),
+            _ => None,
+        })
+        .ok_or("recovery view missing")?;
+    assert!(body.iter().any(|line| line.contains("missing_database")));
+    assert!(body.iter().any(|line| line.contains("unavailable")));
+    assert!(
+        body.iter()
+            .any(|line| line.contains("Read-only observations"))
+    );
+    for input in ["/recovery", "/recovery one two"] {
+        assert!(
+            command(
+                workspace.path().to_path_buf(),
+                state.clone(),
+                input.to_owned()
+            )
+            .await
+            .is_err()
+        );
+        assert!(!state.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn initial_recovery_admission_follows_registered_skill_rewriting() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let home = tempfile::tempdir()?;
+    let _registry = core_registry(workspace.path(), home.path())?;
+    for input in [
+        "/recovery cdx-missing",
+        " \t/ReCoVeRy \t cdx-missing ",
+        "$codegraph-operator /recovery cdx-missing",
+        "/codegraph-operator /recovery cdx-missing",
+        " \t$codegraph-operator \t/ReCoVeRy \t cdx-missing ",
+        "$codegraph-operator $codex-heterarchy /recovery cdx-missing",
+    ] {
+        assert!(
+            initial_recovery_input(workspace.path(), Some(home.path()), input)?,
+            "{input}"
+        );
+    }
+    for input in [
+        "",
+        "/help",
+        "/argon /recovery cdx-missing",
+        "$unknown /recovery cdx-missing",
+        "/unknown /recovery cdx-missing",
+        "$codegraph-operator explain /recovery cdx-missing",
+        "$codegraph-operator /help",
+    ] {
+        assert!(
+            !initial_recovery_input(workspace.path(), Some(home.path()), input)?,
+            "{input}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn initial_resume_requires_an_existing_session_after_registered_prefix_resolution() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let home = tempfile::tempdir()?;
+    let _registry = core_registry(workspace.path(), home.path())?;
+    for input in [
+        "/resume cdx-prior",
+        " \t/ReSuMe ",
+        "$codegraph-operator /resume cdx-prior",
+        "/codegraph-operator /resume cdx-prior",
+        "/dag-run --resume cdx-prior",
+        "/dag-run --live --resume cdx-prior",
+        "/dag --worktree --resume cdx-prior",
+        "/dag-mode --resume cdx-prior",
+        "$codegraph-operator /dag-run --resume cdx-prior",
+    ] {
+        assert!(
+            initial_existing_session_input(workspace.path(), Some(home.path()), input)?,
+            "{input}"
+        );
+    }
+    for input in [
+        "",
+        "/dag-mode",
+        "/dag-run improve resume documentation",
+        "$unknown /resume cdx-prior",
+        "$codegraph-operator explain /resume cdx-prior",
+    ] {
+        assert!(
+            !initial_existing_session_input(workspace.path(), Some(home.path()), input)?,
+            "{input}"
+        );
+    }
+    assert!(
+        initial_existing_session_input(
+            workspace.path(),
+            Some(home.path()),
+            "/dag-run --resume cdx-prior replacement goal"
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_flags_never_regenerate_a_plan_from_replacement_goals() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let parent = tempfile::tempdir()?;
+    let state = parent.path().join("not-created");
+    for input in [
+        "/dag-run --resume cdx-prior replacement goal",
+        "/dag-run --resume",
+        "/dag-run --worktree --resume cdx-prior",
+        "/dag-ulw --plan-only --resume cdx-prior",
+        "/resume one two",
+    ] {
+        assert!(
+            command(
+                workspace.path().to_path_buf(),
+                state.clone(),
+                input.to_owned()
+            )
+            .await
+            .is_err(),
+            "{input}"
+        );
+        assert!(!state.exists(), "{input}");
+    }
+    Ok(())
+}
+
+#[test]
+fn recovery_view_separates_observation_from_history_and_omits_raw_payloads() {
+    let report = json!({
+        "job_id":"cdx-campaign", "observation":"observed", "reason":"job_observed",
+        "job":{"status":"timed_out_unknown","outcome_state":"unknown","model":"gpt-6.1-sol",
+            "error":"secret raw provider error", "result":{"prompt":"secret prompt"}},
+        "worktrees":{"observation":"observed","reason":"lifecycle_observed","state_path":"/state/worktrees/one",
+            "nodes":[{"node_id":"node\u{1b}[31m", "observation":"unknown", "filesystem":"missing",
+                "git_registration":"registered", "recorded_verified":true,"recorded_removed":false,
+                "path":"/state/worktrees/one/node"}]}
+    });
+    let body = recovery_summary(&report).join("\n");
+    assert!(body.contains("timed_out_unknown"));
+    assert!(body.contains("observed=unknown · path=missing · Git=registered"));
+    assert!(body.contains("Recorded only · verified=true · removed=false"));
+    assert!(!body.contains("secret"));
+    assert!(!body.contains('\u{1b}'));
+}
+
+#[tokio::test]
+async fn named_session_dag_preparation_selects_worktree_without_goal_flag() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::write(root.path().join("module.rs"), "pub fn module() {}\n")?;
+    let handler = AppHandler::new(
+        Gateway::new(root.path().join("state")),
+        root.path().to_path_buf(),
+    )?;
+    let request =
+        json!({"campaign_goal":"audit module","workspace_dir":root.path(),"plan_only":false});
+    let normal = handler.prepare_execution_request(&request, false).await?;
+    assert_eq!(normal["spawn_plan"]["isolation_mode"], "direct");
+    let named = handler
+        .clone()
+        .with_worktree_default(true)
+        .prepare_execution_request(&request, false)
+        .await?;
+    assert_eq!(named["spawn_plan"]["isolation_mode"], "worktree");
+    assert_eq!(named["spawn_plan"]["hazard_acknowledgment"], true);
+    assert_eq!(
+        handler.prepare_execution_request(&request, true).await?["spawn_plan"]["isolation_mode"],
+        "worktree"
+    );
+    Ok(())
+}
+
+#[test]
+fn worktree_flag_is_a_mode_before_goal_planning_only_when_explicit() {
+    assert_eq!(
+        worktree_goal(" --worktree audit source "),
+        ("audit source".into(), true)
+    );
+    assert_eq!(worktree_goal("--worktree\taudit"), ("audit".into(), true));
+    assert_eq!(worktree_goal("--worktree"), (String::new(), true));
+    assert_eq!(
+        worktree_goal("--worktree --resume cdx-example audit"),
+        ("--resume cdx-example audit".into(), true)
+    );
+    assert_eq!(
+        worktree_goal(" audit source "),
+        ("audit source".into(), false)
+    );
+    assert_eq!(
+        worktree_goal("audit --worktree source"),
+        ("audit --worktree source".into(), false)
+    );
+    assert_eq!(
+        worktree_goal("--worktrees audit"),
+        ("--worktrees audit".into(), false)
+    );
+}
+
+#[test]
 fn human_provider_output_uses_actual_code_or_summary_before_raw_envelopes() {
     assert_eq!(
         response_text(
@@ -944,15 +1209,26 @@ fn effect_permissions_and_theme_are_typed_and_validated() -> crate::Result<()> {
 #[test]
 fn persisted_dag_result_recovers_resume_identity() {
     let value = json!({
-        "jobs": [{
-            "job_id": "dag-1",
-            "task_type": "dag_ulw",
-            "result": {"compiled_plan": {"goal": "resume exact campaign"}}
-        }]
+        "jobs": [
+            {"job_id":"export","task_type":"dag_worktree_export","workspace_dir":"/repo",
+                "result":{"compiled_plan":{"goal":"not a campaign"}}},
+            {"job_id":"preview","task_type":"dag_ulw","workspace_dir":"/repo","result":{"plan_only":true}},
+            {"job_id":"foreign","task_type":"dag_ulw","workspace_dir":"/foreign"},
+            {"job_id":"ckp-dag-1-plan","task_type":"dag_checkpoint","status":"completed",
+                "workspace_dir":"/repo","metadata":{"campaign_id":"dag-1","checkpoint_kind":"plan"},
+                "result":{"plan":{"goal":"resume exact campaign"}}}
+        ]
     });
     assert_eq!(
-        latest_dag_checkpoint(&value),
-        Some(("dag-1".to_owned(), "resume exact campaign".to_owned()))
+        latest_dag_checkpoint(&value, Path::new("/repo")),
+        Some("dag-1".to_owned())
+    );
+    assert_eq!(
+        latest_dag_checkpoint(
+            &json!({"jobs":[{"job_id":"dag-2","task_type":"dag_ulw","workspace_dir":"/repo","status":"timed_out_unknown"}]}),
+            Path::new("/repo")
+        ),
+        Some("dag-2".to_owned())
     );
 }
 

@@ -7,6 +7,88 @@ use crate::context::SkillRegistry;
 use std::process::Stdio;
 
 #[test]
+fn request_identity_ignores_transport_and_binds_semantics() -> crate::Result<()> {
+    let first = json!({
+        "task_spec":"review identity", "target_code_or_diff":"fn first() {}",
+        "workspace_dir":"/tmp/workspace", "model":"gpt-6.1-sol",
+        "request_id":"cdx-first", "idempotency_key":"key-first",
+        "retry_same_request":false, "async_background":false,
+    });
+    let mut second = first.clone();
+    second["request_id"] = Value::String("cdx-second".to_owned());
+    second["idempotency_key"] = Value::String("key-second".to_owned());
+    second["retry_same_request"] = Value::Bool(true);
+    second["async_background"] = Value::Bool(true);
+    second["_background_reserved"] = Value::Bool(true);
+    assert_eq!(
+        triad_request_identity(&first)?,
+        triad_request_identity(&second)?
+    );
+    second["target_code_or_diff"] = Value::String("fn changed() {}".to_owned());
+    assert_ne!(
+        triad_request_identity(&first)?,
+        triad_request_identity(&second)?
+    );
+
+    let route = build_route_request("codex_adversarial_audit", &first, "prompt".to_owned())?;
+    let first_provider = provider_request_identity(
+        "codex_adversarial_audit",
+        &first,
+        &route,
+        "gpt-6.1-sol",
+        crate::routing::SandboxMode::ReadOnly,
+        Duration::from_secs(30),
+        256_000,
+    )?;
+    let mut transport_changed = first.clone();
+    transport_changed["request_id"] = Value::String("cdx-other".to_owned());
+    transport_changed["async_background"] = Value::Bool(true);
+    assert_eq!(
+        first_provider,
+        provider_request_identity(
+            "codex_adversarial_audit",
+            &transport_changed,
+            &route,
+            "gpt-6.1-sol",
+            crate::routing::SandboxMode::ReadOnly,
+            Duration::from_secs(30),
+            256_000,
+        )?
+    );
+    let mut explicit_defaults = first.clone();
+    explicit_defaults["timeout_seconds"] = json!(30.0);
+    explicit_defaults["max_input_bytes"] = json!(256_000);
+    explicit_defaults["sandbox_mode"] = Value::String("read-only".to_owned());
+    assert_eq!(
+        first_provider,
+        provider_request_identity(
+            "codex_adversarial_audit",
+            &explicit_defaults,
+            &route,
+            "gpt-6.1-sol",
+            crate::routing::SandboxMode::ReadOnly,
+            Duration::from_secs(30),
+            256_000,
+        )?
+    );
+    let mut semantic_changed = first;
+    semantic_changed["target_code_or_diff"] = Value::String("fn changed() {}".to_owned());
+    assert_ne!(
+        first_provider,
+        provider_request_identity(
+            "codex_adversarial_audit",
+            &semantic_changed,
+            &route,
+            "gpt-6.1-sol",
+            crate::routing::SandboxMode::ReadOnly,
+            Duration::from_secs(30),
+            256_000,
+        )?
+    );
+    Ok(())
+}
+
+#[test]
 fn source_attachments_are_grounded_and_canonicalized_for_evidence() -> crate::Result<()> {
     let workspace = tempfile::tempdir()?;
     std::fs::create_dir(workspace.path().join("space dir"))?;

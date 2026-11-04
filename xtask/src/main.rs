@@ -176,8 +176,13 @@ fn help() {
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for ancestor in manifest_dir.ancestors().skip(1) {
+    let current = std::env::current_dir()
+        .map_err(|error| format!("working directory unavailable: {error}"))?;
+    workspace_root_from(&current)
+}
+
+fn workspace_root_from(current: &Path) -> Result<PathBuf, String> {
+    for ancestor in current.ancestors() {
         let path = ancestor.join("Cargo.toml");
         if path.is_file() && read_toml(&path)?.get("workspace").is_some() {
             return Ok(ancestor.to_path_buf());
@@ -185,7 +190,7 @@ fn workspace_root() -> Result<PathBuf, String> {
     }
     Err(format!(
         "could not locate workspace root above {}",
-        manifest_dir.display()
+        current.display()
     ))
 }
 
@@ -641,6 +646,29 @@ fn verify_manifest(root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_working_directory_selects_nearest_workspace() -> Result<(), String> {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("hcodex-xtask-{}-{suffix}", std::process::id()));
+        let child = root.join("isolated/xtask");
+        fs::create_dir_all(&child).map_err(|e| e.to_string())?;
+        fs::write(root.join("Cargo.toml"), "[workspace]\nmembers=[]\n")
+            .map_err(|e| e.to_string())?;
+        fs::write(
+            root.join("isolated/Cargo.toml"),
+            "[workspace]\nmembers=[]\n",
+        )
+        .map_err(|e| e.to_string())?;
+        let selected = workspace_root_from(&child);
+        fs::remove_dir_all(&root).map_err(|e| e.to_string())?;
+        assert_eq!(selected?, root.join("isolated"));
+        Ok(())
+    }
 
     #[test]
     fn uses_rustup_for_pin() {

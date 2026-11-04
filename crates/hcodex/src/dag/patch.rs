@@ -65,6 +65,40 @@ pub(crate) fn apply_scoped_patch_with_rollback(
     pre_manifest: &WorkspaceManifest,
     artifact: &PatchArtifact,
 ) -> Result<AppliedScopedPatch> {
+    apply_scoped_patch_inner(
+        root,
+        declared_write_files,
+        pre_manifest,
+        artifact,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn apply_scoped_patch_observed(
+    root: &Path,
+    declared_write_files: &[PathBuf],
+    pre_manifest: &WorkspaceManifest,
+    artifact: &PatchArtifact,
+    observer: &dyn Fn(&'static str),
+) -> Result<AppliedScopedPatch> {
+    apply_scoped_patch_inner(
+        root,
+        declared_write_files,
+        pre_manifest,
+        artifact,
+        Some(observer),
+    )
+}
+
+fn apply_scoped_patch_inner(
+    root: &Path,
+    declared_write_files: &[PathBuf],
+    pre_manifest: &WorkspaceManifest,
+    artifact: &PatchArtifact,
+    #[cfg(test)] observer: Option<&dyn Fn(&'static str)>,
+) -> Result<AppliedScopedPatch> {
     if artifact.edits.is_empty() {
         return Err("patch artifact contains no edits".into());
     }
@@ -130,10 +164,19 @@ pub(crate) fn apply_scoped_patch_with_rollback(
             permissions: metadata.map(|value| value.permissions()),
         });
     }
-    apply_validated(&root, validated)
+    apply_validated(
+        &root,
+        validated,
+        #[cfg(test)]
+        observer,
+    )
 }
 
-fn apply_validated(root: &Path, edits: Vec<ValidatedEdit>) -> Result<AppliedScopedPatch> {
+fn apply_validated(
+    root: &Path,
+    edits: Vec<ValidatedEdit>,
+    #[cfg(test)] observer: Option<&dyn Fn(&'static str)>,
+) -> Result<AppliedScopedPatch> {
     let mut staged = Vec::new();
     for (index, edit) in edits.iter().enumerate() {
         let temporary = temporary_path(root, &edit.path, index, "apply")?;
@@ -143,6 +186,10 @@ fn apply_validated(root: &Path, edits: Vec<ValidatedEdit>) -> Result<AppliedScop
             return Err(error);
         }
         staged.push(temporary);
+    }
+    #[cfg(test)]
+    if let Some(observer) = observer {
+        observer("staged");
     }
     let mut committed = Vec::new();
     for (index, edit) in edits.iter().enumerate() {
@@ -158,6 +205,12 @@ fn apply_validated(root: &Path, edits: Vec<ValidatedEdit>) -> Result<AppliedScop
             };
         }
         committed.push(index);
+        #[cfg(test)]
+        if committed.len() < edits.len()
+            && let Some(observer) = observer
+        {
+            observer("partial_publication");
+        }
     }
     let changed_paths = edits.iter().map(|edit| edit.path.clone()).collect();
     Ok(AppliedScopedPatch {

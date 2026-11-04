@@ -1019,7 +1019,11 @@ async fn run_codex_process(
         }
     };
     let status = match wait_outcome {
-        WaitOutcome::Completed(result) => result?,
+        WaitOutcome::Completed(Ok(status)) => status,
+        WaitOutcome::Completed(Err(error)) => {
+            terminate_process_group(&mut child, process_group).await?;
+            return Err(error.into());
+        }
         WaitOutcome::TimedOut => {
             terminate_process_group(&mut child, process_group).await?;
             receipt.duration_ms = millis(started.elapsed());
@@ -1036,6 +1040,8 @@ async fn run_codex_process(
             return Ok(empty_result(receipt));
         }
     };
+    receipt.owned_processes_closed =
+        Some(crate::verification::owned_process_group_closed(process_group).await);
     receipt.duration_ms = millis(started.elapsed());
     let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
     let auth_diagnostics = classify_stderr_auth(&String::from_utf8_lossy(&stderr_bytes));

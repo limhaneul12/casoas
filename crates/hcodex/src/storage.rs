@@ -1,5 +1,6 @@
 //! Durable SQLite storage and SQL boundary defenses.
 
+pub(crate) mod diagnostics;
 mod domain;
 mod sql;
 mod store;

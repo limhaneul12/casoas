@@ -14,12 +14,14 @@ use tokio::process::{Child, Command};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GateOutcome {
     Completed,
+    OwnedProcessesRemain,
     TimedOut,
     Cancelled,
 }
 
 #[derive(Debug)]
 pub(crate) struct ProcessProof {
+    pub owned_processes_closed: bool,
     pub outcome: GateOutcome,
     pub exit_code: Option<i32>,
     pub duration_seconds: f64,
@@ -33,7 +35,29 @@ pub(crate) async fn run(
     program: &str,
     arguments: &[&str],
 ) -> crate::Result<ProcessProof> {
+    run_profile(workspace, limit, program, arguments, false).await
+}
+
+pub(crate) async fn run_isolated(
+    workspace: &Path,
+    limit: Duration,
+    program: &str,
+    arguments: &[&str],
+) -> crate::Result<ProcessProof> {
+    run_profile(workspace, limit, program, arguments, true).await
+}
+
+async fn run_profile(
+    workspace: &Path,
+    limit: Duration,
+    program: &str,
+    arguments: &[&str],
+    isolated_build: bool,
+) -> crate::Result<ProcessProof> {
     let mut process = Command::new(program);
+    if isolated_build {
+        process.env("CARGO_TARGET_DIR", workspace.join("target"));
+    }
     process
         .env("PATH", crate::runtime::enriched_command_path())
         .args(arguments)
@@ -96,7 +120,89 @@ pub(crate) async fn run(
             )
         }
     };
-    Ok(proof(outcome, exit_code, started, stdout_hash, stderr_hash))
+    let mut proof = proof(outcome, exit_code, started, stdout_hash, stderr_hash);
+    proof.owned_processes_closed = owned_process_group_closed(process_group).await;
+    if proof.outcome == GateOutcome::Completed && !proof.owned_processes_closed {
+        proof.outcome = GateOutcome::OwnedProcessesRemain;
+    }
+    proof.duration_seconds = started.elapsed().as_secs_f64();
+    Ok(proof)
+}
+
+/// Positive absence observation for the exact group created by this process.
+/// Errors, unsupported platforms and truncated process inventories are unproven.
+pub(crate) async fn owned_process_group_closed(group: Option<u32>) -> bool {
+    #[cfg(not(unix))]
+    {
+        let _ = group;
+        false
+    }
+    #[cfg(unix)]
+    {
+        let Some(group) = group else {
+            return false;
+        };
+        let mut command = Command::new("/bin/ps");
+        command
+            .args(["-axo", "pgid="])
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let Ok(mut child) = command.spawn() else {
+            return false;
+        };
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return false;
+        };
+        const MAX_OUTPUT: u64 = 256 * 1024;
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut stdout = stdout.take(MAX_OUTPUT + 1);
+        let mut stderr = stderr.take(4097);
+        let operation = async {
+            let (status, _, _) = tokio::try_join!(
+                child.wait(),
+                stdout.read_to_end(&mut out),
+                stderr.read_to_end(&mut err),
+            )?;
+            Ok::<_, std::io::Error>(status)
+        };
+        let observed = tokio::time::timeout(Duration::from_secs(5), operation).await;
+        if !matches!(observed, Ok(Ok(status)) if status.success()) {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return false;
+        }
+        if !err.is_empty() {
+            return false;
+        }
+        inventory_proves_group_absent(&out, group)
+    }
+}
+
+#[cfg(unix)]
+fn inventory_proves_group_absent(output: &[u8], group: u32) -> bool {
+    if output.len() > 256 * 1024 {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(output) else {
+        return false;
+    };
+    let mut rows = 0;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(found) = line.trim().parse::<u32>() else {
+            return false;
+        };
+        rows += 1;
+        if found == group {
+            return false;
+        }
+    }
+    rows > 0
 }
 
 fn proof(
@@ -107,6 +213,7 @@ fn proof(
     stderr_hash: Sha256,
 ) -> ProcessProof {
     ProcessProof {
+        owned_processes_closed: false,
         outcome,
         exit_code,
         duration_seconds: started.elapsed().as_secs_f64(),
@@ -129,7 +236,10 @@ async fn hash_stream<R: AsyncRead + Unpin>(
     }
 }
 
-async fn terminate_and_reap(child: &mut Child, process_group: Option<u32>) -> crate::Result<()> {
+pub(crate) async fn terminate_and_reap(
+    child: &mut Child,
+    process_group: Option<u32>,
+) -> crate::Result<()> {
     #[cfg(unix)]
     if let Some(pid) = process_group {
         let group = format!("-{pid}");
@@ -213,6 +323,7 @@ mod tests {
         )
         .await?;
         assert_eq!(result.outcome, GateOutcome::Completed);
+        assert!(result.owned_processes_closed);
         assert_eq!(result.exit_code, Some(0));
         assert_eq!(
             result.stdout_digest,
@@ -222,6 +333,49 @@ mod tests {
             result.stderr_digest,
             format!("sha256:{:x}", Sha256::digest(b"stderr"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn group_inventory_requires_complete_valid_positive_observation() {
+        assert!(inventory_proves_group_absent(b" 1\n2\n", 3));
+        assert!(!inventory_proves_group_absent(b"1\n2\n", 2));
+        assert!(!inventory_proves_group_absent(b"", 3));
+        assert!(!inventory_proves_group_absent(b"1\nPGID\n", 3));
+        assert!(!inventory_proves_group_absent(b"\xff", 3));
+        assert!(!inventory_proves_group_absent(&b"1\n".repeat(131_073), 3));
+    }
+
+    #[tokio::test]
+    async fn completed_gate_with_detached_stdio_descendant_is_not_completed_proof()
+    -> crate::Result<()> {
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Ok(body) = std::fs::read_to_string(&self.0)
+                    && let Ok(pid) = body.trim().parse::<u32>()
+                {
+                    let _ = std::process::Command::new("/bin/kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status();
+                }
+            }
+        }
+        let root = tempfile::tempdir()?;
+        let _owned_background = Cleanup(root.path().join("background-pid"));
+        let proof = run(
+            root.path(),
+            Duration::from_secs(5),
+            "sh",
+            &[
+                "-c",
+                "sleep 30 </dev/null >/dev/null 2>&1 & printf '%s' \"$!\" > background-pid; exit 0",
+            ],
+        )
+        .await?;
+        assert_eq!(proof.exit_code, Some(0));
+        assert!(!proof.owned_processes_closed);
+        assert_eq!(proof.outcome, GateOutcome::OwnedProcessesRemain);
         Ok(())
     }
 

@@ -7,6 +7,83 @@ use tokio::net::TcpListener;
 
 use super::{control, control_with_refresh};
 
+#[tokio::test]
+async fn identity_status_preserves_legacy_registry_and_source_scope() -> crate::Result<()> {
+    let repository = tempdir()?;
+    let home = tempdir()?;
+    let binary = seed_repository(repository.path())?;
+    fs::create_dir_all(repository.path().join("src"))?;
+    fs::write(
+        repository.path().join("src/lib.rs"),
+        "const SECRET: &str = \"PRIVATE_SOURCE_BODY\";\n",
+    )?;
+    for args in [
+        vec!["init", "-q"],
+        vec!["add", "src/lib.rs"],
+        vec![
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .env_clear()
+            .env("PATH", crate::runtime::enriched_command_path())
+            .env("HOME", home.path())
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args([
+                "--no-optional-locks",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.fsmonitor=false",
+            ])
+            .args(args)
+            .current_dir(repository.path())
+            .output()?;
+        assert!(output.status.success());
+    }
+    let registry = home.path().join(".cache/hcodex/owned-mcp-processes.json");
+    fs::create_dir_all(registry.parent().ok_or("registry parent missing")?)?;
+    let legacy = serde_json::to_vec(&serde_json::json!([{
+        "pid":std::process::id(), "executable":binary,
+        "arguments":["mcp"], "start_identity":"old-or-reused-pid",
+        "registered_at_unix_ms":0
+    }]))?;
+    fs::write(&registry, &legacy)?;
+    let status = control("status", repository.path(), home.path()).await?;
+    assert_eq!(status["runtime_identity"]["source"]["state"], "observed");
+    assert_eq!(
+        status["runtime_identity"]["registered_mcp"][0]["state"],
+        "unknown"
+    );
+    assert!(status["runtime_identity"]["registered_mcp"][0]["recorded_binary_sha256"].is_null());
+    assert_eq!(
+        status["runtime_identity"]["verification"]["source_to_binary"],
+        "unverified"
+    );
+    assert_eq!(fs::read(&registry)?, legacy);
+    assert!(!serde_json::to_string(&status)?.contains("PRIVATE_SOURCE_BODY"));
+    fs::write(
+        repository.path().join("src/lib.rs"),
+        "pub const CHANGED: bool = true;\n",
+    )?;
+    let changed = control("status", repository.path(), home.path()).await?;
+    assert_eq!(changed["runtime_identity"]["source"]["dirty"], true);
+    assert_ne!(
+        status["runtime_identity"]["source"]["manifest_digest"],
+        changed["runtime_identity"]["source"]["manifest_digest"]
+    );
+    assert_eq!(fs::read(&registry)?, legacy);
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn setup_migrates_shadowing_python_launcher_and_preserves_custom_commands()

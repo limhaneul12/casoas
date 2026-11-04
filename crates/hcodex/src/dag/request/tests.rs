@@ -167,6 +167,7 @@ async fn checkpoint_storage_failure_signals_the_owned_campaign() -> Result<()> {
                 "plan".to_owned(),
                 "config".to_owned(),
                 None,
+                None,
             );
             let failure =
                 cancel_on_checkpoint_failure(&owner, "cdx-checkpoint-failure", persisting);
@@ -275,6 +276,7 @@ async fn settled_node_events_are_persisted_as_campaign_checkpoints() -> Result<(
         "plan-a".to_owned(),
         "config-a".to_owned(),
         Some(observer),
+        None,
     ));
     // The deliberately full observer must not prevent durable settlement.
     let persistence = tokio::time::timeout(Duration::from_secs(10), async {
@@ -290,6 +292,11 @@ async fn settled_node_events_are_persisted_as_campaign_checkpoints() -> Result<(
     let _previous = observed.recv().await;
     persisting.await??;
     persistence??;
+    let delivered = observed
+        .recv()
+        .await
+        .ok_or("settlement notification lost")?;
+    assert!(matches!(delivered, DagExecutionEvent::NodeSettled { .. }));
     let jobs = gateway
         .database(move |store| store.list_jobs(10, None))
         .await?;

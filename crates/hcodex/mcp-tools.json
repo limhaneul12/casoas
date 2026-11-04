@@ -1273,7 +1273,16 @@
     "title": null,
     "description": "Check health, verified routability, and independent auth boundaries of the bridge.\n\nReturns:\n    Pretty-printed JSON string reporting bridge health and routing contracts.\n",
     "inputSchema": {
-      "properties": {},
+      "properties": {
+        "workspace_dir": {
+          "anyOf": [
+            { "type": "string", "maxLength": 4096 },
+            { "type": "null" }
+          ],
+          "default": null,
+          "description": "Workspace for scoped source identity; defaults to the server working directory."
+        }
+      },
       "title": "codex_bridge_healthArguments",
       "type": "object"
     },
@@ -1841,7 +1850,7 @@
   {
     "name": "heterarchy_dag_ulw",
     "title": null,
-    "description": "Compile and execute a Tri-Polar Graph Engineering (`DAG-ULW++`) campaign.\n\nCompiles a DAG of nodes (`topology_planner`, `reproduction_prober`, `interface_contractor`,\n`disjoint_builder`, `adversarial_auditor`, `verification_fan_in`) into Kahn topological waves,\nchecks WAW/RAW and CodeGraph 1-hop symbol hazards, enforces `SpawnPlanGate`, and dispatches dependency-ready nodes with bounded concurrency, exclusive shared-workspace writes,\nand two-stage settlement (`STOPPED != SETTLED` with full-workspace\nSHA-256 `WorkspaceManifest` verification).\n\nArgs:\n    campaign_goal: High-level engineering objective for the DAG campaign.\n    nodes: Optional list of node specification dictionaries (`DagNodeInputModel`).\n    workspace_dir: Target workspace directory path.\n    plan_only: If True, compile waves, hazards, and ASCII graph without executing nodes.\n    spawn_plan: Optional spawn plan acknowledgment dictionary (`DagSpawnPlanInputModel`).\n    resume_dag_id: Optional prior DAG campaign ID (`cdx-...`) to resume settled nodes from.\n    timeout_seconds: Per-node execution timeout budget in seconds.\n    max_input_bytes: Maximum UTF-8 prompt byte budget per node.\n    request_id: Optional caller-supplied campaign identifier (`cdx-...`).\n    idempotency_key: Optional idempotency key for deduplicating campaign persistence.\n\nReturns:\n    Pretty-printed JSON string containing the `DagUlwResponseDict` payload.\n",
+    "description": "Compile and execute a Tri-Polar Graph Engineering (`DAG-ULW++`) campaign.\n\nCompiles a DAG of nodes (`topology_planner`, `reproduction_prober`, `interface_contractor`,\n`disjoint_builder`, `adversarial_auditor`, `verification_fan_in`) into Kahn topological waves,\nchecks WAW/RAW and CodeGraph 1-hop symbol hazards, enforces `SpawnPlanGate`, and dispatches dependency-ready nodes with bounded concurrency, exclusive shared-workspace writes,\nand two-stage settlement (`STOPPED != SETTLED` with full-workspace\nSHA-256 `WorkspaceManifest` verification).\n\nArgs:\n    campaign_goal: High-level engineering objective for the DAG campaign.\n    nodes: Optional list of node specification dictionaries (`DagNodeInputModel`).\n    workspace_dir: Target workspace directory path.\n    plan_only: If True, compile waves, hazards, and ASCII graph without executing nodes.\n    spawn_plan: Optional spawn plan acknowledgment dictionary (`DagSpawnPlanInputModel`). Use isolation_mode=worktree for explicit per-node detached worktrees; the original checkout must be clean including staged, unstaged, and untracked files. All worktrees are created before dispatch. Cleanup follows verified canonical integration, durable results and owned-process closure; uncertain work is retained. Existing direct/serial modes remain available with no silent fallback.\n    resume_dag_id: Optional prior DAG campaign ID (`cdx-...`) to resume settled nodes from.\n    timeout_seconds: Per-node execution timeout budget in seconds.\n    max_input_bytes: Maximum UTF-8 prompt byte budget per node.\n    request_id: Optional caller-supplied campaign identifier (`cdx-...`).\n    idempotency_key: Optional idempotency key for deduplicating campaign persistence.\n\nReturns:\n    Pretty-printed JSON string containing the `DagUlwResponseDict` payload.\n",
     "inputSchema": {
       "$defs": {
         "JsonObject": {

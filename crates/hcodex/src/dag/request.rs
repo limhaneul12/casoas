@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -12,11 +13,16 @@ use crate::Result;
 use crate::gateway::Gateway;
 use crate::storage::NewJob;
 
+use super::checkpoint::CheckpointContext;
 use super::execution::{DagExecutionEvent, DagExecutionOptions, execute_with_options};
+use super::handoff::AgentReport;
 use super::{
     DagNode, DagPlan, DagPlanner, DagSettlementVerifier, HazardKind, NodeKind, NodeRole, NodeState,
     SettlementReceipt,
 };
+
+mod resume;
+pub use resume::{PreparedResume, prepare_resume_request};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,6 +85,7 @@ enum IsolationMode {
     #[default]
     Direct,
     Serial,
+    Worktree,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -126,6 +133,32 @@ pub async fn handle_request_with_observer(
     args: &Value,
     observer: Option<mpsc::Sender<DagExecutionEvent>>,
 ) -> Result<Value> {
+    handle_request_inner(
+        gateway,
+        args,
+        observer,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(super) async fn handle_request_with_worktree_hook(
+    gateway: &Gateway,
+    args: &Value,
+    observer: Option<mpsc::Sender<DagExecutionEvent>>,
+    control: super::worktrees::TestControl,
+) -> Result<Value> {
+    handle_request_inner(gateway, args, observer, Some(control)).await
+}
+
+async fn handle_request_inner(
+    gateway: &Gateway,
+    args: &Value,
+    observer: Option<mpsc::Sender<DagExecutionEvent>>,
+    #[cfg(test)] test_control: Option<super::worktrees::TestControl>,
+) -> Result<Value> {
     let request: DagRequest = serde_json::from_value(args.clone())?;
     validate_request(&request)?;
     if !request.plan_only {
@@ -138,17 +171,45 @@ pub async fn handle_request_with_observer(
         }
     }
     let workspace = request.workspace_dir.canonicalize()?;
+    let worktree_mode = request
+        .spawn_plan
+        .as_ref()
+        .is_some_and(|spawn| matches!(spawn.isolation_mode, IsolationMode::Worktree));
+    if worktree_mode && !request.plan_only {
+        super::worktrees::validate_source_budget(&workspace)?;
+    }
+    let config_identity = resume::config_identity(&request)?;
+    if worktree_mode
+        && !request.plan_only
+        && let Some(result) =
+            resume::early_worktree_readback(gateway, &request, &workspace, &config_identity).await?
+    {
+        return Ok(result);
+    }
     let planning_workspace = workspace.clone();
     let goal = request.campaign_goal.clone();
     let nodes = request
         .nodes
         .as_ref()
         .map(|nodes| nodes.iter().map(convert_node).collect());
-    let mut plan = tokio::task::spawn_blocking(move || match nodes {
-        Some(nodes) => DagPlanner::compile_with_workspace(&goal, nodes, &planning_workspace),
-        None => DagPlanner::generate(&goal, &planning_workspace),
-    })
-    .await??;
+    let mut plan = if worktree_mode && request.resume_dag_id.is_some() {
+        let (_, plan, _) = resume::load_plan(
+            gateway,
+            &workspace,
+            request
+                .resume_dag_id
+                .as_deref()
+                .ok_or("resume source missing")?,
+        )
+        .await?;
+        plan
+    } else {
+        tokio::task::spawn_blocking(move || match nodes {
+            Some(nodes) => DagPlanner::compile_with_workspace(&goal, nodes, &planning_workspace),
+            None => DagPlanner::generate(&goal, &planning_workspace),
+        })
+        .await??
+    };
     let force_serial = request
         .spawn_plan
         .as_ref()
@@ -163,25 +224,29 @@ pub async fn handle_request_with_observer(
         plan.blocking_hazards_count = plan.hazards.len();
     }
     let plan_identity = digest_json(&plan)?;
-    let config_identity = digest_json(&json!({
-        "campaign_goal": request.campaign_goal,
-        "nodes": request.nodes,
-        "spawn_plan": request.spawn_plan,
-        "max_input_bytes": request.max_input_bytes,
-    }))?;
     let initial_workspace = workspace.clone();
     let initial_manifest =
         tokio::task::spawn_blocking(move || DagSettlementVerifier::capture(&initial_workspace))
             .await??;
-    let resumed = load_resume(
-        gateway,
-        request.resume_dag_id.as_deref(),
-        &workspace,
-        &plan_identity,
-        &config_identity,
-        &initial_manifest.digest,
-    )
-    .await?;
+    let (retained_worktrees, resumed) = if worktree_mode && request.resume_dag_id.is_some() {
+        let (campaign, receipts) =
+            resume::reopen_worktrees(gateway, &request, &workspace, &plan, &config_identity)
+                .await?;
+        (Some(campaign), receipts)
+    } else {
+        (
+            None,
+            load_resume(
+                gateway,
+                request.resume_dag_id.as_deref(),
+                &workspace,
+                &plan_identity,
+                &config_identity,
+                &initial_manifest.digest,
+            )
+            .await?,
+        )
+    };
     let resumed_nodes: Vec<String> = resumed.keys().cloned().collect();
     let registration = register_campaign(
         gateway,
@@ -199,11 +264,79 @@ pub async fn handle_request_with_observer(
             .ok_or_else(|| "deduplicated DAG campaign has no persisted result".into());
     }
     let dag_id = registration.0.job_id;
+    // Validate the durable handoff contract and historical resume input before
+    // creating worktrees or admitting any provider effects.
+    let checkpoint_context = if !request.plan_only && plan.is_executable() {
+        let context = CheckpointContext::new(
+            gateway.clone(),
+            workspace.clone(),
+            dag_id.clone(),
+            plan_identity.clone(),
+            config_identity.clone(),
+            &plan,
+            request.resume_dag_id.clone(),
+            resumed.keys().cloned().collect(),
+        );
+        let context = match context {
+            Ok(context) => context,
+            Err(error) => {
+                let id = dag_id.clone();
+                let message = error.to_string();
+                gateway
+                    .database(move |store| {
+                        store.reject_before_dispatch(&id, message, None)?;
+                        Ok(())
+                    })
+                    .await?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = context.preflight_resumed().await {
+            let id = dag_id.clone();
+            let message = error.to_string();
+            gateway
+                .database(move |store| {
+                    store.reject_before_dispatch(&id, message, None)?;
+                    Ok(())
+                })
+                .await?;
+            return Err(error);
+        }
+        Some(context)
+    } else {
+        None
+    };
     let execution_gateway = gateway.clone();
     let campaign_id = dag_id.clone();
-    let outcome = gateway.supervise(dag_id.clone(), async move {
+    let outcome = gateway.supervise(dag_id.clone(), Box::pin(async move {
         let gateway = &execution_gateway;
         let dag_id = campaign_id;
+        let worktrees = if worktree_mode && !request.plan_only && plan.is_executable() {
+            let mut campaign = if let Some(campaign) = retained_worktrees {
+                campaign
+            } else {
+                let pending = plan.nodes.iter().map(|node|node.id.clone()).collect::<Vec<_>>();
+                match super::worktrees::WorktreeCampaign::start_registered(&workspace, &gateway.state_root, &pending,
+                    Duration::from_secs_f64(request.timeout_seconds.min(30.0)), &dag_id, Some(gateway), #[cfg(test)] test_control.clone()).await {
+                    Ok(campaign) => campaign,
+                    Err(error) => {
+                        let id=dag_id.clone();let message=error.to_string();
+                        gateway.database(move|store|{store.reject_before_dispatch(&id,message,None)?;Ok(())}).await?;
+                        return Err(error);
+                    }
+                }
+            };
+            #[cfg(test)]
+            if let Some(control) = &test_control { campaign.set_test_control(control.clone())?; }
+            if request.resume_dag_id.is_some() {
+                campaign.activate(gateway, &dag_id).await?;
+            } else {
+                campaign.initialize_frontier(gateway).await?;
+            }
+            let campaign = Arc::new(campaign);
+            if let Some(context) = &checkpoint_context { context.bind_worktrees(campaign.clone())?; }
+            Some(campaign)
+        } else { None };
         let mut response = if request.plan_only || !plan.is_executable() {
             json!({
                 "ok": plan.is_executable(),
@@ -230,9 +363,11 @@ pub async fn handle_request_with_observer(
                 &plan_identity,
                 &config_identity,
                 &initial_manifest.digest,
+                resume::recipe_value(&request)?,
             )
             .await?;
             let (event_tx, event_rx) = mpsc::channel(32);
+            let checkpoint_context = checkpoint_context.ok_or("validated checkpoint context missing")?;
             let checkpoint_gateway = gateway.clone();
             let checkpoint_dag_id = dag_id.clone();
             let checkpoint_workspace = workspace.clone();
@@ -246,8 +381,15 @@ pub async fn handle_request_with_observer(
                 checkpoint_plan_identity,
                 checkpoint_config_identity,
                 observer,
+                Some(checkpoint_context.clone()),
             );
-                let checkpoint_future = cancel_on_checkpoint_failure(gateway, &dag_id, checkpoint_future);
+            let failure_context = checkpoint_context.clone();
+            let checkpoint_future = async move {
+                let result = checkpoint_future.await;
+                if let Err(error) = &result { failure_context.fail_pending(&error.to_string()); }
+                result
+            };
+            let checkpoint_future = cancel_on_checkpoint_failure(gateway, &dag_id, checkpoint_future);
             let execution_future = execute_with_options(
                 gateway,
                 plan.clone(),
@@ -258,6 +400,8 @@ pub async fn handle_request_with_observer(
                     max_input_bytes: request.max_input_bytes,
                     force_serial,
                     resumed,
+                    worktrees: worktrees.clone(),
+                    checkpoints: Some(checkpoint_context),
                 },
                 Some(event_tx),
             );
@@ -271,6 +415,9 @@ pub async fn handle_request_with_observer(
         let final_manifest =
             tokio::task::spawn_blocking(move || DagSettlementVerifier::capture(&final_workspace))
                 .await??;
+        if response["ok"] == true && let Some(campaign) = &worktrees {
+            campaign.verify_final(&final_manifest).await?;
+        }
         normalize_response(
             &mut response,
             &dag_id,
@@ -282,9 +429,26 @@ pub async fn handle_request_with_observer(
             &resumed_nodes,
             request.plan_only,
         )?;
+        if let Some(campaign) = &worktrees {
+            response["worktrees"] = json!({"status":"retained", "report":campaign.report()?});
+            if let Some(reference)=campaign.previous_export() {response["resumed_execution_export"]=reference;}
+            // Save full execution output/checkpoints outside disposable worktrees
+            // before allowing deletion. Final campaign result includes actual cleanup.
+            let export_id = format!("ckp-{dag_id}-worktree-export");
+            response=campaign.prepare_export(gateway,&export_id,response).await?;
+            let export_id = persist_worktree_export(gateway, &dag_id, &workspace, response.clone()).await?;
+            #[cfg(test)]
+            campaign.test_boundary("", super::worktrees::TestBoundary::ExportCommittedBeforeAck);
+            let cleanup = if response["ok"] == true { campaign.cleanup_verified().await }
+                else { Err("campaign verification incomplete; worktrees retained".into()) };
+            response["worktrees"] = match cleanup {
+                Ok(report) => json!({"status":"removed","report":report,"execution_export_id":export_id}),
+                Err(error) => json!({"status":if response["ok"]==true {"cleanup_unknown"}else{"retained"},"report":campaign.report()?,"execution_export_id":export_id,"reason":error.to_string()}),
+            };
+        }
         persist_result(gateway, &dag_id, response.clone()).await?;
         Ok(response)
-    }).await;
+    })).await;
     match outcome {
         Ok(response) => Ok(response),
         Err(error) => {
@@ -300,6 +464,49 @@ pub async fn handle_request_with_observer(
             Err(error)
         }
     }
+}
+
+async fn persist_worktree_export(
+    gateway: &Gateway,
+    dag_id: &str,
+    workspace: &Path,
+    result: Value,
+) -> Result<String> {
+    let id = format!("ckp-{dag_id}-worktree-export");
+    let key = id.clone();
+    let workspace = workspace.to_path_buf();
+    gateway
+        .database(move |store| {
+            let registration = store.resolve_or_register(
+                NewJob {
+                    task_type: "dag_worktree_export".into(),
+                    workspace_dir: workspace,
+                    model: Some("dag-export".into()),
+                    metadata: BTreeMap::new(),
+                    job_id: Some(key.clone()),
+                    idempotency_key: Some(key.clone()),
+                    provider: Some("heterarchy_triad".into()),
+                    engine: Some("dag_ulw".into()),
+                    created_at: None,
+                },
+                false,
+            )?;
+            let saved = if registration.should_dispatch {
+                store
+                    .complete_job(&key, result.clone(), None, None)?
+                    .ok_or("worktree export record disappeared")?
+            } else {
+                registration.record
+            };
+            if saved.status != crate::storage::JobStatus::Completed
+                || saved.result.as_ref() != Some(&result)
+            {
+                return Err("worktree execution export is not durably confirmed".into());
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(id)
 }
 
 async fn cancel_on_checkpoint_failure<F>(
@@ -373,6 +580,16 @@ pub async fn prepare_interactive_request(args: &Value) -> Result<Value> {
 }
 
 fn validate_request(request: &DagRequest) -> Result<()> {
+    if !request.plan_only
+        && request.resume_dag_id.is_some()
+        && request
+            .spawn_plan
+            .as_ref()
+            .is_some_and(|p| matches!(p.isolation_mode, IsolationMode::Worktree))
+        && (request.request_id.is_none() || request.request_id == request.resume_dag_id)
+    {
+        return Err("worktree resume requires a distinct continuation request_id".into());
+    }
     if request.campaign_goal.trim().is_empty() {
         return Err("campaign_goal must not be empty".into());
     }
@@ -464,6 +681,9 @@ async fn register_campaign(
     metadata.insert("plan_identity".to_owned(), plan_identity.to_owned());
     metadata.insert("config_identity".to_owned(), config_identity.to_owned());
     metadata.insert("source_identity".to_owned(), source_identity.to_owned());
+    if let Some(resume_id) = &request.resume_dag_id {
+        metadata.insert("resume_dag_id".into(), resume_id.clone());
+    }
     let new_job = NewJob {
         task_type: "dag_ulw".to_owned(),
         workspace_dir: workspace.to_path_buf(),
@@ -475,8 +695,18 @@ async fn register_campaign(
         engine: Some("dag_ulw".to_owned()),
         created_at: None,
     };
+    let worktree_mode = request
+        .spawn_plan
+        .as_ref()
+        .is_some_and(|spawn| matches!(spawn.isolation_mode, IsolationMode::Worktree));
     let registration = gateway
-        .database(move |store| store.resolve_or_register(new_job, false))
+        .database(move |store| {
+            if worktree_mode {
+                store.register_worktree_campaign(new_job)
+            } else {
+                store.resolve_or_register(new_job, false)
+            }
+        })
         .await?;
     Ok((registration.record, registration.should_dispatch))
 }
@@ -490,6 +720,7 @@ async fn persist_plan_checkpoint(
     plan_identity: &str,
     config_identity: &str,
     source_identity: &str,
+    request_recipe: Value,
 ) -> Result<()> {
     let mut metadata = checkpoint_metadata(
         campaign_id,
@@ -515,18 +746,16 @@ async fn persist_plan_checkpoint(
     let plan = serde_json::to_value(plan)?;
     gateway
         .database(move |store| {
-            let registration = store.resolve_or_register(new_job, true)?;
-            store.complete_job(
-                &registration.record.job_id,
-                json!({"plan": plan, "source_identity": source_identity}),
-                None,
-                None,
+            store.complete_checkpoint_once(
+                new_job,
+                json!({"plan": plan, "source_identity": source_identity,"request_recipe":request_recipe}),
             )?;
             Ok(())
         })
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_node_checkpoints(
     gateway: Gateway,
     mut events: mpsc::Receiver<DagExecutionEvent>,
@@ -535,15 +764,34 @@ async fn persist_node_checkpoints(
     plan_identity: String,
     config_identity: String,
     observer: Option<mpsc::Sender<DagExecutionEvent>>,
+    context: Option<Arc<CheckpointContext>>,
 ) -> Result<()> {
+    let mut reports = BTreeMap::new();
     while let Some(event) = events.recv().await {
+        if let DagExecutionEvent::ProviderFinished { node_id, output } = &event {
+            reports.insert(node_id.clone(), AgentReport::from_output("", Some(output)));
+        }
         let DagExecutionEvent::NodeSettled { receipt } = &event else {
             if let Some(sender) = &observer {
-                let _ignored_closed_receiver = sender.send(event).await;
+                let _ignored_observer_backpressure = sender.try_send(event);
             }
             continue;
         };
         let receipt = receipt.clone();
+        if let Some(context) = &context {
+            let report = reports.remove(&receipt.node_id);
+            let report = report.map_or_else(
+                || AgentReport::from_output(&receipt.output_summary, None),
+                |report| report.with_summary(&receipt.output_summary),
+            );
+            context.persist(receipt, report).await?;
+            if let Some(sender) = &observer {
+                // Persistence and commit notification precede UI backpressure;
+                // terminal transitions must not silently disappear.
+                let _ignored_closed_observer = sender.send(event).await;
+            }
+            continue;
+        }
         let checkpoint_id = format!("ckp-{campaign_id}-{}", receipt.node_id);
         let mut metadata = checkpoint_metadata(
             &campaign_id,
@@ -566,26 +814,20 @@ async fn persist_node_checkpoints(
         };
         gateway
             .database(move |store| {
-                let registration = store.resolve_or_register(new_job, true)?;
-                store.complete_job(
-                    &registration.record.job_id,
-                    json!({"receipt": receipt}),
-                    None,
-                    None,
-                )?;
+                store.complete_checkpoint_once(new_job, json!({"receipt": receipt}))?;
                 Ok(())
             })
             .await?;
         // A visible settlement is backed by its durable checkpoint. Observer
         // backpressure must not stand between receipt creation and persistence.
         if let Some(sender) = &observer {
-            let _ignored_closed_receiver = sender.send(event).await;
+            let _ignored_closed_observer = sender.send(event).await;
         }
     }
     Ok(())
 }
 
-fn checkpoint_metadata(
+pub(super) fn checkpoint_metadata(
     campaign_id: &str,
     plan_identity: &str,
     config_identity: &str,
@@ -625,6 +867,16 @@ async fn load_resume(
         || prior.metadata.get("config_identity").map(String::as_str) != Some(config_identity)
     {
         return Err("resume DAG plan/config identity mismatch".into());
+    }
+    if matches!(
+        prior.status,
+        crate::storage::JobStatus::Running | crate::storage::JobStatus::TimedOutUnknown
+    ) || prior.result.is_none()
+    {
+        return Err("direct resume has no confirmed provider frontier; inspect original campaign/provider IDs".into());
+    }
+    if let Some(result) = &prior.result {
+        reject_unresolved_direct_outputs(gateway, result).await?;
     }
     let mut receipts: Vec<SettlementReceipt> = Vec::new();
     let final_source = if let Some(result) = prior.result {
@@ -671,6 +923,56 @@ async fn load_resume(
         .filter(|receipt| receipt.state == NodeState::Settled)
         .map(|receipt| (receipt.node_id.clone(), receipt))
         .collect())
+}
+
+async fn reject_unresolved_direct_outputs(gateway: &Gateway, result: &Value) -> Result<()> {
+    let mut provider_ids = std::collections::BTreeSet::new();
+    if let Some(outputs) = result.get("outputs").and_then(Value::as_object) {
+        for output in outputs.values() {
+            for pointer in [
+                "",
+                "/receipt",
+                "/result",
+                "/result/receipt",
+                "/result/result/receipt",
+            ] {
+                let Some(value) = output.pointer(pointer) else {
+                    continue;
+                };
+                let status = value.get("status").and_then(Value::as_str);
+                let outcome = value.get("outcome_state").and_then(Value::as_str);
+                if matches!(status, Some("running" | "queued" | "timed_out_unknown"))
+                    || matches!(outcome, Some("in_flight" | "outcome_unknown"))
+                {
+                    return Err("direct resume contains an unresolved provider outcome; inspect its original ID".into());
+                }
+                for key in ["job_id", "request_id"] {
+                    if let Some(id) = value.get(key).and_then(Value::as_str) {
+                        provider_ids.insert(id.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    gateway
+        .database(move |store| {
+            for id in provider_ids {
+                if let Some(record) = store.get_job(&id)?
+                    && matches!(
+                        record.status,
+                        crate::storage::JobStatus::Running
+                            | crate::storage::JobStatus::TimedOutUnknown
+                    )
+                {
+                    return Err(
+                        "direct resume provider record is unresolved; inspect its original ID"
+                            .into(),
+                    );
+                }
+            }
+            Ok(())
+        })
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]

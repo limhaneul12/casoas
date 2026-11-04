@@ -5,7 +5,7 @@ mod helpers;
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -62,6 +62,7 @@ pub struct AppHandler {
     gateway: Gateway,
     workspace: PathBuf,
     state: Arc<Mutex<HandlerState>>,
+    worktree_default: bool,
 }
 
 impl AppHandler {
@@ -73,6 +74,7 @@ impl AppHandler {
         Ok(Self {
             gateway,
             workspace,
+            worktree_default: false,
             state: Arc::new(Mutex::new(HandlerState {
                 active_model: "gemini-4-argon-high".to_owned(),
                 effort: "high".to_owned(),
@@ -96,6 +98,23 @@ impl AppHandler {
         })
     }
 
+    fn with_worktree_default(mut self, enabled: bool) -> Self {
+        self.worktree_default = enabled;
+        self
+    }
+
+    async fn prepare_execution_request(
+        &self,
+        request: &Value,
+        explicit_worktree: bool,
+    ) -> Result<Value> {
+        let mut prepared = prepare_interactive_request(request).await?;
+        if explicit_worktree || self.worktree_default {
+            prepared["spawn_plan"]["isolation_mode"] = Value::String("worktree".to_owned());
+        }
+        Ok(prepared)
+    }
+
     async fn ensure_baseline_manifest(&self) {
         if self.state.lock().await.baseline_manifest.is_some() {
             return;
@@ -112,101 +131,113 @@ impl AppHandler {
         }
     }
 
-    async fn dispatch(&self, action: TuiAction, updates: mpsc::Sender<TuiUpdate>) -> Result<()> {
-        let Some(action) = self.registered_skill_action(action, &updates).await? else {
-            return Ok(());
-        };
-        match action {
-            TuiAction::SubmitPrompt(prompt) => self.submit_prompt(prompt, updates).await,
-            TuiAction::RunDag(goal) | TuiAction::AutoDag(goal) => {
-                self.plan_dag(goal, true, None, updates).await
-            }
-            TuiAction::PlanDag(goal) => self.plan_dag(goal, false, None, updates).await,
-            TuiAction::ToggleDag => {
-                send_transcript(
-                    &updates,
-                    "DAG mode toggled; execution remains receipt-gated",
-                )
-                .await
-            }
-            TuiAction::EnterDag(goal) => {
-                let active = {
-                    let mut state = self.state.lock().await;
-                    if state.skills.skills().contains_key("codex-heterarchy")
-                        && !state
-                            .skills
-                            .active()
-                            .iter()
-                            .any(|name| name == "codex-heterarchy")
-                    {
-                        let mut selected = state.skills.clone();
-                        selected.activate("codex-heterarchy")?;
-                        let preflight = selected.clone();
-                        let _body =
-                            tokio::task::spawn_blocking(move || preflight.active_context(32_000))
-                                .await??;
-                        state.skills = selected;
+    fn dispatch(&self, action: TuiAction, updates: mpsc::Sender<TuiUpdate>) -> ActionFuture {
+        let handler = self.clone();
+        Box::pin(async move {
+            let Some(action) = handler.registered_skill_action(action, &updates).await? else {
+                return Ok(());
+            };
+            match action {
+                TuiAction::SubmitPrompt(prompt) => handler.submit_prompt(prompt, updates).await,
+                TuiAction::RunDag(goal) | TuiAction::AutoDag(goal) => {
+                    handler.plan_dag(goal, true, None, updates).await
+                }
+                TuiAction::PlanDag(goal) => handler.plan_dag(goal, false, None, updates).await,
+                TuiAction::ToggleDag => {
+                    send_transcript(
+                        &updates,
+                        "DAG mode toggled; execution remains receipt-gated",
+                    )
+                    .await
+                }
+                TuiAction::EnterDag(goal) => {
+                    let active = {
+                        let mut state = handler.state.lock().await;
+                        if state.skills.skills().contains_key("codex-heterarchy")
+                            && !state
+                                .skills
+                                .active()
+                                .iter()
+                                .any(|name| name == "codex-heterarchy")
+                        {
+                            let mut selected = state.skills.clone();
+                            selected.activate("codex-heterarchy")?;
+                            let preflight = selected.clone();
+                            let _body = tokio::task::spawn_blocking(move || {
+                                preflight.active_context(32_000)
+                            })
+                            .await??;
+                            state.skills = selected;
+                        }
+                        state.skills.active().to_vec()
+                    };
+                    updates.send(TuiUpdate::ActiveSkills(active)).await?;
+                    send_transcript(&updates, "DAG mode enabled").await?;
+                    if let Some(goal) = goal {
+                        handler.plan_dag(goal, true, None, updates).await
+                    } else {
+                        Ok(())
                     }
-                    state.skills.active().to_vec()
-                };
-                updates.send(TuiUpdate::ActiveSkills(active)).await?;
-                send_transcript(&updates, "DAG mode enabled").await?;
-                if let Some(goal) = goal {
-                    self.plan_dag(goal, true, None, updates).await
-                } else {
+                }
+                TuiAction::ExitDag => send_transcript(&updates, "DAG mode exited").await,
+                TuiAction::ShowOverview => handler.show_overview(updates).await,
+                TuiAction::ShowWorkBoard(limit) => handler.show_workboard(limit, updates).await,
+                TuiAction::RunCouncil(proposal) => handler.run_council(proposal, updates).await,
+                TuiAction::ShowVotes(collaboration_id) => {
+                    handler.show_votes(collaboration_id, updates).await
+                }
+                TuiAction::ShowRecovery(job_id) => handler.show_recovery(job_id, updates).await,
+                TuiAction::ShowPrompts(selector) => handler.show_prompts(selector, updates).await,
+                TuiAction::Back => Ok(()),
+                TuiAction::ShowModels => handler.show_models(updates).await,
+                TuiAction::ShowActiveModel => {
+                    let active = {
+                        let state = handler.state.lock().await;
+                        format!("{}:{}", state.active_model, state.effort)
+                    };
+                    show_static_view(&updates, "Active model", vec![active]).await
+                }
+                TuiAction::SelectModel(model) => handler.select_model(model, updates).await,
+                TuiAction::SelectAndPrompt { model, prompt } => {
+                    handler.select_model(model, updates.clone()).await?;
+                    handler.submit_prompt(prompt, updates).await
+                }
+                TuiAction::ShowSkills => handler.show_skills(updates).await,
+                TuiAction::ToggleSkill(skill) => handler.toggle_skill(skill, updates).await,
+                TuiAction::SetEffort(effort) => handler.set_effort(effort, updates).await,
+                TuiAction::ConfigureEffect(effect) => {
+                    handler.configure_effect(effect, updates).await
+                }
+                TuiAction::Compact => handler.compact(updates).await,
+                TuiAction::SetPermissions(mode) => handler.set_permissions(mode, updates).await,
+                TuiAction::Resume(dag_id) => handler.resume(dag_id, updates).await,
+                TuiAction::RunTriad(goal) => handler.run_triad(goal, updates).await,
+                TuiAction::ShowStatus => handler.show_status(updates).await,
+                TuiAction::ShowInbox => handler.show_inbox(updates).await,
+                TuiAction::ShowDiff => handler.show_diff(updates).await,
+                TuiAction::Review(focus) => handler.review(focus, updates).await,
+                TuiAction::SetTheme(theme) => handler.set_theme(theme, updates).await,
+                TuiAction::UnknownCommand(command) => {
+                    Err(format!("unknown slash command: {command}").into())
+                }
+                TuiAction::Clear => {
+                    let mut state = handler.state.lock().await;
+                    state.history.clear();
+                    state.last_dag_request = None;
+                    state.last_dag_result = None;
+                    state.tokens_in = 0;
+                    state.tokens_out = 0;
+                    state.context_window = None;
+                    state.current_context_tokens = None;
+                    state.seen_usage_requests.clear();
+                    state.usage_known_seen = false;
+                    state.usage_unknown_seen = false;
                     Ok(())
                 }
+                TuiAction::Help => show_static_view(&updates, "Help", help_lines()).await,
+                TuiAction::Quit => Ok(()),
             }
-            TuiAction::ExitDag => send_transcript(&updates, "DAG mode exited").await,
-            TuiAction::ShowOverview => self.show_overview(updates).await,
-            TuiAction::ShowPrompts(selector) => self.show_prompts(selector, updates).await,
-            TuiAction::Back => Ok(()),
-            TuiAction::ShowModels => self.show_models(updates).await,
-            TuiAction::ShowActiveModel => {
-                let active = {
-                    let state = self.state.lock().await;
-                    format!("{}:{}", state.active_model, state.effort)
-                };
-                show_static_view(&updates, "Active model", vec![active]).await
-            }
-            TuiAction::SelectModel(model) => self.select_model(model, updates).await,
-            TuiAction::SelectAndPrompt { model, prompt } => {
-                self.select_model(model, updates.clone()).await?;
-                self.submit_prompt(prompt, updates).await
-            }
-            TuiAction::ShowSkills => self.show_skills(updates).await,
-            TuiAction::ToggleSkill(skill) => self.toggle_skill(skill, updates).await,
-            TuiAction::SetEffort(effort) => self.set_effort(effort, updates).await,
-            TuiAction::ConfigureEffect(effect) => self.configure_effect(effect, updates).await,
-            TuiAction::Compact => self.compact(updates).await,
-            TuiAction::SetPermissions(mode) => self.set_permissions(mode, updates).await,
-            TuiAction::Resume(dag_id) => self.resume(dag_id, updates).await,
-            TuiAction::RunTriad(goal) => self.run_triad(goal, updates).await,
-            TuiAction::ShowStatus => self.show_status(updates).await,
-            TuiAction::ShowInbox => self.show_inbox(updates).await,
-            TuiAction::ShowDiff => self.show_diff(updates).await,
-            TuiAction::Review(focus) => self.review(focus, updates).await,
-            TuiAction::SetTheme(theme) => self.set_theme(theme, updates).await,
-            TuiAction::UnknownCommand(command) => {
-                Err(format!("unknown slash command: {command}").into())
-            }
-            TuiAction::Clear => {
-                let mut state = self.state.lock().await;
-                state.history.clear();
-                state.last_dag_request = None;
-                state.last_dag_result = None;
-                state.tokens_in = 0;
-                state.tokens_out = 0;
-                state.context_window = None;
-                state.current_context_tokens = None;
-                state.seen_usage_requests.clear();
-                state.usage_known_seen = false;
-                state.usage_unknown_seen = false;
-                Ok(())
-            }
-            TuiAction::Help => show_static_view(&updates, "Help", help_lines()).await,
-            TuiAction::Quit => Ok(()),
-        }
+        })
     }
 
     async fn registered_skill_action(
@@ -335,28 +366,18 @@ impl AppHandler {
         resume_id: Option<String>,
         updates: mpsc::Sender<TuiUpdate>,
     ) -> Result<()> {
+        let (mut goal, worktree) = worktree_goal(&goal);
+        if let Some(id) = inline_resume_id(&goal)? {
+            if !execute {
+                return Err("resume executes a stored plan; use /resume <campaign_id>".into());
+            }
+            if worktree {
+                return Err("resume uses stored isolation; omit the --worktree flag".into());
+            }
+            return self.resume(Some(id.to_owned()), updates).await;
+        }
         if execute {
             self.ensure_baseline_manifest().await;
-        }
-        let mut goal = goal.trim().to_owned();
-        let mut resume_id = resume_id;
-        if let Some(rest) = goal.strip_prefix("--resume ") {
-            let mut parts = rest.splitn(2, char::is_whitespace);
-            let id = parts
-                .next()
-                .filter(|id| !id.is_empty())
-                .ok_or("--resume requires a campaign ID")?
-                .to_owned();
-            goal = parts.next().unwrap_or_default().trim().to_owned();
-            if goal.is_empty() {
-                let status = self
-                    .gateway
-                    .call("codex_job_status", json!({"job_id":id,"cancel":false}))
-                    .await?;
-                goal = extract_dag_goal(&status)
-                    .ok_or("resume checkpoint contains no campaign goal")?;
-            }
-            resume_id = Some(id);
         }
         if goal == "--live" {
             goal.clear();
@@ -451,7 +472,7 @@ impl AppHandler {
             self.record_history(goal, response).await;
             return Ok(());
         }
-        let prepared = prepare_interactive_request(&request).await?;
+        let prepared = self.prepare_execution_request(&request, worktree).await?;
         self.state.lock().await.last_dag_request = Some(prepared.clone());
         let execution = self
             .execute_dag_live(prepared, plan, updates.clone())
@@ -747,6 +768,78 @@ impl AppHandler {
         show_static_view(&updates, "DAG source and evidence board", lines).await
     }
 
+    async fn show_workboard(
+        &self,
+        requested_limit: Option<String>,
+        updates: mpsc::Sender<TuiUpdate>,
+    ) -> Result<()> {
+        let limit = requested_limit.as_deref().map_or(Ok(20), |value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| crate::Error::from("usage: /board [limit]"))
+        })?;
+        if !(1..=100).contains(&limit) {
+            return Err("board limit must be between 1 and 100".into());
+        }
+        let value = crate::workbench::board(&self.gateway, &self.workspace, limit).await?;
+        show_static_view(
+            &updates,
+            "Organization workboard",
+            workboard_summary(&value),
+        )
+        .await
+    }
+
+    async fn run_council(&self, proposal: String, updates: mpsc::Sender<TuiUpdate>) -> Result<()> {
+        let proposal = proposal.trim();
+        if proposal.is_empty() {
+            return Err("usage: /council <proposal>".into());
+        }
+        let response = self
+            .gateway
+            .call(
+                "heterarchy_triad_orchestrate",
+                crate::workbench::parse_council_request(proposal, &self.workspace)?,
+            )
+            .await?;
+        self.record_history(format!("/council {proposal}"), response.clone())
+            .await;
+        show_static_view(
+            &updates,
+            "Review Council dispatch",
+            vec![
+                "Queued or running roles are not votes or approval. Use /votes <collaboration_id> after completion. Reviews without --file scope report source freshness as unknown."
+                    .to_owned(),
+                pretty_json_limited(&response, VIEW_BYTE_LIMIT),
+            ],
+        )
+        .await
+    }
+
+    async fn show_votes(
+        &self,
+        collaboration_id: String,
+        updates: mpsc::Sender<TuiUpdate>,
+    ) -> Result<()> {
+        let collaboration_id = collaboration_id.trim();
+        if collaboration_id.is_empty() || collaboration_id.split_whitespace().count() != 1 {
+            return Err("usage: /votes <collaboration_id>".into());
+        }
+        let value =
+            crate::workbench::votes(&self.gateway, &self.workspace, collaboration_id).await?;
+        show_static_view(&updates, "Review Council ballots", votes_summary(&value)).await
+    }
+
+    async fn show_recovery(&self, job_id: String, updates: mpsc::Sender<TuiUpdate>) -> Result<()> {
+        let job_id = job_id.trim();
+        if job_id.is_empty() || job_id.split_whitespace().count() != 1 {
+            return Err("usage: /recovery <job_id>".into());
+        }
+        let value =
+            crate::workbench::recovery(&self.gateway.state_root, &self.workspace, job_id).await?;
+        show_static_view(&updates, "Recovery observations", recovery_summary(&value)).await
+    }
+
     async fn show_prompts(
         &self,
         selector: Option<String>,
@@ -788,7 +881,13 @@ impl AppHandler {
     }
 
     async fn show_models(&self, updates: mpsc::Sender<TuiUpdate>) -> Result<()> {
-        let health = self.gateway.call("codex_bridge_health", json!({})).await?;
+        let health = self
+            .gateway
+            .call(
+                "codex_bridge_health",
+                json!({"workspace_dir":self.workspace}),
+            )
+            .await?;
         let (active_model, active_effort, effect_summary) = {
             let state = self.state.lock().await;
             (
@@ -1182,40 +1281,149 @@ impl AppHandler {
         requested_id: Option<String>,
         updates: mpsc::Sender<TuiUpdate>,
     ) -> Result<()> {
-        let (known_id, known_goal) = {
-            let state = self.state.lock().await;
-            (state.last_dag_id.clone(), state.last_dag_goal.clone())
-        };
-        let explicit_id = requested_id
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty());
+        let workspace = self.workspace.clone();
+        let workspace = tokio::task::spawn_blocking(move || workspace.canonicalize()).await??;
+        let known_id = self.state.lock().await.last_dag_id.clone();
         let target_id = requested_id
-            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
             .or(known_id);
-        let (dag_id, goal) = match (target_id, known_goal) {
-            (Some(dag_id), Some(goal)) if !explicit_id => (dag_id, goal),
-            (Some(dag_id), _) => {
-                let status = self
-                    .gateway
-                    .call("codex_job_status", json!({"job_id":dag_id,"cancel":false}))
-                    .await?;
-                let goal = extract_dag_goal(&status)
-                    .ok_or("resume checkpoint contains no campaign goal")?;
-                (dag_id, goal)
-            }
-            (None, _) => {
+        let dag_id = match target_id {
+            Some(dag_id) => dag_id,
+            None => {
                 let jobs = self
                     .gateway
                     .call(
                         "codex_job_list",
-                        json!({"limit":20,"workspace_dir":self.workspace}),
+                        json!({"limit":100,"workspace_dir":workspace}),
                     )
                     .await?;
-                latest_dag_checkpoint(&jobs).ok_or("no previous DAG checkpoint is available")?
+                latest_dag_checkpoint(&jobs, &workspace)
+                    .ok_or("no previous DAG checkpoint is available")?
             }
         };
-        send_transcript(&updates, format!("Resuming DAG checkpoint {dag_id}")).await?;
-        self.plan_dag(goal, true, Some(dag_id), updates).await
+        if dag_id.split_whitespace().count() != 1 {
+            return Err("usage: /resume [campaign_id]".into());
+        }
+        let prepared =
+            match crate::dag::prepare_resume_request(&self.gateway, &workspace, &dag_id).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    if let Some(goal) = self.legacy_direct_resume_goal(&workspace, &dag_id).await? {
+                        send_transcript(
+                            &updates,
+                            format!("Resuming historical direct DAG checkpoint {dag_id}"),
+                        )
+                        .await?;
+                        return Box::pin(self.plan_dag(goal, true, Some(dag_id), updates)).await;
+                    }
+                    return Err(error);
+                }
+            };
+        let permission_mode = self.state.lock().await.permission_mode.clone();
+        ensure_plan_permission(&permission_mode, &prepared.plan, true)?;
+        self.ensure_baseline_manifest().await;
+        let total = prepared.plan.nodes.len();
+        {
+            let mut state = self.state.lock().await;
+            state.last_dag_goal = Some(prepared.plan.goal.clone());
+            state.last_dag_request = Some(prepared.request.clone());
+            state.last_dag_result = Some(json!({"node_receipts":[],"outputs":{}}));
+        }
+        updates
+            .send(TuiUpdate::DagSnapshot(dag_lanes(&prepared.plan)))
+            .await?;
+        updates
+            .send(TuiUpdate::HeaderProgress { done: 0, total })
+            .await?;
+        send_transcript(
+            &updates,
+            format!(
+                "Resuming saved DAG {dag_id}; topology, skills, models and isolation are unchanged"
+            ),
+        )
+        .await?;
+        let execution = self
+            .execute_dag_live(prepared.request, prepared.plan, updates.clone())
+            .await?;
+        if let Some(id) = execution["dag_id"].as_str() {
+            self.state.lock().await.last_dag_id = Some(id.to_owned());
+        }
+        let verified = execution["node_receipts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|receipt| receipt["state"] == "settled" && receipt["verify_passed"] == true)
+            .count();
+        let reused = execution["resumed_nodes"].as_array().map_or(0, Vec::len);
+        updates
+            .send(TuiUpdate::HeaderProgress {
+                done: verified,
+                total,
+            })
+            .await?;
+        send_transcript(
+            &updates,
+            format!("Resumed DAG finished: {verified}/{total} lanes verified; {reused} settled checkpoints reused"),
+        )
+        .await?;
+        self.record_history(format!("/resume {dag_id}"), execution)
+            .await;
+        Ok(())
+    }
+
+    async fn legacy_direct_resume_goal(
+        &self,
+        workspace: &Path,
+        id: &str,
+    ) -> Result<Option<String>> {
+        let root_id = id.to_owned();
+        let checkpoint_id = format!("ckp-{id}-plan");
+        let workspace = workspace.to_path_buf();
+        self.gateway
+            .database(move |store| {
+                let Some(root) = store.get_job(&root_id)? else {
+                    return Ok(None);
+                };
+                let Some(checkpoint) = store.get_job(&checkpoint_id)? else {
+                    return Ok(None);
+                };
+                if root.task_type != "dag_ulw"
+                    || !matches!(
+                        root.status,
+                        crate::storage::JobStatus::Completed | crate::storage::JobStatus::Failed
+                    )
+                    || Path::new(&root.workspace_dir) != workspace
+                    || root.metadata.keys().any(|key| key.starts_with("worktree_"))
+                    || checkpoint.task_type != "dag_checkpoint"
+                    || checkpoint.status != crate::storage::JobStatus::Completed
+                    || Path::new(&checkpoint.workspace_dir) != workspace
+                    || checkpoint.metadata.get("campaign_id") != Some(&root_id)
+                    || checkpoint
+                        .metadata
+                        .get("checkpoint_kind")
+                        .map(String::as_str)
+                        != Some("plan")
+                {
+                    return Ok(None);
+                }
+                let (Some(result), Some(saved)) = (root.result, checkpoint.result) else {
+                    return Ok(None);
+                };
+                if result["plan_only"] != false
+                    || result.get("worktrees").is_some()
+                    || saved.get("request_recipe").is_some()
+                    || !result["node_receipts"]
+                        .as_array()
+                        .or_else(|| result["receipts"].as_array())
+                        .is_some_and(|receipts| !receipts.is_empty())
+                {
+                    return Ok(None);
+                }
+                let plan: DagPlan = serde_json::from_value(saved["plan"].clone())?;
+                Ok(plan.is_executable().then_some(plan.goal))
+            })
+            .await
     }
 
     async fn run_triad(&self, goal: String, updates: mpsc::Sender<TuiUpdate>) -> Result<()> {
@@ -1297,7 +1505,10 @@ impl AppHandler {
 
     async fn show_status(&self, updates: mpsc::Sender<TuiUpdate>) -> Result<()> {
         let (health, jobs, inbox) = tokio::try_join!(
-            self.gateway.call("codex_bridge_health", json!({})),
+            self.gateway.call(
+                "codex_bridge_health",
+                json!({"workspace_dir":self.workspace})
+            ),
             self.gateway.call(
                 "codex_job_list",
                 json!({"limit":15,"workspace_dir":self.workspace})
@@ -1412,8 +1623,7 @@ impl AppHandler {
 
 impl ActionHandler for AppHandler {
     fn handle(&self, action: TuiAction, updates: mpsc::Sender<TuiUpdate>) -> ActionFuture {
-        let handler = self.clone();
-        Box::pin(async move { handler.dispatch(action, updates).await })
+        self.dispatch(action, updates)
     }
 
     fn shutdown(&self) -> ActionFuture {
@@ -1424,14 +1634,87 @@ impl ActionHandler for AppHandler {
 
 /// Runs the interactive terminal against the real Rust application gateway.
 pub async fn run(workspace: PathBuf, state_root: PathBuf) -> Result<()> {
+    run_configured(workspace, state_root, false).await
+}
+
+/// Interactive named session: every executing DAG opts into per-node worktrees.
+pub async fn run_with_worktrees(workspace: PathBuf, state_root: PathBuf) -> Result<()> {
+    run_configured(workspace, state_root, true).await
+}
+
+async fn run_configured(
+    workspace: PathBuf,
+    state_root: PathBuf,
+    worktree_default: bool,
+) -> Result<()> {
     let gateway = Gateway::new(state_root);
     let handler_workspace = workspace.clone();
-    let handler =
-        tokio::task::spawn_blocking(move || AppHandler::new(gateway, handler_workspace)).await??;
+    let handler = tokio::task::spawn_blocking(move || {
+        AppHandler::new(gateway, handler_workspace)
+            .map(|h| h.with_worktree_default(worktree_default))
+    })
+    .await??;
     handler.ensure_baseline_manifest().await;
     let run_result = crate::tui::run_with_handler(workspace, handler.clone()).await;
     let shutdown_result = handler.gateway.shutdown().await;
     run_result.and(shutdown_result)
+}
+
+/// Observes whether an initial command resolves to recovery before session creation.
+/// Uses the TUI's registered-skill prefix rules without changing session state or dispatching work.
+pub fn initial_recovery_input(workspace: &Path, home: Option<&Path>, input: &str) -> Result<bool> {
+    Ok(matches!(
+        resolved_initial_action(workspace, home, input)?,
+        TuiAction::ShowRecovery(_)
+    ))
+}
+
+/// Diagnostics and resume must target an existing workspace rather than create a named session.
+pub fn initial_existing_session_input(
+    workspace: &Path,
+    home: Option<&Path>,
+    input: &str,
+) -> Result<bool> {
+    match resolved_initial_action(workspace, home, input)? {
+        TuiAction::ShowRecovery(_) | TuiAction::Resume(_) => Ok(true),
+        TuiAction::RunDag(goal)
+        | TuiAction::PlanDag(goal)
+        | TuiAction::AutoDag(goal)
+        | TuiAction::EnterDag(Some(goal)) => {
+            Ok(inline_resume_id(&worktree_goal(&goal).0)?.is_some())
+        }
+        _ => Ok(false),
+    }
+}
+
+fn resolved_initial_action(
+    workspace: &Path,
+    home: Option<&Path>,
+    input: &str,
+) -> Result<TuiAction> {
+    let input = input.trim();
+    let action = crate::tui::action_from_input(input);
+    if !matches!(
+        action,
+        TuiAction::SubmitPrompt(_) | TuiAction::UnknownCommand(_)
+    ) {
+        return Ok(action);
+    }
+    let mut skills = SkillRegistry::discover(workspace, home)?;
+    if let TuiAction::UnknownCommand(ref command) = action
+        && skills
+            .extract_mentions_where(command, inline_skill_token)
+            .0
+            .is_empty()
+    {
+        return Ok(action);
+    }
+    let (matched, cleaned) = skills.extract_mentions_where(input, inline_skill_token);
+    Ok(if matched.is_empty() {
+        action
+    } else {
+        crate::tui::action_from_input(&cleaned)
+    })
 }
 
 /// Runs one composer command through the same real action adapter without a TTY.
@@ -1440,13 +1723,34 @@ pub async fn command(
     state_root: PathBuf,
     input: String,
 ) -> Result<Vec<TuiUpdate>> {
+    command_configured(workspace, state_root, input, false).await
+}
+
+/// One named-session command using the same node-isolation default as the TUI.
+pub async fn command_with_worktrees(
+    workspace: PathBuf,
+    state_root: PathBuf,
+    input: String,
+) -> Result<Vec<TuiUpdate>> {
+    command_configured(workspace, state_root, input, true).await
+}
+
+async fn command_configured(
+    workspace: PathBuf,
+    state_root: PathBuf,
+    input: String,
+    worktree_default: bool,
+) -> Result<Vec<TuiUpdate>> {
     if input.trim().is_empty() {
         return Err("command input cannot be empty".into());
     }
     let gateway = Gateway::new(state_root);
     let handler_workspace = workspace.clone();
-    let handler =
-        tokio::task::spawn_blocking(move || AppHandler::new(gateway, handler_workspace)).await??;
+    let handler = tokio::task::spawn_blocking(move || {
+        AppHandler::new(gateway, handler_workspace)
+            .map(|h| h.with_worktree_default(worktree_default))
+    })
+    .await??;
     let action = crate::tui::action_from_input(input.trim());
     let action = if let TuiAction::UnknownCommand(ref command) = action {
         let mut skills = handler.state.lock().await.skills.clone();
@@ -1463,8 +1767,7 @@ pub async fn command(
         action
     };
     let (updates_tx, mut updates_rx) = mpsc::channel(256);
-    let dispatch = handler.dispatch(action, updates_tx);
-    tokio::pin!(dispatch);
+    let mut dispatch = handler.dispatch(action, updates_tx);
     let mut updates = Vec::new();
     let dispatch_result = loop {
         tokio::select! {

@@ -25,6 +25,46 @@ fn new_job(workspace: &Path) -> NewJob {
     }
 }
 
+fn checkpoint_job(workspace: &Path, id: &str) -> NewJob {
+    NewJob {
+        task_type: "dag_checkpoint".to_owned(),
+        workspace_dir: workspace.to_path_buf(),
+        model: Some("dag-node".to_owned()),
+        metadata: BTreeMap::from([
+            ("campaign_id".to_owned(), "campaign-a".to_owned()),
+            ("checkpoint_kind".to_owned(), "node".to_owned()),
+            ("config_identity".to_owned(), "sha256:config".to_owned()),
+            ("plan_identity".to_owned(), "sha256:plan".to_owned()),
+            (
+                "request_identity".to_owned(),
+                "sha256:checkpoint".to_owned(),
+            ),
+            ("source_identity".to_owned(), "sha256:source".to_owned()),
+        ]),
+        job_id: Some(id.to_owned()),
+        idempotency_key: Some(id.to_owned()),
+        provider: Some("heterarchy_triad".to_owned()),
+        engine: Some("dag_ulw".to_owned()),
+        created_at: Some(100.0),
+    }
+}
+
+#[test]
+fn persisted_duration_reopens_without_float_identity_drift() -> crate::Result<()> {
+    let root = tempdir()?;
+    let workspace = tempdir()?;
+    let store = Store::open(root.path())?;
+    let job = store.create_job(new_job(workspace.path()))?;
+    let result = json!({"duration_seconds":1.6224532919999999_f64});
+    store.complete_job(&job.job_id, result.clone(), None, None)?;
+    drop(store);
+    let read = Store::open(root.path())?
+        .get_job(&job.job_id)?
+        .ok_or("stored job missing")?;
+    assert_eq!(read.result, Some(result));
+    Ok(())
+}
+
 #[test]
 fn job_lifecycle_is_idempotent_and_cancel_is_final() -> crate::Result<()> {
     let root = tempdir()?;
@@ -410,7 +450,7 @@ fn independent_store_cancel_completion_race_is_terminally_coherent() -> crate::R
 }
 
 #[test]
-fn independent_store_retry_reuses_id_and_increments_once() -> crate::Result<()> {
+fn terminal_unknown_retry_is_readback_only() -> crate::Result<()> {
     let root = tempdir()?;
     let workspace = tempdir()?;
     let setup = Store::open(root.path())?;
@@ -449,18 +489,270 @@ fn independent_store_retry_reuses_id_and_increments_once() -> crate::Result<()> 
             .iter()
             .all(|registration| registration.record.job_id == first.record.job_id)
     );
+    assert!(registrations.iter().all(|registration| {
+        registration.record.attempt_count == 1
+            && registration.record.status == JobStatus::TimedOutUnknown
+            && !registration.should_dispatch
+    }));
+    Ok(())
+}
+
+#[test]
+fn terminal_success_failure_and_cancel_do_not_redispatch() -> crate::Result<()> {
+    let root = tempdir()?;
+    let workspace = tempdir()?;
+    let store = Store::open(root.path())?;
+    for (key, terminal) in [
+        ("completed-retry-key", "completed"),
+        ("failed-retry-key", "failed"),
+        ("cancelled-retry-key", "cancelled"),
+    ] {
+        let first = store.resolve_or_register(
+            NewJob {
+                idempotency_key: Some(key.to_owned()),
+                ..new_job(workspace.path())
+            },
+            false,
+        )?;
+        match terminal {
+            "completed" => {
+                store.complete_job(&first.record.job_id, json!({"ok":true}), None, None)?;
+            }
+            "failed" => {
+                store.fail_job(
+                    &first.record.job_id,
+                    "failed after dispatch".to_owned(),
+                    None,
+                )?;
+            }
+            "cancelled" => {
+                store.cancel_job(&first.record.job_id, "caller cancelled".to_owned())?;
+            }
+            _ => return Err(IoError::other("unknown fixture terminal state").into()),
+        }
+        let replay = store.resolve_or_register(
+            NewJob {
+                idempotency_key: Some(key.to_owned()),
+                ..new_job(workspace.path())
+            },
+            true,
+        )?;
+        assert!(!replay.should_dispatch, "{terminal} was redispatched");
+        assert_eq!(replay.record.attempt_count, 1);
+    }
+    Ok(())
+}
+
+#[test]
+fn actual_model_update_preserves_requested_model_identity() -> crate::Result<()> {
+    let root = tempdir()?;
+    let workspace = tempdir()?;
+    let store = Store::open(root.path())?;
+    let mut request = new_job(workspace.path());
+    request.model = Some("codex-default".to_owned());
+    request.idempotency_key = Some("model-identity-key".to_owned());
+    let first = store.resolve_or_register(request.clone(), false)?;
+    store.complete_job_with_details(
+        &first.record.job_id,
+        json!({"ok":true}),
+        None,
+        None,
+        Some("gpt-6.1-sol".to_owned()),
+        BTreeMap::new(),
+    )?;
+    let replay = store.resolve_or_register(request, false)?;
+    assert!(!replay.should_dispatch);
+    assert_eq!(replay.record.model.as_deref(), Some("gpt-6.1-sol"));
+    assert_eq!(replay.record.attempt_count, 1);
+    Ok(())
+}
+
+#[test]
+fn confirmed_pre_dispatch_failure_can_retry_exact_identity() -> crate::Result<()> {
+    let root = tempdir()?;
+    let workspace = tempdir()?;
+    let store = Store::open(root.path())?;
+    let first = store.resolve_or_register(
+        NewJob {
+            idempotency_key: Some("pre-dispatch-retry".to_owned()),
+            metadata: BTreeMap::from([(
+                "request_identity".to_owned(),
+                "sha256:pre-dispatch".to_owned(),
+            )]),
+            ..new_job(workspace.path())
+        },
+        false,
+    )?;
+    store.reject_before_dispatch(&first.record.job_id, "route unavailable".to_owned(), None)?;
+    let retried = store.resolve_or_register(
+        NewJob {
+            idempotency_key: Some("pre-dispatch-retry".to_owned()),
+            metadata: BTreeMap::from([(
+                "request_identity".to_owned(),
+                "sha256:pre-dispatch".to_owned(),
+            )]),
+            ..new_job(workspace.path())
+        },
+        true,
+    )?;
+    assert!(retried.should_dispatch);
+    assert_eq!(retried.record.attempt_count, 2);
+    assert_eq!(retried.record.status, JobStatus::Running);
+    Ok(())
+}
+
+#[test]
+fn legacy_pre_dispatch_record_without_fingerprint_is_readback_only() -> crate::Result<()> {
+    let root = tempdir()?;
+    let workspace = tempdir()?;
+    let store = Store::open(root.path())?;
+    let first = store.resolve_or_register(
+        NewJob {
+            idempotency_key: Some("legacy-pre-dispatch".to_owned()),
+            ..new_job(workspace.path())
+        },
+        false,
+    )?;
+    store.reject_before_dispatch(&first.record.job_id, "legacy rejection".to_owned(), None)?;
+    let replay = store.resolve_or_register(
+        NewJob {
+            idempotency_key: Some("legacy-pre-dispatch".to_owned()),
+            metadata: BTreeMap::from([(
+                "request_identity".to_owned(),
+                "sha256:new-client".to_owned(),
+            )]),
+            ..new_job(workspace.path())
+        },
+        true,
+    )?;
+    assert!(!replay.should_dispatch);
+    assert_eq!(replay.record.status, JobStatus::RejectedPreDispatch);
+    assert_eq!(replay.record.attempt_count, 1);
+    assert!(!replay.record.metadata.contains_key("request_identity"));
+    Ok(())
+}
+
+#[test]
+fn reused_identity_rejects_changed_scope_and_contradictory_selectors() -> crate::Result<()> {
+    let root = tempdir()?;
+    let workspace = tempdir()?;
+    let other_workspace = tempdir()?;
+    let store = Store::open(root.path())?;
+    let first = store.resolve_or_register(
+        NewJob {
+            job_id: Some("cdx-scope-a".to_owned()),
+            idempotency_key: Some("scope-key-a".to_owned()),
+            metadata: BTreeMap::from([(
+                "request_identity".to_owned(),
+                "sha256:request-a".to_owned(),
+            )]),
+            ..new_job(workspace.path())
+        },
+        false,
+    )?;
+    assert!(first.should_dispatch);
+
+    let changed_workspace = store.resolve_or_register(
+        NewJob {
+            job_id: Some(first.record.job_id.clone()),
+            idempotency_key: Some("scope-key-a".to_owned()),
+            metadata: BTreeMap::from([(
+                "request_identity".to_owned(),
+                "sha256:request-a".to_owned(),
+            )]),
+            ..new_job(other_workspace.path())
+        },
+        false,
+    );
+    assert!(changed_workspace.is_err());
+
+    let changed_request_identity = store.resolve_or_register(
+        NewJob {
+            job_id: Some(first.record.job_id.clone()),
+            idempotency_key: Some("scope-key-a".to_owned()),
+            metadata: BTreeMap::from([(
+                "request_identity".to_owned(),
+                "sha256:request-b".to_owned(),
+            )]),
+            ..new_job(workspace.path())
+        },
+        false,
+    );
+    assert!(changed_request_identity.is_err());
+
+    let second = store.resolve_or_register(
+        NewJob {
+            job_id: Some("cdx-scope-b".to_owned()),
+            idempotency_key: Some("scope-key-b".to_owned()),
+            ..new_job(workspace.path())
+        },
+        false,
+    )?;
+    assert!(second.should_dispatch);
+    let contradictory = store.resolve_or_register(
+        NewJob {
+            job_id: Some(first.record.job_id),
+            idempotency_key: second.record.idempotency_key,
+            ..new_job(workspace.path())
+        },
+        false,
+    );
+    assert!(contradictory.is_err());
+    Ok(())
+}
+
+#[test]
+fn completed_checkpoint_is_write_once_across_store_handles() -> crate::Result<()> {
+    let root = tempdir()?;
+    let workspace = tempdir()?;
+    let [first_store, second_store] = [Store::open(root.path())?, Store::open(root.path())?];
+    let request = checkpoint_job(workspace.path(), "ckp-campaign-a-node-a");
+    let result = json!({"receipt":{"node_id":"node-a","state":"settled"}});
+    let barrier = Arc::new(Barrier::new(2));
+    let first_start = Arc::clone(&barrier);
+    let first_request = request.clone();
+    let first_result = result.clone();
+    let first = thread::spawn(move || {
+        first_start.wait();
+        first_store.complete_checkpoint_once(first_request, first_result)
+    });
+    let second_start = Arc::clone(&barrier);
+    let second_request = request.clone();
+    let second_result = result.clone();
+    let second = thread::spawn(move || {
+        second_start.wait();
+        second_store.complete_checkpoint_once(second_request, second_result)
+    });
+    let first = first
+        .join()
+        .map_err(|_| IoError::other("first checkpoint writer panicked"))??;
+    let replay = second
+        .join()
+        .map_err(|_| IoError::other("second checkpoint writer panicked"))??;
+    assert_eq!(replay, first);
+
+    let read_store = Store::open(root.path())?;
+    let mut changed_request = request.clone();
+    changed_request
+        .metadata
+        .insert("source_identity".to_owned(), "sha256:changed".to_owned());
     assert!(
-        registrations
-            .iter()
-            .all(|registration| registration.record.attempt_count == 2)
+        read_store
+            .complete_checkpoint_once(changed_request, result.clone())
+            .is_err()
     );
-    assert_eq!(
-        registrations
-            .iter()
-            .filter(|registration| registration.should_dispatch)
-            .count(),
-        1
+    assert!(
+        read_store
+            .complete_checkpoint_once(
+                request,
+                json!({"receipt":{"node_id":"node-a","state":"failed"}})
+            )
+            .is_err()
     );
+    let persisted = read_store
+        .get_job("ckp-campaign-a-node-a")?
+        .ok_or_else(|| IoError::other("checkpoint missing"))?;
+    assert_eq!(persisted, first);
     Ok(())
 }
 

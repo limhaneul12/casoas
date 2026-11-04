@@ -11,6 +11,22 @@ fn request(model: &str, provider: Provider, engine: Engine, effort: &str) -> Rou
 }
 
 #[test]
+fn historical_receipt_does_not_invent_local_process_closure() -> crate::Result<()> {
+    let route = validate_route(&request(
+        "gpt-6.1-sol",
+        Provider::OpenaiCodex,
+        Engine::CodexCli,
+        "high",
+    ))?;
+    let receipt = new_receipt(&route);
+    let legacy = serde_json::to_value(&receipt)?;
+    assert!(legacy.get("owned_processes_closed").is_none());
+    let decoded: Receipt = serde_json::from_value(legacy)?;
+    assert_eq!(decoded.owned_processes_closed, None);
+    Ok(())
+}
+
+#[test]
 fn historical_interactive_aliases_preserve_model_family_and_medium_gate() -> crate::Result<()> {
     for (alias, model) in [
         ("sonnet", "claude-sonnet-5-5-medium"),

@@ -26,6 +26,10 @@ pub enum TuiAction {
     EnterDag(Option<String>),
     ExitDag,
     ShowOverview,
+    ShowWorkBoard(Option<String>),
+    RunCouncil(String),
+    ShowVotes(String),
+    ShowRecovery(String),
     ShowPrompts(Option<String>),
     Back,
     ShowModels,
@@ -1207,7 +1211,11 @@ pub fn action_from_input(text: &str) -> TuiAction {
                 .map(str::to_owned),
         ),
         "/dag-exit" => TuiAction::ExitDag,
-        "/omh" | "/board" | "/todo" | "/plan" => TuiAction::ShowOverview,
+        "/omh" | "/todo" | "/plan" => TuiAction::ShowOverview,
+        "/board" => TuiAction::ShowWorkBoard(argument.map(str::to_owned)),
+        "/council" => TuiAction::RunCouncil(argument.unwrap_or_default().to_owned()),
+        "/votes" => TuiAction::ShowVotes(argument.unwrap_or_default().to_owned()),
+        "/recovery" => TuiAction::ShowRecovery(argument.unwrap_or_default().to_owned()),
         "/prompts" | "/promt" | "/trace" if argument.is_some_and(is_back_token) => TuiAction::Back,
         "/prompts" | "/promt" | "/trace" | "/prompt-trace" => {
             TuiAction::ShowPrompts(argument.map(str::to_owned))

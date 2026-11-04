@@ -224,7 +224,10 @@ const PYTHON_SLASH_FIXTURE: &[(&str, &str)] = &[
     ("/models", "show_models"),
     ("/lanes", "show_models"),
     ("/omh", "show_overview"),
-    ("/board", "show_overview"),
+    ("/board", "show_work_board"),
+    ("/council", "run_council"),
+    ("/votes", "show_votes"),
+    ("/recovery", "show_recovery"),
     ("/todo", "show_overview"),
     ("/plan", "show_overview"),
     ("/status", "show_status"),
@@ -378,6 +381,26 @@ fn unknown_slash_never_falls_through_to_provider_prompt() {
     assert_eq!(
         action_from_input("/not-a-command secret"),
         TuiAction::UnknownCommand("/not-a-command".to_owned())
+    );
+}
+
+#[test]
+fn organization_commands_preserve_workboard_limit_proposal_and_vote_identity() {
+    assert_eq!(
+        action_from_input("/board 7"),
+        TuiAction::ShowWorkBoard(Some("7".to_owned()))
+    );
+    assert_eq!(
+        action_from_input("/council verify handoff evidence"),
+        TuiAction::RunCouncil("verify handoff evidence".to_owned())
+    );
+    assert_eq!(
+        action_from_input("/votes cdx-council-1"),
+        TuiAction::ShowVotes("cdx-council-1".to_owned())
+    );
+    assert_eq!(
+        action_from_input("/recovery cdx-campaign-1"),
+        TuiAction::ShowRecovery("cdx-campaign-1".to_owned())
     );
 }
 

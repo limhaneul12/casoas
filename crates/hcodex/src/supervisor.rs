@@ -3,10 +3,11 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Semaphore, watch};
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::task::JoinSet;
 
 tokio::task_local! {
     static CANCELLATION: watch::Receiver<bool>;
@@ -19,6 +20,8 @@ pub struct Supervisor {
 }
 
 struct Inner {
+    closed: AtomicBool,
+    shutdown: Mutex<()>,
     permits: Arc<Semaphore>,
     tasks: Mutex<JoinSet<()>>,
     controls: Mutex<BTreeMap<String, TaskControl>>,
@@ -26,13 +29,14 @@ struct Inner {
 
 struct TaskControl {
     cancel: watch::Sender<bool>,
-    abort: AbortHandle,
 }
 
 impl Supervisor {
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Arc::new(Inner {
+                closed: AtomicBool::new(false),
+                shutdown: Mutex::new(()),
                 permits: Arc::new(Semaphore::new(capacity)),
                 tasks: Mutex::new(JoinSet::new()),
                 controls: Mutex::new(BTreeMap::new()),
@@ -44,10 +48,16 @@ impl Supervisor {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err("supervisor admission is closed".into());
+        }
         self.reap().await?;
         // Same lock order as reap/shutdown. Hold registration until the control
         // exists, so a fast task cannot remove it before it is inserted.
         let mut tasks = self.inner.tasks.lock().await;
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err("supervisor admission is closed".into());
+        }
         let mut controls = self.inner.controls.lock().await;
         if controls.contains_key(&job_id) {
             return Err(format!("job is already supervised: {job_id}").into());
@@ -80,8 +90,8 @@ impl Supervisor {
                 inner.controls.lock().await.remove(&task_id);
             }),
         );
-        let abort = tasks.spawn(wrapped);
-        controls.insert(job_id, TaskControl { cancel, abort });
+        let _abort = tasks.spawn(wrapped);
+        controls.insert(job_id, TaskControl { cancel });
         Ok(())
     }
 
@@ -99,35 +109,48 @@ impl Supervisor {
     }
 
     pub async fn shutdown(&self, grace: Duration) -> crate::Result<()> {
-        {
+        // Serialize complete shutdowns so a second caller cannot report success
+        // while the first still owns draining tasks. Callers must await shutdown.
+        let _shutdown = self.inner.shutdown.lock().await;
+        let mut tasks = {
+            let mut tasks = self.inner.tasks.lock().await;
+            self.inner.closed.store(true, Ordering::Release);
             let controls = self.inner.controls.lock().await;
             for control in controls.values() {
                 let _sent = control.cancel.send(true);
             }
-        }
+            std::mem::replace(&mut *tasks, JoinSet::new())
+        };
+        let mut first_error: Option<crate::Error> = None;
         let drain = async {
-            let mut tasks = self.inner.tasks.lock().await;
             while let Some(joined) = tasks.join_next().await {
-                joined?;
+                if let Err(error) = joined {
+                    first_error.get_or_insert_with(|| error.into());
+                }
             }
-            Ok::<_, crate::Error>(())
         };
         if tokio::time::timeout(grace, drain).await.is_err() {
-            for control in self.inner.controls.lock().await.values() {
-                control.abort.abort();
-            }
-            let mut tasks = self.inner.tasks.lock().await;
             tasks.abort_all();
+            first_error.get_or_insert_with(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "supervisor grace expired; owned tasks were forcibly aborted",
+                )
+                .into()
+            });
             while let Some(joined) = tasks.join_next().await {
                 if let Err(error) = joined
                     && !error.is_cancelled()
                 {
-                    return Err(error.into());
+                    first_error.get_or_insert_with(|| error.into());
                 }
             }
         }
         self.inner.controls.lock().await.clear();
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn reap(&self) -> crate::Result<()> {
@@ -203,7 +226,6 @@ async fn wait_for_cancel(receiver: &mut watch::Receiver<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[tokio::test]
     async fn cancel_and_shutdown_own_every_task() -> crate::Result<()> {
@@ -242,6 +264,96 @@ mod tests {
                 .is_err()
         );
         supervisor.shutdown(Duration::from_secs(10)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_admission_before_draining() -> crate::Result<()> {
+        let supervisor = Supervisor::new(2);
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        supervisor
+            .spawn("draining".to_owned(), async move {
+                cancelled().await;
+                let _ = cancelled_tx.send(());
+                let _ = finish_rx.await;
+            })
+            .await?;
+        let shutting_down = supervisor.clone();
+        let task =
+            tokio::spawn(async move { shutting_down.shutdown(Duration::from_secs(5)).await });
+        tokio::time::timeout(Duration::from_secs(5), cancelled_rx).await??;
+        assert!(supervisor.spawn("late".to_owned(), async {}).await.is_err());
+        let _ = finish_tx.send(());
+        task.await??;
+        assert_eq!(supervisor.active().await, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn panicked_child_does_not_skip_owned_sibling_cleanup() -> crate::Result<()> {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let supervisor = Supervisor::new(2);
+        let (panic_tx, panic_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&dropped);
+        supervisor
+            .spawn("panic".to_owned(), async move {
+                let _ = panic_rx.await;
+                std::panic::resume_unwind(Box::new("intentional supervised test panic"));
+            })
+            .await?;
+        supervisor
+            .spawn("sibling".to_owned(), async move {
+                let _drop = Dropped(observed);
+                let _ = ready_tx.send(());
+                std::future::pending::<()>().await;
+            })
+            .await?;
+        ready_rx.await?;
+        let _ = panic_tx.send(());
+        assert!(
+            supervisor
+                .shutdown(Duration::from_millis(50))
+                .await
+                .is_err()
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(supervisor.active().await, 0);
+        assert!(supervisor.spawn("late".to_owned(), async {}).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_joins_tasks_but_reports_grace_expiry() -> crate::Result<()> {
+        let supervisor = Supervisor::new(1);
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        supervisor
+            .spawn("uncooperative".to_owned(), async move {
+                let _ = ready_tx.send(());
+                std::future::pending::<()>().await;
+            })
+            .await?;
+        ready_rx.await?;
+        let error = supervisor
+            .shutdown(Duration::from_millis(20))
+            .await
+            .err()
+            .ok_or("forced shutdown must report grace expiry")?;
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::TimedOut)
+        );
+        assert_eq!(supervisor.active().await, 0);
+        assert!(supervisor.spawn("late".to_owned(), async {}).await.is_err());
         Ok(())
     }
 
@@ -295,6 +407,7 @@ mod tests {
         }
         assert_eq!(accepted, 1);
         supervisor.shutdown(Duration::from_secs(10)).await?;
+        let supervisor = Supervisor::new(2);
         for index in 0..100 {
             supervisor.spawn(format!("fast-{index}"), async {}).await?;
             // Await each control's removal; no timing assumption or detached task.

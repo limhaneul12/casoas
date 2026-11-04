@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use crate::gateway::{Gateway, optional, text};
 use crate::storage::{HandoffStatus, JobStatus};
 
-use super::adjudication::{adjudicate, canonical_digest};
+use super::adjudication::{adjudicate, canonical_digest, inspect_role};
 use super::orchestrator::snapshot_valid;
 use super::types::RoleSnapshot;
 
@@ -122,7 +122,7 @@ pub async fn decision_pack(gateway: &Gateway, args: &Value) -> crate::Result<Val
     }))
 }
 
-async fn load_source(
+pub(crate) async fn load_source(
     gateway: &Gateway,
     collaboration_id: &str,
     expected_workspace: Option<&Path>,
@@ -162,10 +162,13 @@ async fn load_source(
     };
     let mut role_fences = Vec::new();
     let mut handoff_fences = Vec::new();
-    for value in role_values.values() {
+    for (role, value) in role_values {
         let Ok(snapshot) = serde_json::from_value::<RoleSnapshot>(value.clone()) else {
             return Ok(None);
         };
+        if snapshot.role != *role {
+            return Ok(None);
+        }
         if !snapshot.review_artifact_present {
             continue;
         }
@@ -173,7 +176,7 @@ async fn load_source(
             return Ok(None);
         };
         if let Some(job_id) = snapshot.job_id {
-            role_fences.push((job_id, expected_digest));
+            role_fences.push((role.clone(), job_id, snapshot.verdict, expected_digest));
         } else if let Some(ticket_id) = snapshot.handoff_ticket_id {
             handoff_fences.push((ticket_id, snapshot.verdict, expected_digest));
         } else {
@@ -182,7 +185,7 @@ async fn load_source(
     }
     let role_jobs_valid = gateway
         .database(move |store| {
-            for (job_id, expected_digest) in role_fences {
+            for (role, job_id, expected_verdict, expected_digest) in role_fences {
                 let Some(job) = store.get_job(&job_id)? else {
                     return Ok(false);
                 };
@@ -198,7 +201,7 @@ async fn load_source(
                 else {
                     return Ok(false);
                 };
-                if canonical_digest(artifact)? != expected_digest {
+                if !role_artifact_matches(&role, expected_verdict, &expected_digest, artifact)? {
                     return Ok(false);
                 }
             }
@@ -226,7 +229,29 @@ async fn load_source(
     Ok(role_jobs_valid.then_some(result))
 }
 
-fn recompute(source: &Value) -> crate::Result<super::types::Adjudication> {
+fn role_artifact_matches(
+    role: &str,
+    expected_verdict: Option<super::types::Verdict>,
+    expected_digest: &str,
+    artifact: &Value,
+) -> crate::Result<bool> {
+    if canonical_digest(artifact)? != expected_digest {
+        return Ok(false);
+    }
+    let actual = inspect_role(
+        role,
+        Some(json!({
+            "ok":true,
+            "status":"succeeded",
+            "structured_output":artifact,
+        })),
+    );
+    Ok(actual.review_artifact_has_narrative
+        && actual.verdict.is_some()
+        && actual.verdict == expected_verdict)
+}
+
+pub(crate) fn recompute(source: &Value) -> crate::Result<super::types::Adjudication> {
     let object = source["roles"]
         .as_object()
         .ok_or("triad source has no role snapshots")?;
@@ -582,5 +607,26 @@ mod tests {
             "verification_evidence":"verified", "collaboration_id":collaboration_id,
             "workspace_dir":workspace, "expected_scope_digest":scope
         })
+    }
+
+    #[test]
+    fn child_artifact_verdict_and_narrative_must_match_parent_snapshot() -> crate::Result<()> {
+        let blocked = json!({"verdict":"BLOCK","summary":"blocked by red team"});
+        let digest = canonical_digest(&blocked)?;
+        assert!(!role_artifact_matches(
+            "codex",
+            Some(super::super::types::Verdict::Pass),
+            &digest,
+            &blocked,
+        )?);
+        let no_narrative = json!({"verdict":"PASS","findings":[]});
+        let digest = canonical_digest(&no_narrative)?;
+        assert!(!role_artifact_matches(
+            "codex",
+            Some(super::super::types::Verdict::Pass),
+            &digest,
+            &no_narrative,
+        )?);
+        Ok(())
     }
 }

@@ -41,6 +41,12 @@ pub struct OwnedProcessHandle {
     #[serde(default)]
     pub start_identity: String,
     pub registered_at_unix_ms: u128,
+    /// Startup disk observation, not a proof of the process's loaded image.
+    #[serde(default)]
+    pub startup_binary_sha256: Option<String>,
+    /// Version of the registering package; absent for external PID registration.
+    #[serde(default)]
+    pub registrant_package_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
