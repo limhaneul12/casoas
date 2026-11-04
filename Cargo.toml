@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/hcodex", "xtask"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.3.0"
+
+[workspace.lints.rust]
+warnings = "deny"
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"

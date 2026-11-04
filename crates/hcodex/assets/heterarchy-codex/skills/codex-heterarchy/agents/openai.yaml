@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tri-Polar Heterarchy (Argon ↔ Sonnet/Opus 5.5 ↔ Codex)"
+  short_description: "제미나이 4 아르곤, 클로드 소넷/오퍼스 5.5(Medium), OpenAI Codex 간의 검증 기반(Receipt-Verified) 3극 헤테라키 협업 및 오케스트레이션"
+  default_prompt: "Use $codex-heterarchy to coordinate Gemini 4 Argon, Claude Sonnet/Opus 5.5 (Medium), and OpenAI Codex with verified routing, execution receipts, and explicit partial/consensus state tracking."

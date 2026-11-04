@@ -1,39 +1,23 @@
-# Repository Agent Authority (`codex-collab-mcp`)
+# Repository Agent Authority (`hcodex`)
 
-Before modifying code in this repository, read and follow the materialized Alexandria Python Engineering Harness under `.agents/`:
+Read `.agents/README.md`, `.agents/rust_dev_harness/PROJECT_PROFILE.md`, `HARNESS.toml`, `HARNESS_MANIFEST.toml`, and `rules/README.md` before modifying Rust code. Activate normal + type rules for all Rust work, and async rules for task/process/network work. Repository code, typed boundaries and executed gates own concrete behavior.
 
-1. [`.agents/README.md`](./.agents/README.md)
-2. [`.agents/python_dev_harness/PROJECT_PROFILE.md`](./.agents/python_dev_harness/PROJECT_PROFILE.md)
-3. [`.agents/python_dev_harness/HARNESS.toml`](./.agents/python_dev_harness/HARNESS.toml)
-4. [`.agents/python_dev_harness/rules/README.md`](./.agents/python_dev_harness/rules/README.md)
+## Required contracts
 
-## Non-Optional Invariants
+- Rust Edition 2024; toolchain comes from `rust-toolchain.toml`; Cargo.lock is application dependency authority.
+- Safe-only: `unsafe_code = "forbid"`; no unwrap/expect/panic/todo/unimplemented in production.
+- Closed external input uses typed serde structures with `deny_unknown_fields`; historical persisted data remains readable without weakening new input validation.
+- One owner per effect: routing, runtime, storage, deterministic DAG/settlement, context, MCP/CLI/TUI adapters.
+- SQL lives in feature `.sql` files and uses prepared bindings. Enforce NUL, stacked statement and dangerous meta-command defenses. External CodeGraph DB handles are encoded read-only/immutable/query_only.
+- Own every task and child process. Bound queues/concurrency; cancellation and timeout kill/reap owned children. Persist unknown outcomes without inventing completion or starting a new request ID.
+- Actual model/usage/evidence must come from runtime receipts; queued handoffs are not collaboration completion, and role completion is not consensus.
+- Settled DAG nodes require real gate proof and scoped workspace-manifest verification. Skills and code context contain actual disk bodies/excerpts.
+- Preserve pre-existing dirty work, persisted state, public MCP tools, CLI behavior and source contracts during full Rust migration.
 
-- Built-in `getattr()`, `hasattr()`, and `setattr()` are **strictly forbidden** in production source (`app/`).
-- Every function and method in production source (`app/`) must have explicit parameter and return type annotations (`__init__ -> None`) with zero bare collections (`list`, `dict`, `tuple`, `set`, `frozenset`) and zero unapproved `Any`.
-- Do not abuse bare `*` keyword-only separators in function definitions (`def f(*, ...)` is forbidden unless `*_args` varargs are genuinely needed).
-- Always pass explicit keyword arguments (`변수=값`) when calling multi-argument functions, methods, and constructors so parameter bindings are immediately clear at call sites.
-- Symbolic string sets, path/config segment constants, model/engine aliases, capability sets, and any `Literal[...]` with $\ge 3$ string items must use `StrEnum` in a `*_enums.py` module (`class X(str, Enum)` is forbidden).
-- Manage subpackage public exports cleanly via `__init__.py` (`__all__`) rather than module-bottom singleton method-alias bindings.
-- Do not pass known dictionary shapes as raw `dict[str, Any]` / `dict[str, object]`:
-  - External I/O boundaries use **Pydantic v2** (`StrictSchemaModel`: `ConfigDict(extra="forbid", frozen=True, use_enum_values=True, validate_default=True)`).
-  - Validated internal I/O / DTOs use **`@dataclass(frozen=True, slots=True)`**.
-  - Every `to_dict(self)` method on internal DTOs must return an explicit **`TypedDict`**.
-- Avoid generic or stdlib-colliding module names (`json.py`, `http.py`, `utils.py`, `helpers.py`, `common.py`, `misc.py`, `models.py`, `types.py`, `schema.py`, `manager.py`).
-- Every function and method in production source (`app/`) must have a Google-style docstring (`"""... Args: ... Returns: ..."""` / `Yields:`).
-- Cohesion & Size Limits:
-  - Modules with $\ge 6$ functions of the same category/responsibility must group them into a cohesive Class.
-  - Every Class in `app/` must have **at most 6 behavioral methods** (excluding `__init__`, dunders, `@property`, and Pydantic validator hooks).
-  - Every module in `app/` must have **at most 430 structural lines** (excluding docstrings), and every package directory must have **at most 10 direct `.py` modules**.
-- Async functions must never call blocking `subprocess.*`, `time.sleep()`, or unowned `asyncio.create_task()`.
+## Canonical verification
 
-## Canonical Verification
-
-Run all 9 mechanical contract verifiers and quality gates before reporting completion:
-
-```bash
-uv run python .agents/python_dev_harness/verify_mechanical_contracts.py
-uv run ruff check app tests
-uv run pyrefly check
-uv run pytest
+```sh
+make ci
 ```
+
+This executes Rust mechanical rules and manifest integrity, formatting, workspace checks, strict all-target/all-feature Clippy with `-D warnings`, and tests. No skipped gate is PASS. The former project Python implementation, backups and environment are deleted; source hashes and historical SQLite compatibility fixtures remain.

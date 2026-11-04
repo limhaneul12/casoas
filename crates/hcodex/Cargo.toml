@@ -1,0 +1,29 @@
+[package]
+name = "hcodex"
+description = "Rust-native tri-polar MCP collaboration, CLI, and DAG terminal workbench"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ratatui = "0.29"
+crossterm = "0.28"
+unicode-width = "0.2"
+clap = { version = "4", features = ["derive", "env"] }
+walkdir = "2"
+regex = "1"
+toml_edit = "0.23"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

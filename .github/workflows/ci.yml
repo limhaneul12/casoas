@@ -1,48 +1,15 @@
-name: github action
-
+name: Rust CI
 on:
   push:
-    branches: ["main"]
+    branches: [main]
   pull_request:
-    branches: ["main"]
-
+    branches: [main]
 jobs:
   quality-gates:
-    name: Free-Threaded 3.14t Quality Gates
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-
-      - name: Set up Python 3.14t (Free-Threaded)
-        run: uv python install cpython-3.14+freethreaded
-
-      - name: Sync dependencies
-        run: uv sync --frozen
-
-      - name: Verify Free-Threaded (No-GIL) runtime
-        run: |
-          uv run python -c "import sys; assert 't' in getattr(sys, 'abiflags', ''); assert not sys._is_gil_enabled(); print('Verified Python', sys.version)"
-
-      - name: Mechanical harness & architecture contracts
-        run: |
-          if [ -f .agents/python_dev_harness/verify_mechanical_contracts.py ]; then
-            uv run python .agents/python_dev_harness/verify_mechanical_contracts.py
-          fi
-          uv run pytest -v -k test_mechanical_and_sqlite_retention_contracts
-
-      - name: Ruff format & lint check
-        run: |
-          uv run ruff format --check src tests
-          uv run ruff check src tests
-
-      - name: Pyrefly strict type check
-        run: uv run pyrefly check
-
-      - name: Pytest suite
-        run: uv run pytest -v
+      - uses: actions/checkout@v4
+      - name: Install repository toolchain
+        run: rustup show active-toolchain
+      - name: Rust contracts, formatting, strict lint, and tests
+        run: make ci

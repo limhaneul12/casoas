@@ -1,53 +1,43 @@
 .DEFAULT_GOAL := ci
-.PHONY: ci check harness ruff lint pyrefly typecheck test pytest tui status restart help
+.PHONY: ci check harness fmt lint test build install doctor tui status help
 
-UV ?= uv
+# Route Cargo through rustup's proxy; rust-toolchain.toml owns the version.
+export PATH := $(HOME)/.cargo/bin:$(PATH)
+CARGO ?= cargo
 
-help: ## 사용 가능한 Make 명령어 목록 출력
-	@printf "\033[1;36m=== Heterarchy Codex (codex-collab-mcp) Makefile Targets ===\033[0m\n"
-	@printf "  \033[1;32mmake ci\033[0m         하네스(9개 기계적 계약) + ruff + pyrefly + pytest 통합 점검\n"
-	@printf "  \033[1;32mmake check\033[0m      하네스 + ruff + pyrefly 정적 점검 (빠른 검사)\n"
-	@printf "  \033[1;32mmake harness\033[0m    .agents/python_dev_harness 9개 기계적 계약 검증\n"
-	@printf "  \033[1;32mmake ruff\033[0m       Ruff 린트 점검 (app, tests)\n"
-	@printf "  \033[1;32mmake pyrefly\033[0m    Pyrefly 엄격 정적 타입 점검\n"
-	@printf "  \033[1;32mmake test\033[0m       Pytest 전체 테스트 스위트 실행\n"
-	@printf "  \033[1;32mmake tui\033[0m        hcodex tui 대화형 워크벤치 실행\n"
-	@printf "  \033[1;32mmake status\033[0m     hcodex status 브릿지 및 모델 상태 확인\n"
-	@printf "  \033[1;32mmake restart\033[0m    hcodex restart 데몬 재시작\n"
+ci:
+	$(CARGO) xtask ci
 
-harness: ## 9개 하네스 기계적 계약 검증 (.agents/python_dev_harness)
-	@printf "\033[1;36m[1/4] Running Alexandria Python Dev Harness (9 Mechanical Contracts)...\033[0m\n"
-	$(UV) run python .agents/python_dev_harness/verify_mechanical_contracts.py
+check:
+	$(CARGO) xtask check
 
-ruff: ## Ruff 린트 점검
-	@printf "\033[1;36m[2/4] Running Ruff Lint Check (app, tests)...\033[0m\n"
-	$(UV) run ruff check app tests
+harness:
+	$(CARGO) xtask rules
 
-lint: ruff
+fmt:
+	$(CARGO) xtask fmt
 
-pyrefly: ## Pyrefly 정적 타입 점검
-	@printf "\033[1;36m[3/4] Running Pyrefly Strict Type Check...\033[0m\n"
-	$(UV) run pyrefly check
+lint:
+	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
 
-typecheck: pyrefly
+test:
+	$(CARGO) xtask test
 
-test: ## Pytest 테스트 스위트 실행
-	@printf "\033[1;36m[4/4] Running Pytest Suite...\033[0m\n"
-	$(UV) run pytest -q
+build:
+	$(CARGO) build --release --package hcodex
 
-pytest: test
+install:
+	$(CARGO) install --path crates/hcodex --locked
 
-check: harness ruff pyrefly ## 빠른 정적 검증 (하네스 + ruff + pyrefly)
-	@printf "\033[1;32m✔ [CHECK PASS] Harness + Ruff + Pyrefly checks passed!\033[0m\n"
+doctor:
+	$(CARGO) xtask doctor
 
-ci: harness ruff pyrefly test ## 전체 CI 파이프라인 (하네스 + ruff + pyrefly + pytest)
-	@printf "\033[1;32m✔ [CI PASS] All 9 Harness Contracts + Ruff + Pyrefly + Pytest gates passed!\033[0m\n"
 
-tui: ## hcodex TUI 워크벤치 실행
-	$(UV) run hcodex tui
+tui:
+	$(CARGO) run --package hcodex -- tui
 
-status: ## hcodex 상태 점검
-	$(UV) run hcodex status
+status:
+	$(CARGO) run --package hcodex -- status
 
-restart: ## hcodex MCP 데몬 재시작
-	$(UV) run hcodex restart
+help:
+	@printf '%s\n' 'make ci       Rust rules + fmt + check + strict Clippy + tests' 'make harness  Rust mechanical contracts' 'make build    release binary' 'make install  install hcodex' 'make tui      interactive workbench'

@@ -1,0 +1,9 @@
+[toolchain]
+policy = "current-stable"
+
+[verification]
+supply_chain = false
+
+[unsafe]
+mode = "forbid"
+approved_crates = []

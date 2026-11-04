@@ -1,0 +1,19 @@
+# Python input/completion parity
+
+Historical authority: Git HEAD `app/core/tui_completer.py` (`TuiSuggestionEngine.suggest`, `apply_completion`, `_read_tty_loop`) and `tests/test_dag_ulw_and_tui.py` suggestion assertions. The Rust catalog currently has only token-prefix matching and drops the historical contextual command recipes, Korean keyword search, selection execution and editing controls.
+
+Restore contextual slash recipes/model/skill/effect/permission choices, actual registered skills including plugin aliases, active-first and duplicate suppression, bounded workspace file/directory completion, Unicode-safe replacement at the actual cursor, force-open completion, Tab/selected Enter/right acceptance, history and ESC/Ctrl-U/W/P/N/D behavior. Preserve bracketed paste, DAG-mode ordinary-text routing, authoritative skill activation, stage/motion fields and source-context safety. Missing skills must not be fabricated as fallback catalog entries.
+
+Ownership: completion worker owns `tui/completion.rs` and input/completion sections of `tui/model.rs`. Root owns completion rendering and context/status integration. New item metadata exposes display label, badge, replacement start and execution policy; public runtime/provider contracts remain unchanged.
+
+Add focused historical-contract tests first, then run module tests, relevant model/render checks and strict Clippy. Root owns final canonical CI, installation and actual terminal verification.
+
+## Delivery and verification
+
+Restored contextual `/use`/`model`, skills presets and registered names, DAG-mode exit, prompt inspection, effect/reasoning/theme and permission recipes; Korean keyword matching; registered global/plugin-qualified skills with active-first ranking and duplicate suppression; workspace directories/JSON-quoted paths/range suffixes; UTF-8 cursor-safe replacement; force-open Tab/Down, selected Enter execution, end-right completion, bounded session history, Shift-Tab/Up/Ctrl-P, Down/Ctrl-N, ESC dismiss/clear/back, Ctrl-U/W and empty Ctrl-D exit. Unknown slash commands remain rejected unless the actual catalog resolves a registered skill, and `$skill` input retains the rest of its prompt for registry validation.
+
+Completion item metadata now carries `display_label`, `badge`, `replace_start`, `submit_on_enter`; `value`/`detail` remain. `completion_ghost()` is presentation only and never edits input. The completion menu keeps up to 64 matches, history 100 entries and file catalog 8,192 entries at depth 8; file discovery is a session-start snapshot. Historical Python did not implement `@file` autocomplete, but its bounded/safe file expansion is handled separately by the context owner.
+
+All **39 TUI tests** passed against integrated current source, including five new completion/input regressions, inspector page/clamp/back restoration, and root's HUD/menu/ghost checks. Strict `cargo clippy -p hcodex --all-targets --all-features -- -D warnings` and `cargo xtask rules` passed. PageUp/PageDown move the current inspector by ten body rows and preserve prior position through Back. Root owns canonical CI and native installed TUI acceptance; these checks do not claim provider execution or full Python parity outside this slice.
+
+Final bounded parity follow-through restores the historical actual Git branch HUD metadata without spawning git. Catalog discovery reads the nearest `.git/HEAD`, follows explicit worktree/submodule `gitdir:` metadata, labels detached identities as `detached@<8 hex>`, and reports no branch for missing/corrupt metadata instead of inventing `main`. Reads are capped at 4 KiB. The normal/nested/worktree/detached/no-Git fixture and inspector multiline/page/back regression passed, followed by strict Clippy. Catalog home discovery honors `HCODEX_HOME` consistently with the application adapter. Inspector bodies normalize embedded newlines before logical paging.

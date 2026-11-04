@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "source": "repository plugin/heterarchy-codex",
+  "purpose": "Standalone hcodex setup fallback",
+  "files": {
+    "mcp_config.json": "sha256:cb2237e9cbdf771336e6abdfcecf4686db9eb0a83d1afa6fe74ce1d4fa2ad98d",
+    "plugin.json": "sha256:0734fed9361cac3dd8b9cccfbedc8bd4a5376be6b6ab9e99480d8dd0ea084470",
+    "rules/AGENTS.md": "sha256:3849d0e1aafafb6dbaef62292db32d6be73d06b9da9a312dbfe809d889c0505f",
+    "skills/codex-heterarchy/SKILL.md": "sha256:2e3a37fdc12be0f130e0721bc5f2c99d3b6c6e1909601baecf8acd6efb465b3a",
+    "skills/codex-heterarchy/agents/openai.yaml": "sha256:81fc9c8ee667d5c1ce0aa471d047f0ac8e319e08aa8f93573cff80845dd37813"
+  }
+}

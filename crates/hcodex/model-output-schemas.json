@@ -1,0 +1,699 @@
+{
+  "codex_adversarial_audit": {
+    "request": {
+      "type": "object",
+      "description": "Pydantic v2 boundary contract for Codex adversarial audit outputs.",
+      "additionalProperties": false,
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "PASS",
+            "WARN",
+            "BLOCK"
+          ],
+          "description": "Explicit structured review and audit verdicts."
+        },
+        "risk_score": {
+          "type": "integer",
+          "description": "0 (safe) to 100 (critical failure risk)"
+        },
+        "executive_critique": {
+          "type": "string",
+          "description": "Direct, unfiltered technical summary of what could break in production."
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "Validated red-team finding entry.",
+            "additionalProperties": false,
+            "properties": {
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "CRITICAL",
+                  "HIGH",
+                  "MEDIUM",
+                  "LOW"
+                ],
+                "description": "Severity levels for adversarial audit findings."
+              },
+              "category": {
+                "type": "string",
+                "description": "Category e.g. 'race_condition', 'memory_leak', 'logic_bug', 'type_hole', 'edge_case', 'security'"
+              },
+              "location": {
+                "type": "string",
+                "description": "Function, class, or line reference"
+              },
+              "flaw_description": {
+                "type": "string",
+                "description": "Precise technical explanation of the flaw"
+              },
+              "trigger_scenario": {
+                "type": "string",
+                "description": "Concrete input, timing, or state sequence that triggers the failure"
+              },
+              "recommended_fix": {
+                "type": "string",
+                "description": "Minimal, idiomatic code or architectural fix"
+              }
+            },
+            "required": [
+              "severity",
+              "category",
+              "location",
+              "flaw_description",
+              "trigger_scenario",
+              "recommended_fix"
+            ]
+          }
+        },
+        "failing_test_cases": {
+          "type": "array",
+          "description": "Concrete pytest/unit test code snippets that would expose the flaws.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "alexandria_decision_note": {
+          "type": "string",
+          "description": "Concise architectural takeaway suitable for storing in Alexandria memory via alexandria_verified_upsert."
+        }
+      },
+      "required": [
+        "verdict",
+        "risk_score",
+        "executive_critique",
+        "findings",
+        "failing_test_cases",
+        "alexandria_decision_note"
+      ]
+    },
+    "validation": {
+      "$defs": {
+        "AuditFindingModel": {
+          "additionalProperties": false,
+          "description": "Validated red-team finding entry.",
+          "properties": {
+            "severity": {
+              "$ref": "#/$defs/AuditSeverity"
+            },
+            "category": {
+              "description": "Category e.g. 'race_condition', 'memory_leak', 'logic_bug', 'type_hole', 'edge_case', 'security'",
+              "title": "Category",
+              "type": "string"
+            },
+            "location": {
+              "description": "Function, class, or line reference",
+              "title": "Location",
+              "type": "string"
+            },
+            "flaw_description": {
+              "description": "Precise technical explanation of the flaw",
+              "title": "Flaw Description",
+              "type": "string"
+            },
+            "trigger_scenario": {
+              "description": "Concrete input, timing, or state sequence that triggers the failure",
+              "title": "Trigger Scenario",
+              "type": "string"
+            },
+            "recommended_fix": {
+              "description": "Minimal, idiomatic code or architectural fix",
+              "title": "Recommended Fix",
+              "type": "string"
+            }
+          },
+          "required": [
+            "severity",
+            "category",
+            "location",
+            "flaw_description",
+            "trigger_scenario",
+            "recommended_fix"
+          ],
+          "title": "AuditFindingModel",
+          "type": "object"
+        },
+        "AuditSeverity": {
+          "description": "Severity levels for adversarial audit findings.",
+          "enum": [
+            "CRITICAL",
+            "HIGH",
+            "MEDIUM",
+            "LOW"
+          ],
+          "title": "AuditSeverity",
+          "type": "string"
+        },
+        "AuditVerdict": {
+          "description": "Explicit structured review and audit verdicts.",
+          "enum": [
+            "PASS",
+            "WARN",
+            "BLOCK"
+          ],
+          "title": "AuditVerdict",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Pydantic v2 boundary contract for Codex adversarial audit outputs.",
+      "properties": {
+        "verdict": {
+          "$ref": "#/$defs/AuditVerdict",
+          "description": "PASS if production-ready, WARN if minor risks exist, BLOCK if critical flaws exist."
+        },
+        "risk_score": {
+          "description": "0 (safe) to 100 (critical failure risk)",
+          "title": "Risk Score",
+          "type": "integer"
+        },
+        "executive_critique": {
+          "description": "Direct, unfiltered technical summary of what could break in production.",
+          "title": "Executive Critique",
+          "type": "string"
+        },
+        "findings": {
+          "items": {
+            "$ref": "#/$defs/AuditFindingModel"
+          },
+          "title": "Findings",
+          "type": "array"
+        },
+        "failing_test_cases": {
+          "description": "Concrete pytest/unit test code snippets that would expose the flaws.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Failing Test Cases",
+          "type": "array"
+        },
+        "alexandria_decision_note": {
+          "description": "Concise architectural takeaway suitable for storing in Alexandria memory via alexandria_verified_upsert.",
+          "title": "Alexandria Decision Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "risk_score",
+        "executive_critique",
+        "findings",
+        "failing_test_cases",
+        "alexandria_decision_note"
+      ],
+      "title": "AdversarialAuditOutput",
+      "type": "object"
+    },
+    "defaults": {}
+  },
+  "codex_targeted_synthesize": {
+    "request": {
+      "type": "object",
+      "description": "Pydantic v2 boundary contract for Codex targeted synthesis outputs.",
+      "additionalProperties": false,
+      "properties": {
+        "language": {
+          "type": "string",
+          "description": "Programming language (e.g., python, rust, typescript)"
+        },
+        "implementation_code": {
+          "type": "string",
+          "description": "Complete, drop-in, production-ready code with zero placeholders or TODOs."
+        },
+        "unit_tests": {
+          "type": "string",
+          "description": "Runnable unit test suite verifying the implementation."
+        },
+        "edge_cases_handled": {
+          "type": "array",
+          "description": "List of boundary conditions explicitly guarded in the code.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "complexity_analysis": {
+          "type": "string",
+          "description": "Time and space complexity + concurrency/lock-contention guarantees."
+        }
+      },
+      "required": [
+        "language",
+        "implementation_code",
+        "unit_tests",
+        "edge_cases_handled",
+        "complexity_analysis"
+      ]
+    },
+    "validation": {
+      "additionalProperties": false,
+      "description": "Pydantic v2 boundary contract for Codex targeted synthesis outputs.",
+      "properties": {
+        "language": {
+          "description": "Programming language (e.g., python, rust, typescript)",
+          "title": "Language",
+          "type": "string"
+        },
+        "implementation_code": {
+          "description": "Complete, drop-in, production-ready code with zero placeholders or TODOs.",
+          "title": "Implementation Code",
+          "type": "string"
+        },
+        "unit_tests": {
+          "description": "Runnable unit test suite verifying the implementation.",
+          "title": "Unit Tests",
+          "type": "string"
+        },
+        "edge_cases_handled": {
+          "description": "List of boundary conditions explicitly guarded in the code.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Edge Cases Handled",
+          "type": "array"
+        },
+        "complexity_analysis": {
+          "description": "Time and space complexity + concurrency/lock-contention guarantees.",
+          "title": "Complexity Analysis",
+          "type": "string"
+        }
+      },
+      "required": [
+        "language",
+        "implementation_code",
+        "unit_tests",
+        "edge_cases_handled",
+        "complexity_analysis"
+      ],
+      "title": "TargetedSynthesisOutput",
+      "type": "object"
+    },
+    "defaults": {}
+  },
+  "codex_differential_implementations": {
+    "request": {
+      "type": "object",
+      "description": "Pydantic v2 boundary contract for differential candidate exploration.",
+      "additionalProperties": false,
+      "properties": {
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "description": "Single optimization-axis candidate implementation.",
+            "additionalProperties": false,
+            "properties": {
+              "axis": {
+                "type": "string",
+                "description": "Optimization axis (e.g. 'Maximal Throughput / Zero-Copy', 'Minimal Simplicity / Stdlib-Only', 'Strict Fault-Isolation')"
+              },
+              "strategy_name": {
+                "type": "string",
+                "description": "Short title for this candidate approach"
+              },
+              "code": {
+                "type": "string",
+                "description": "Complete, runnable implementation for this candidate"
+              },
+              "pros": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "cons": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "estimated_complexity": {
+                "type": "string",
+                "description": "Big-O time/memory and operational overhead"
+              }
+            },
+            "required": [
+              "axis",
+              "strategy_name",
+              "code",
+              "pros",
+              "cons",
+              "estimated_complexity"
+            ]
+          }
+        },
+        "argon_selection_guide": {
+          "type": "string",
+          "description": "Decision matrix guiding Gemini 4 Argon on which candidate fits which system constraint."
+        }
+      },
+      "required": [
+        "candidates",
+        "argon_selection_guide"
+      ]
+    },
+    "validation": {
+      "$defs": {
+        "DifferentialCandidateModel": {
+          "additionalProperties": false,
+          "description": "Single optimization-axis candidate implementation.",
+          "properties": {
+            "axis": {
+              "description": "Optimization axis (e.g. 'Maximal Throughput / Zero-Copy', 'Minimal Simplicity / Stdlib-Only', 'Strict Fault-Isolation')",
+              "title": "Axis",
+              "type": "string"
+            },
+            "strategy_name": {
+              "description": "Short title for this candidate approach",
+              "title": "Strategy Name",
+              "type": "string"
+            },
+            "code": {
+              "description": "Complete, runnable implementation for this candidate",
+              "title": "Code",
+              "type": "string"
+            },
+            "pros": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Pros",
+              "type": "array"
+            },
+            "cons": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Cons",
+              "type": "array"
+            },
+            "estimated_complexity": {
+              "description": "Big-O time/memory and operational overhead",
+              "title": "Estimated Complexity",
+              "type": "string"
+            }
+          },
+          "required": [
+            "axis",
+            "strategy_name",
+            "code",
+            "pros",
+            "cons",
+            "estimated_complexity"
+          ],
+          "title": "DifferentialCandidateModel",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Pydantic v2 boundary contract for differential candidate exploration.",
+      "properties": {
+        "candidates": {
+          "items": {
+            "$ref": "#/$defs/DifferentialCandidateModel"
+          },
+          "title": "Candidates",
+          "type": "array"
+        },
+        "argon_selection_guide": {
+          "description": "Decision matrix guiding Gemini 4 Argon on which candidate fits which system constraint.",
+          "title": "Argon Selection Guide",
+          "type": "string"
+        }
+      },
+      "required": [
+        "candidates",
+        "argon_selection_guide"
+      ],
+      "title": "DifferentialCandidatesOutput",
+      "type": "object"
+    },
+    "defaults": {}
+  },
+  "codex_rescue_sandbox": {
+    "request": {
+      "type": "object",
+      "description": "Pydantic v2 boundary contract for isolated rescue sandbox diagnosis.",
+      "additionalProperties": false,
+      "properties": {
+        "root_cause": {
+          "type": "string",
+          "description": "Exact root cause identified for the failure or bug."
+        },
+        "fix_strategy": {
+          "type": "string",
+          "description": "Why this fix resolves the issue without regressions."
+        },
+        "patch_or_replacement_code": {
+          "type": "string",
+          "description": "Unified diff or complete replacement code block."
+        },
+        "verification_commands": {
+          "type": "array",
+          "description": "Exact commands Argon or the user should run to verify the fix.",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "root_cause",
+        "fix_strategy",
+        "patch_or_replacement_code",
+        "verification_commands"
+      ]
+    },
+    "validation": {
+      "additionalProperties": false,
+      "description": "Pydantic v2 boundary contract for isolated rescue sandbox diagnosis.",
+      "properties": {
+        "root_cause": {
+          "description": "Exact root cause identified for the failure or bug.",
+          "title": "Root Cause",
+          "type": "string"
+        },
+        "fix_strategy": {
+          "description": "Why this fix resolves the issue without regressions.",
+          "title": "Fix Strategy",
+          "type": "string"
+        },
+        "patch_or_replacement_code": {
+          "description": "Unified diff or complete replacement code block.",
+          "title": "Patch Or Replacement Code",
+          "type": "string"
+        },
+        "verification_commands": {
+          "description": "Exact commands Argon or the user should run to verify the fix.",
+          "items": {
+            "type": "string"
+          },
+          "title": "Verification Commands",
+          "type": "array"
+        }
+      },
+      "required": [
+        "root_cause",
+        "fix_strategy",
+        "patch_or_replacement_code",
+        "verification_commands"
+      ],
+      "title": "RescueDiagnosisOutput",
+      "type": "object"
+    },
+    "defaults": {}
+  },
+  "claude_code_craft": {
+    "request": {
+      "type": "object",
+      "description": "Pydantic v2 boundary contract for Claude Sonnet 5.5 / Opus 5.5 code craft.",
+      "additionalProperties": false,
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "PASS",
+            "WARN",
+            "BLOCK"
+          ],
+          "description": "Explicit structured review and audit verdicts."
+        },
+        "summary": {
+          "type": "string"
+        },
+        "crafted_code": {
+          "type": "string"
+        },
+        "design_highlights": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "edge_cases_guarded": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "handoff_notes_for_codex_audit": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "summary",
+        "crafted_code",
+        "design_highlights",
+        "edge_cases_guarded",
+        "handoff_notes_for_codex_audit"
+      ]
+    },
+    "validation": {
+      "$defs": {
+        "AuditVerdict": {
+          "description": "Explicit structured review and audit verdicts.",
+          "enum": [
+            "PASS",
+            "WARN",
+            "BLOCK"
+          ],
+          "title": "AuditVerdict",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Pydantic v2 boundary contract for Claude Sonnet 5.5 / Opus 5.5 code craft.",
+      "properties": {
+        "verdict": {
+          "$ref": "#/$defs/AuditVerdict"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "crafted_code": {
+          "default": "",
+          "title": "Crafted Code",
+          "type": "string"
+        },
+        "design_highlights": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Design Highlights",
+          "type": "array"
+        },
+        "edge_cases_guarded": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Edge Cases Guarded",
+          "type": "array"
+        },
+        "handoff_notes_for_codex_audit": {
+          "default": "",
+          "title": "Handoff Notes For Codex Audit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "summary"
+      ],
+      "title": "ClaudeCraftOutput",
+      "type": "object"
+    },
+    "defaults": {
+      "crafted_code": "",
+      "design_highlights": [],
+      "edge_cases_guarded": [],
+      "handoff_notes_for_codex_audit": ""
+    }
+  },
+  "argon_review": {
+    "request": {
+      "type": "object",
+      "description": "Pydantic v2 boundary contract for Gemini 4 Argon architectural adjudication.",
+      "additionalProperties": false,
+      "properties": {
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "PASS",
+            "WARN",
+            "BLOCK"
+          ],
+          "description": "Explicit structured review and audit verdicts."
+        },
+        "summary": {
+          "type": "string"
+        },
+        "architectural_risks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "final_recommendation": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "summary",
+        "architectural_risks",
+        "final_recommendation"
+      ]
+    },
+    "validation": {
+      "$defs": {
+        "AuditVerdict": {
+          "description": "Explicit structured review and audit verdicts.",
+          "enum": [
+            "PASS",
+            "WARN",
+            "BLOCK"
+          ],
+          "title": "AuditVerdict",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Pydantic v2 boundary contract for Gemini 4 Argon architectural adjudication.",
+      "properties": {
+        "verdict": {
+          "$ref": "#/$defs/AuditVerdict"
+        },
+        "summary": {
+          "title": "Summary",
+          "type": "string"
+        },
+        "architectural_risks": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Architectural Risks",
+          "type": "array"
+        },
+        "final_recommendation": {
+          "default": "",
+          "title": "Final Recommendation",
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "summary"
+      ],
+      "title": "ArgonReviewOutput",
+      "type": "object"
+    },
+    "defaults": {
+      "architectural_risks": [],
+      "final_recommendation": ""
+    }
+  }
+}
