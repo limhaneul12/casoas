@@ -1,6 +1,40 @@
 use super::*;
 
 #[test]
+fn research_commands_remain_explicit_while_development_dag_mode_is_active() -> Result<()> {
+    let mut app = TuiApp::new_with_motion(
+        PathBuf::from("workspace"),
+        TuiCatalog::command_catalog(),
+        false,
+    );
+    app.set_dag_mode(true);
+    app.handle_paste("/research --plan-only -- compare contracts");
+    assert_eq!(
+        app.submit()?,
+        Some(TuiAction::RunResearch(
+            "--plan-only -- compare contracts".to_owned()
+        ))
+    );
+    assert!(app.dag_mode);
+    assert_eq!(
+        action_from_input("/research-status research-existing"),
+        TuiAction::ShowResearchStatus("research-existing".to_owned())
+    );
+    assert_eq!(app.active_workspace(), WorkspaceKind::Research);
+    app.apply_update(TuiUpdate::ValidatedAction(TuiAction::SelectWorkspace(
+        WorkspaceKind::Building,
+    )));
+    app.handle_paste("ordinary development request");
+    assert_eq!(
+        app.submit()?,
+        Some(TuiAction::AutoDag(
+            "ordinary development request".to_owned()
+        ))
+    );
+    Ok(())
+}
+
+#[test]
 fn inspector_pages_clamp_and_back_restores_the_previous_position() -> Result<()> {
     let mut app = TuiApp::new_with_motion(PathBuf::from("workspace"), TuiCatalog::default(), false);
     app.apply_update(TuiUpdate::View {
@@ -37,7 +71,7 @@ fn contextual_completion_replaces_the_full_recipe_and_enter_executes_selection()
         false,
     );
     app.handle_paste("/use a tail");
-    app.cursor = "/use a".len();
+    app.active_pane_mut().cursor = "/use a".len();
     app.refresh_completions();
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?;
     assert_eq!(app.input(), "/use argon tail");
@@ -265,6 +299,200 @@ fn skill_labels_wait_for_registry_confirmation() -> Result<()> {
     Ok(())
 }
 
+fn workflow_lane(id: &str) -> DagLaneView {
+    DagLaneView {
+        id: id.to_owned(),
+        layer: 0,
+        dependencies: Vec::new(),
+        title: id.to_owned(),
+        summary: "workspace lane".to_owned(),
+        role: "planner".to_owned(),
+        model: "gpt-6.1-sol".to_owned(),
+        effort: "high".to_owned(),
+        state: LaneState::Running,
+        note: String::new(),
+        elapsed: None,
+    }
+}
+
+#[test]
+fn workspace_reservation_is_atomic_and_late_or_foreign_updates_are_ignored() {
+    let mut app = TuiApp::new_with_motion(PathBuf::from("workspace"), TuiCatalog::default(), false);
+    app.apply_update(TuiUpdate::WorkspaceStarted {
+        run_id: "flow-one".to_owned(),
+        selected: vec![WorkspaceKind::Research],
+        objective: "investigate".to_owned(),
+    });
+    app.apply_update(TuiUpdate::WorkspaceStarted {
+        run_id: "flow-two".to_owned(),
+        selected: vec![WorkspaceKind::Research, WorkspaceKind::Planning],
+        objective: "must not partially reserve".to_owned(),
+    });
+    assert_eq!(
+        app.workspace_pane(WorkspaceKind::Research).current_run_id(),
+        Some("flow-one")
+    );
+    assert_eq!(
+        app.workspace_pane(WorkspaceKind::Planning).current_run_id(),
+        None
+    );
+    app.apply_update(TuiUpdate::WorkspaceScoped {
+        run_id: "foreign".to_owned(),
+        workspace: WorkspaceKind::Research,
+        update: WorkspaceUpdate::View {
+            title: "wrong".to_owned(),
+            body: vec!["must not appear".to_owned()],
+        },
+    });
+    assert_eq!(
+        app.workspace_pane(WorkspaceKind::Research)
+            .ignored_updates(),
+        1
+    );
+    app.apply_update(TuiUpdate::WorkspaceScoped {
+        run_id: "flow-one".to_owned(),
+        workspace: WorkspaceKind::Research,
+        update: WorkspaceUpdate::Status {
+            status: WorkspaceRunStatus::Completed,
+            detail: "source report persisted".to_owned(),
+        },
+    });
+    app.apply_update(TuiUpdate::WorkspaceFinished {
+        run_id: "flow-one".to_owned(),
+        status: WorkspaceRunStatus::Completed,
+    });
+    assert_eq!(
+        app.workspace_pane(WorkspaceKind::Research).status(),
+        WorkspaceRunStatus::Completed
+    );
+    assert_eq!(
+        app.workspace_pane(WorkspaceKind::Research).current_run_id(),
+        None
+    );
+    app.apply_update(TuiUpdate::WorkspaceScoped {
+        run_id: "flow-one".to_owned(),
+        workspace: WorkspaceKind::Research,
+        update: WorkspaceUpdate::Status {
+            status: WorkspaceRunStatus::Failed,
+            detail: "late result".to_owned(),
+        },
+    });
+    assert_eq!(
+        app.workspace_pane(WorkspaceKind::Research).status(),
+        WorkspaceRunStatus::Completed
+    );
+    assert_eq!(
+        app.workspace_pane(WorkspaceKind::Research)
+            .ignored_updates(),
+        2
+    );
+}
+
+#[test]
+fn workspace_switching_retains_drafts_views_and_lanes() -> Result<()> {
+    let mut app = TuiApp::new_with_motion(PathBuf::from("workspace"), TuiCatalog::default(), false);
+    app.apply_update(TuiUpdate::ValidatedAction(TuiAction::SelectWorkspace(
+        WorkspaceKind::Research,
+    )));
+    app.handle_paste("research draft");
+    app.apply_update(TuiUpdate::WorkspaceStarted {
+        run_id: "flow".to_owned(),
+        selected: vec![WorkspaceKind::Research, WorkspaceKind::Planning],
+        objective: "connected".to_owned(),
+    });
+    app.apply_update(TuiUpdate::WorkspaceScoped {
+        run_id: "flow".to_owned(),
+        workspace: WorkspaceKind::Research,
+        update: WorkspaceUpdate::View {
+            title: "Research result".to_owned(),
+            body: (0..40).map(|index| format!("source {index}")).collect(),
+        },
+    });
+    app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))?;
+    let research_scroll = app.view_scroll();
+    assert!(research_scroll > 0);
+    app.apply_update(TuiUpdate::ValidatedAction(TuiAction::SelectWorkspace(
+        WorkspaceKind::Planning,
+    )));
+    app.handle_paste("planning draft");
+    app.apply_update(TuiUpdate::WorkspaceScoped {
+        run_id: "flow".to_owned(),
+        workspace: WorkspaceKind::Planning,
+        update: WorkspaceUpdate::Lanes(vec![workflow_lane("plan")]),
+    });
+    assert_eq!(app.input(), "planning draft");
+    assert_eq!(app.lanes()[0].id, "plan");
+    app.apply_update(TuiUpdate::ValidatedAction(TuiAction::SelectWorkspace(
+        WorkspaceKind::Research,
+    )));
+    assert_eq!(app.input(), "research draft");
+    assert_eq!(
+        app.current_view().map(|view| view.0),
+        Some("Research result")
+    );
+    assert_eq!(app.view_scroll(), research_scroll);
+    assert!(app.lanes().is_empty());
+    Ok(())
+}
+
+#[test]
+fn research_and_planning_plain_text_override_dag_mode_without_implicit_building() -> Result<()> {
+    let mut app = TuiApp::new_with_motion(PathBuf::from("workspace"), TuiCatalog::default(), false);
+    app.apply_update(TuiUpdate::ValidatedAction(TuiAction::EnterDag(None)));
+    app.apply_update(TuiUpdate::ValidatedAction(TuiAction::SelectWorkspace(
+        WorkspaceKind::Research,
+    )));
+    app.handle_paste("find evidence");
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?,
+        Some(TuiAction::RunResearch("-- find evidence".to_owned()))
+    );
+    app.apply_update(TuiUpdate::ValidatedAction(TuiAction::SelectWorkspace(
+        WorkspaceKind::Planning,
+    )));
+    app.handle_paste("design feature");
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?,
+        Some(TuiAction::RunPlanning("design feature".to_owned()))
+    );
+    app.apply_update(TuiUpdate::ValidatedAction(TuiAction::SelectWorkspace(
+        WorkspaceKind::Building,
+    )));
+    app.handle_paste("implement feature");
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?,
+        Some(TuiAction::AutoDag("implement feature".to_owned()))
+    );
+    Ok(())
+}
+
+#[test]
+fn workspace_commands_preserve_existing_plan_and_numeric_navigation() -> Result<()> {
+    assert_eq!(action_from_input("/plan"), TuiAction::ShowOverview);
+    assert_eq!(
+        action_from_input("/space planning"),
+        TuiAction::SelectWorkspace(WorkspaceKind::Planning)
+    );
+    assert_eq!(
+        action_from_input("/workflow --through building -- feature"),
+        TuiAction::RunWorkflow("--through building -- feature".to_owned())
+    );
+    let mut app = TuiApp::new_with_motion(PathBuf::from("workspace"), TuiCatalog::default(), false);
+    app.apply_update(TuiUpdate::View {
+        title: "overlay".to_owned(),
+        body: vec!["body".to_owned()],
+    });
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))?,
+        Some(TuiAction::ShowSkills)
+    );
+    assert_eq!(
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT))?,
+        Some(TuiAction::SelectWorkspace(WorkspaceKind::Planning))
+    );
+    Ok(())
+}
+
 #[test]
 fn aliases_and_commands_map_to_typed_actions() {
     let mut app = TuiApp::new_with_motion(
@@ -370,8 +598,8 @@ fn compact_reduces_local_views_without_fabricating_token_reclamation() {
         ))));
     }
     app.apply_update(TuiUpdate::CompactHistory);
-    assert_eq!(app.view_history.len(), 1);
-    assert_eq!(app.transcript.len(), 50);
+    assert_eq!(app.overlay_history.len(), 1);
+    assert_eq!(app.transcript().len(), 50);
     assert_eq!(app.tokens.input, Some(100));
     assert_eq!(app.tokens.output, Some(50));
 }
@@ -488,4 +716,79 @@ fn history_recall_does_not_open_completion_popup_while_typing_autocompletes() ->
         "recalling input history with Up must not spam the completion popup"
     );
     Ok(())
+}
+
+#[test]
+fn repeated_scoped_lane_snapshots_preserve_the_observed_running_clock() {
+    let mut app = TuiApp::new_with_motion(PathBuf::from("workspace"), TuiCatalog::default(), false);
+    app.apply_update(TuiUpdate::WorkspaceStarted {
+        run_id: "flow-clock".into(),
+        selected: vec![WorkspaceKind::Building],
+        objective: "clock".into(),
+    });
+    let mut lane = workflow_lane("writer");
+    lane.state = LaneState::Running;
+    for _ in 0..2 {
+        app.apply_update(TuiUpdate::WorkspaceScoped {
+            run_id: "flow-clock".into(),
+            workspace: WorkspaceKind::Building,
+            update: WorkspaceUpdate::Lanes(vec![lane.clone()]),
+        });
+    }
+    let first = app.workspace_pane(WorkspaceKind::Building).lane_clocks["writer"].0;
+    app.apply_update(TuiUpdate::WorkspaceScoped {
+        run_id: "flow-clock".into(),
+        workspace: WorkspaceKind::Building,
+        update: WorkspaceUpdate::Lanes(vec![lane.clone()]),
+    });
+    assert_eq!(
+        app.workspace_pane(WorkspaceKind::Building).lane_clocks["writer"].0,
+        first
+    );
+    lane.state = LaneState::Accepted;
+    app.apply_update(TuiUpdate::WorkspaceScoped {
+        run_id: "flow-clock".into(),
+        workspace: WorkspaceKind::Building,
+        update: WorkspaceUpdate::Lanes(vec![lane]),
+    });
+    assert!(
+        app.workspace_pane(WorkspaceKind::Building)
+            .lane_clocks
+            .is_empty()
+    );
+}
+
+#[test]
+fn whole_flow_finish_releases_reservations_without_inventing_stage_completion() {
+    let mut app = TuiApp::new_with_motion(PathBuf::from("workspace"), TuiCatalog::default(), false);
+    app.apply_update(TuiUpdate::WorkspaceStarted {
+        run_id: "flow-unobserved".into(),
+        selected: vec![WorkspaceKind::Research, WorkspaceKind::Planning],
+        objective: "bounded".into(),
+    });
+    app.apply_update(TuiUpdate::WorkspaceScoped {
+        run_id: "flow-unobserved".into(),
+        workspace: WorkspaceKind::Research,
+        update: WorkspaceUpdate::Status {
+            status: WorkspaceRunStatus::Running,
+            detail: "started".into(),
+        },
+    });
+    app.apply_update(TuiUpdate::WorkspaceFinished {
+        run_id: "flow-unobserved".into(),
+        status: WorkspaceRunStatus::Completed,
+    });
+    assert_eq!(
+        app.workspace_pane(WorkspaceKind::Research).status(),
+        WorkspaceRunStatus::Stopped
+    );
+    assert_eq!(
+        app.workspace_pane(WorkspaceKind::Planning).status(),
+        WorkspaceRunStatus::Blocked
+    );
+    assert!(
+        app.workspace_tabs()
+            .iter()
+            .all(|(_, pane)| pane.current_run_id().is_none())
+    );
 }

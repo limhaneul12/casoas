@@ -1,0 +1,10 @@
+# Portable mechanical policy; personal .agents and .cargo data are not build inputs.
+[toolchain]
+policy = "current-stable"
+
+[verification]
+supply_chain = false
+
+[unsafe]
+mode = "forbid"
+approved_crates = []

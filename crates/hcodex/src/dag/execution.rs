@@ -29,6 +29,10 @@ const DEFAULT_MAX_PARALLEL_NODES: usize = 4;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum DagExecutionEvent {
+    /// Intermediate live updates were lost; reconcile from durable campaign state.
+    ProjectionLagged {
+        dropped_events: usize,
+    },
     WaveStarted {
         wave_index: usize,
         node_ids: Vec<String>,
@@ -786,6 +790,28 @@ fn tool_name(node: &DagNode) -> &'static str {
     }
 }
 
+fn node_route_fields(node: &DagNode) -> Value {
+    let mut args = json!({"reasoning_effort":node.reasoning_effort});
+    if node.role == NodeRole::InterfaceBuilder {
+        args["claude_model"] = json!(node.model);
+    } else {
+        args["model"] = json!(node.model);
+        if node.model.starts_with("gemini-") {
+            args["engine"] = json!("antigravity_cli");
+        }
+    }
+    args
+}
+
+pub(crate) fn validate_node_route(node: &DagNode) -> Result<crate::routing::Route> {
+    let request = crate::gateway::build_route_request(
+        tool_name(node),
+        &node_route_fields(node),
+        String::new(),
+    )?;
+    crate::routing::validate_route(&request)
+}
+
 const NODE_CONTEXT_CEILING_BYTES: usize = 120 * 1024;
 const NODE_CONTEXT_RESERVE_BYTES: usize = 64 * 1024;
 
@@ -819,18 +845,15 @@ fn node_arguments(
         .saturating_add(contract_bytes);
     let context_budget = NODE_CONTEXT_CEILING_BYTES.min(total_cap.saturating_sub(overhead));
     let target_context = node_target_context(workspace, node, pre_manifest, context_budget)?;
-    let mut args = json!({
-        "workspace_dir": workspace,
-        "files_inspected": files,
-        "symbols_inspected": node.symbols,
-        "reasoning_effort": node.reasoning_effort,
-        "timeout_seconds": timeout.as_secs_f64(),
-        "max_input_bytes": max_input_bytes,
-    });
+    let mut args = node_route_fields(node);
+    args["workspace_dir"] = json!(workspace);
+    args["files_inspected"] = json!(files);
+    args["symbols_inspected"] = json!(node.symbols);
+    args["timeout_seconds"] = json!(timeout.as_secs_f64());
+    args["max_input_bytes"] = json!(max_input_bytes);
     if node.role == NodeRole::InterfaceBuilder {
         args["task_spec"] = Value::String(task);
         args["target_code_or_context"] = Value::String(target_context);
-        args["claude_model"] = Value::String(node.model.clone());
         args["invariants_and_rules"] = Value::String(invariants.to_owned());
         if let Some(contract) = contract_value {
             args["patch_contract"] = contract;
@@ -839,10 +862,6 @@ fn node_arguments(
         args["audit_focus"] = Value::String(task);
         args["target_code_or_diff"] = Value::String(target_context);
         args["design_rationale"] = Value::String(format!("DAG lane {} ({:?})", node.id, node.role));
-        args["model"] = Value::String(node.model.clone());
-        if node.model.starts_with("gemini-") {
-            args["engine"] = Value::String("antigravity_local_rpc".to_owned());
-        }
     }
     Ok(args)
 }
@@ -1172,7 +1191,7 @@ async fn run_gate(
     execute_gate_command(workspace, timeout, command, program, arguments, false).await
 }
 
-fn default_gate_command(workspace: &Path, requested: Option<&str>) -> String {
+pub(crate) fn default_gate_command(workspace: &Path, requested: Option<&str>) -> String {
     requested.map(str::to_owned).unwrap_or_else(|| {
         if workspace.join("Cargo.toml").is_file() {
             "cargo test --workspace --all-targets".to_owned()
@@ -1208,6 +1227,10 @@ async fn execute_gate_command(
         exit_code: if completed { proof.exit_code } else { None },
         stdout_digest: completed.then(|| format!("sha256:{:x}", Sha256::digest(digest))),
     })
+}
+
+pub(crate) fn gate_command_supported(command: &str) -> bool {
+    allowlisted_command(command).is_some()
 }
 
 fn allowlisted_command(command: &str) -> Option<(&'static str, &'static [&'static str])> {

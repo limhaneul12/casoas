@@ -170,6 +170,13 @@ pub fn current_job_id() -> Option<String> {
     JOB_ID.try_with(Clone::clone).ok()
 }
 
+pub(crate) async fn scope_cancellation<F: Future>(
+    receiver: watch::Receiver<bool>,
+    future: F,
+) -> F::Output {
+    CANCELLATION.scope(receiver, future).await
+}
+
 /// Capture the parent's task-local ownership before moving a future into JoinSet.
 pub(crate) fn inherit_context<F>(future: F) -> impl Future<Output = F::Output>
 where

@@ -286,7 +286,7 @@ fn terminal_and_closed(output: &Value) -> bool {
                 && r["status"] == "succeeded"
                 && r["outcome_state"] == "confirmed_success"
                 && match r["engine"].as_str() {
-                    Some("codex_cli") => r["owned_processes_closed"] == true,
+                    Some("codex_cli" | "antigravity_cli") => r["owned_processes_closed"] == true,
                     Some("antigravity_rpc" | "antigravity_local_rpc" | "http_api") => true,
                     _ => false,
                 }

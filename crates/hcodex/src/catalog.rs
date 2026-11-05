@@ -1,31 +1,23 @@
-//! Pinned MCP wire contracts captured from the previous registered server.
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+//! Shared backend operation schemas for CLI, terminal, and application requests.
+use serde::Deserialize;
+use serde_json::Value;
 use std::sync::LazyLock;
 
-static TOOLS: LazyLock<Option<Vec<ToolDefinition>>> =
-    LazyLock::new(|| serde_json::from_str(include_str!("../mcp-tools.json")).ok());
+static OPERATIONS: LazyLock<Option<Vec<OperationDefinition>>> =
+    LazyLock::new(|| serde_json::from_str(include_str!("../backend-operations.json")).ok());
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: Option<String>,
-    pub input_schema: Value,
-    #[serde(flatten)]
-    pub metadata: Map<String, Value>,
+struct OperationDefinition {
+    name: String,
+    input_schema: Value,
 }
 
-pub fn tools() -> crate::Result<Vec<ToolDefinition>> {
-    TOOLS
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| "invalid embedded mcp-tools.json".into())
-}
-
-/// Rejects unknown arguments and applies the previous server's defaults.
+/// Rejects unknown arguments and applies the shared operation defaults.
 pub fn arguments(name: &str, value: Value) -> crate::Result<Value> {
-    let tools = TOOLS.as_ref().ok_or("invalid embedded mcp-tools.json")?;
+    let tools = OPERATIONS
+        .as_ref()
+        .ok_or("invalid embedded backend-operations.json")?;
     let tool = tools
         .iter()
         .find(|tool| tool.name == name)
@@ -58,7 +50,7 @@ pub fn arguments(name: &str, value: Value) -> crate::Result<Value> {
     Ok(Value::Object(args))
 }
 
-/// Validates the pinned wire/schema subset including references and nested closed objects.
+/// Validates the backend schema subset including references and nested closed objects.
 pub fn validate_schema(value: &Value, schema: &Value) -> crate::Result<()> {
     validate(value, schema, schema, "$", 0)
 }

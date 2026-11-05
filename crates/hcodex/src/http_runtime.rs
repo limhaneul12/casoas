@@ -84,7 +84,11 @@ pub async fn execute(
         .or_else(|_| std::env::var("OPENAI_BASE_URL"))
         .unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_owned());
-    let client = Client::builder().timeout(limit).build()?;
+    let mut builder = Client::builder().connect_timeout(Duration::from_secs(10));
+    if !limit.is_zero() {
+        builder = builder.timeout(limit);
+    }
+    let client = builder.build()?;
     execute_with_client(
         request, limit, options, schema, &client, &base_url, &api_key,
     )
@@ -100,9 +104,6 @@ async fn execute_with_client(
     base_url: &str,
     api_key: &str,
 ) -> crate::Result<ExecutionResult> {
-    if limit.is_zero() {
-        return Err("HTTP timeout must be greater than zero".into());
-    }
     if request.prompt.len() > options.max_input_bytes {
         return Err("prompt exceeds max_input_bytes".into());
     }
@@ -116,6 +117,7 @@ async fn execute_with_client(
         options.idempotency_key.clone(),
     );
     let started = Instant::now();
+    let deadline = crate::execution_policy::ExecutionDeadline::from_limit(limit);
     let schema_name = "hcodex_response";
     let payload = ChatRequest {
         model: &route.resolved_model,
@@ -139,16 +141,15 @@ async fn execute_with_client(
         }),
     };
     let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    let response = client
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .json(&payload)
-        .send()
-        .await;
+    let response = tokio::select! {
+        response=client.post(endpoint).bearer_auth(api_key).json(&payload).send()=>response,
+        ()=deadline.wait()=>return Ok(interrupted_result(receipt,false,started)),
+        ()=crate::supervisor::cancelled()=>return Ok(interrupted_result(receipt,true,started)),
+    };
     receipt.duration_ms = millis(started.elapsed());
     let response = match response {
         Ok(response) => response,
-        Err(error) if error.is_timeout() || started.elapsed() >= limit => {
+        Err(error) if error.is_timeout() || (!limit.is_zero() && started.elapsed() >= limit) => {
             receipt.status = ReceiptStatus::TimedOutUnknown;
             receipt.outcome_state = "outcome_unknown".to_owned();
             receipt.error =
@@ -171,22 +172,30 @@ async fn execute_with_client(
         ));
         return Ok(empty_result(receipt));
     }
-    let body = match response.json::<ChatResponse>().await {
-        Ok(body) => body,
-        Err(error) if error.is_timeout() || started.elapsed() >= limit => {
-            receipt.duration_ms = millis(started.elapsed());
-            receipt.status = ReceiptStatus::TimedOutUnknown;
-            receipt.outcome_state = "outcome_unknown".to_owned();
-            receipt.error =
-                Some("HTTP completion body timed out; provider outcome is unknown".to_owned());
-            return Ok(empty_result(receipt));
+    let body_read = async {
+        let mut response = response;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if bytes.len().saturating_add(chunk.len()) > 2 * 1024 * 1024 {
+                return Err("HTTP completion body exceeded byte budget".into());
+            }
+            bytes.extend_from_slice(&chunk);
         }
-        Err(error) => {
-            receipt.status = ReceiptStatus::Failed;
-            receipt.outcome_state = "confirmed_failure".to_owned();
-            receipt.error = Some(format!("invalid HTTP completion response: {error}"));
-            return Ok(empty_result(receipt));
-        }
+        Ok::<ChatResponse, crate::Error>(serde_json::from_slice(&bytes)?)
+    };
+    let body = tokio::select! {
+        result=body_read=>match result {
+            Ok(body)=>body,
+            Err(error)=>{
+                receipt.duration_ms=millis(started.elapsed());
+                receipt.status=if !limit.is_zero() && deadline.is_elapsed(){ReceiptStatus::TimedOutUnknown}else{ReceiptStatus::Failed};
+                receipt.outcome_state=if receipt.status==ReceiptStatus::TimedOutUnknown{"outcome_unknown"}else{"confirmed_failure"}.into();
+                receipt.error=Some(redacted_error(&format!("invalid HTTP completion response: {error}"),api_key));
+                return Ok(empty_result(receipt));
+            }
+        },
+        ()=deadline.wait()=>return Ok(interrupted_result(receipt,false,started)),
+        ()=crate::supervisor::cancelled()=>return Ok(interrupted_result(receipt,true,started)),
     };
     receipt.duration_ms = millis(started.elapsed());
     receipt.actual_model = Some(body.model.clone());
@@ -216,6 +225,7 @@ async fn execute_with_client(
             structured_output: None,
             session_id: None,
             exit_code: None,
+            search_evidence: None,
         });
     }
     let structured_output = if let Some(output_schema) = schema {
@@ -233,6 +243,7 @@ async fn execute_with_client(
                     structured_output: None,
                     session_id: None,
                     exit_code: None,
+                    search_evidence: None,
                 });
             }
         };
@@ -250,6 +261,7 @@ async fn execute_with_client(
                 structured_output: Some(parsed),
                 session_id: None,
                 exit_code: None,
+                search_evidence: None,
             });
         }
         Some(parsed)
@@ -266,7 +278,31 @@ async fn execute_with_client(
         structured_output,
         session_id: None,
         exit_code: Some(0),
+        search_evidence: None,
     })
+}
+
+fn interrupted_result(
+    mut receipt: crate::routing::Receipt,
+    cancelled: bool,
+    started: Instant,
+) -> ExecutionResult {
+    receipt.duration_ms = millis(started.elapsed());
+    receipt.status = if cancelled {
+        ReceiptStatus::Cancelled
+    } else {
+        ReceiptStatus::TimedOutUnknown
+    };
+    receipt.outcome_state = "outcome_unknown".into();
+    receipt.error = Some(
+        if cancelled {
+            "HTTP completion cancelled; remote outcome is unconfirmed"
+        } else {
+            "HTTP completion deadline elapsed; provider outcome is unknown"
+        }
+        .into(),
+    );
+    empty_result(receipt)
 }
 
 fn empty_result(mut receipt: crate::routing::Receipt) -> ExecutionResult {
@@ -278,6 +314,7 @@ fn empty_result(mut receipt: crate::routing::Receipt) -> ExecutionResult {
         structured_output: None,
         session_id: None,
         exit_code: None,
+        search_evidence: None,
     }
 }
 
@@ -332,6 +369,7 @@ mod tests {
     fn options() -> ExecutionOptions {
         ExecutionOptions {
             requested_model_override: None,
+            progress: None,
             workspace_dir: None,
             sandbox_mode: SandboxMode::ReadOnly,
             request_id: Some("cdx-http-test".to_owned()),

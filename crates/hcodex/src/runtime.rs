@@ -1,32 +1,31 @@
 //! Owned subprocess and local Antigravity Connect-RPC execution boundaries.
 
+mod antigravity_cli;
+mod cli_io;
 mod config;
+mod search;
+pub use antigravity_cli::{
+    execute_antigravity_with_binary_and_options, execute_antigravity_with_options,
+    resolve_antigravity_binary,
+};
 pub(crate) use config::{ConfiguredCodexDefault, resolve_codex_default};
+pub use search::{SearchEvidence, SearchPolicy, SearchStopReason, execute_codex_web_discovery};
 
 use crate::routing::{
     Engine, Receipt, ReceiptStatus, Route, RouteErrorCode, RouteRequest, SandboxMode,
     classify_stderr_auth, digest_output, new_receipt_with_context, redact_sensitive_text,
     validate_route,
 };
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::timeout;
 
-const CONNECT_SERVICE: &str = "exa.language_server_pb.LanguageServerService";
 const MAX_REVIEW_INSTRUCTIONS_ARG_BYTES: usize = 96 * 1024;
-
-static CSRF_TOKEN_RE: LazyLock<Option<Regex>> =
-    LazyLock::new(|| Regex::new(r"--csrf_token(?:=|\s+)([^\s]+)").ok());
-static LISTEN_PORT_RE: LazyLock<Option<Regex>> =
-    LazyLock::new(|| Regex::new(r"127\.0\.0\.1:(\d+)\s+\(LISTEN\)").ok());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionResult {
@@ -37,9 +36,20 @@ pub struct ExecutionResult {
     pub structured_output: Option<Value>,
     pub session_id: Option<String>,
     pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_evidence: Option<SearchEvidence>,
 }
 
-#[derive(Debug, Clone)]
+pub type ProgressObserver = std::sync::Arc<
+    dyn Fn(
+            crate::routing::ExecutionProgress,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
 pub struct ExecutionOptions {
     pub workspace_dir: Option<PathBuf>,
     pub sandbox_mode: SandboxMode,
@@ -49,6 +59,21 @@ pub struct ExecutionOptions {
     pub attempt_count: u32,
     /// Trusted preflight alias; actual/resolved model proof remains independent.
     pub requested_model_override: Option<String>,
+    pub progress: Option<ProgressObserver>,
+}
+
+impl std::fmt::Debug for ExecutionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionOptions")
+            .field("workspace_dir", &self.workspace_dir)
+            .field("sandbox_mode", &self.sandbox_mode)
+            .field("request_id", &self.request_id)
+            .field("attempt_count", &self.attempt_count)
+            .field("max_input_bytes", &self.max_input_bytes)
+            .field("requested_model_override", &self.requested_model_override)
+            .field("progress_observer", &self.progress.is_some())
+            .finish()
+    }
 }
 
 impl Default for ExecutionOptions {
@@ -61,6 +86,7 @@ impl Default for ExecutionOptions {
             max_input_bytes: 256_000,
             attempt_count: 1,
             requested_model_override: None,
+            progress: None,
         }
     }
 }
@@ -83,400 +109,6 @@ pub struct AntigravityModel {
     pub placeholder: String,
     pub remaining_quota: Option<f64>,
     pub routable: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct AntigravityEndpoint {
-    pub base_url: String,
-    pub csrf_token: String,
-    pub pid: u32,
-}
-
-#[derive(Default)]
-struct AntigravityState {
-    cached: Option<(AntigravityEndpoint, Instant)>,
-    consecutive_failures: u8,
-    open_until: Option<Instant>,
-    probe_in_flight: bool,
-}
-
-fn antigravity_state() -> &'static Mutex<AntigravityState> {
-    static STATE: OnceLock<Mutex<AntigravityState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(AntigravityState::default()))
-}
-
-fn antigravity_success(endpoint: Option<AntigravityEndpoint>) -> crate::Result<()> {
-    let mut state = antigravity_state()
-        .lock()
-        .map_err(|_| "Antigravity state lock poisoned")?;
-    if let Some(endpoint) = endpoint {
-        state.cached = Some((endpoint, Instant::now()));
-    }
-    state.consecutive_failures = 0;
-    state.open_until = None;
-    state.probe_in_flight = false;
-    Ok(())
-}
-
-fn antigravity_failure() -> crate::Result<()> {
-    let mut state = antigravity_state()
-        .lock()
-        .map_err(|_| "Antigravity state lock poisoned")?;
-    state.cached = None;
-    state.probe_in_flight = false;
-    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-    if state.consecutive_failures >= 3 {
-        state.open_until = Some(Instant::now() + Duration::from_secs(30));
-    }
-    Ok(())
-}
-
-#[derive(Clone)]
-pub struct AntigravityClient {
-    http: reqwest::Client,
-}
-
-impl AntigravityClient {
-    pub fn new() -> crate::Result<Self> {
-        Ok(Self {
-            http: reqwest::Client::builder()
-                .danger_accept_invalid_certs(true)
-                .build()?,
-        })
-    }
-
-    pub async fn discover(&self) -> crate::Result<Option<AntigravityEndpoint>> {
-        {
-            let mut state = antigravity_state()
-                .lock()
-                .map_err(|_| "Antigravity state lock poisoned")?;
-            let now = Instant::now();
-            if let Some(until) = state.open_until {
-                if until > now {
-                    return Err("Antigravity circuit breaker is open".into());
-                }
-                if state.probe_in_flight {
-                    return Err("Antigravity half-open probe is already in flight".into());
-                }
-                state.probe_in_flight = true;
-                state.open_until = None;
-            }
-            if let Some((endpoint, cached_at)) = &state.cached
-                && now.duration_since(*cached_at) < Duration::from_secs(15)
-            {
-                return Ok(Some(endpoint.clone()));
-            }
-        }
-        let process_output =
-            match probe_command(&["ps", "-axo", "pid,command"], Duration::from_secs(5)).await {
-                Ok(output) => output,
-                Err(error) => {
-                    antigravity_failure()?;
-                    return Err(error);
-                }
-            };
-        let candidates = endpoint_candidates(
-            &process_output,
-            std::env::var("ANTIGRAVITY_CSRF_TOKEN").ok().as_deref(),
-        )?;
-        for (pid, token) in candidates {
-            let pid_text = pid.to_string();
-            let Ok(ports_output) = probe_command(
-                &[
-                    "lsof",
-                    "-nP",
-                    "-a",
-                    "-p",
-                    &pid_text,
-                    "-iTCP",
-                    "-sTCP:LISTEN",
-                ],
-                Duration::from_secs(5),
-            )
-            .await
-            else {
-                continue;
-            };
-            for port in listen_ports(&ports_output)? {
-                for scheme in ["https", "http"] {
-                    let endpoint = AntigravityEndpoint {
-                        base_url: format!("{scheme}://127.0.0.1:{port}"),
-                        csrf_token: token.clone(),
-                        pid,
-                    };
-                    if self
-                        .catalog(&endpoint, Duration::from_millis(2500))
-                        .await
-                        .is_ok()
-                    {
-                        antigravity_success(Some(endpoint.clone()))?;
-                        return Ok(Some(endpoint));
-                    }
-                }
-            }
-        }
-        antigravity_failure()?;
-        Ok(None)
-    }
-
-    pub async fn catalog(
-        &self,
-        endpoint: &AntigravityEndpoint,
-        limit: Duration,
-    ) -> crate::Result<Vec<AntigravityModel>> {
-        let payload = self
-            .post(endpoint, "GetCascadeModelConfigData", json!({}), limit)
-            .await?;
-        parse_antigravity_catalog(&payload)
-    }
-
-    pub async fn refresh_at(
-        &self,
-        endpoint: &AntigravityEndpoint,
-        limit: Duration,
-    ) -> crate::Result<Value> {
-        let response = self
-            .post(endpoint, "RefreshMcpServers", json!({}), limit)
-            .await?;
-        let readback = self
-            .post(endpoint, "GetCascadeModelConfigData", json!({}), limit)
-            .await?;
-        antigravity_success(Some(endpoint.clone()))?;
-        Ok(json!({
-            "ok": true,
-            "endpoint": endpoint.base_url,
-            "pid": endpoint.pid,
-            "csrf_token_redacted": true,
-            "refresh_response": redact_value(response, &endpoint.csrf_token),
-            "readback": redact_value(readback, &endpoint.csrf_token),
-        }))
-    }
-
-    pub async fn execute_with_options(
-        &self,
-        request: RouteRequest,
-        limit: Duration,
-        options: &ExecutionOptions,
-    ) -> crate::Result<ExecutionResult> {
-        let route = validate_route(&request)?;
-        let mut failure_receipt = receipt(&route, options);
-        let endpoint = match self.discover().await {
-            Ok(Some(endpoint)) => endpoint,
-            Ok(None) => {
-                mark_failure_code(
-                    &mut failure_receipt,
-                    "Antigravity language_server is unavailable",
-                    RouteErrorCode::DependencyUnavailable,
-                );
-                return Ok(empty_result(failure_receipt));
-            }
-            Err(error) => {
-                let message = redact_sensitive_text(&error.to_string());
-                let code = antigravity_discovery_error_code(&message);
-                mark_failure_code(&mut failure_receipt, &message, code);
-                return Ok(empty_result(failure_receipt));
-            }
-        };
-        self.execute_at_with_options(request, limit, &endpoint, options)
-            .await
-    }
-
-    pub async fn execute_at_with_options(
-        &self,
-        request: RouteRequest,
-        limit: Duration,
-        endpoint: &AntigravityEndpoint,
-        options: &ExecutionOptions,
-    ) -> crate::Result<ExecutionResult> {
-        verify_input_budget(&request, options)?;
-        let route = validate_route(&request)?;
-        if route.engine != Engine::AntigravityRpc {
-            return Err("route is not Antigravity RPC".into());
-        }
-        let mut receipt = receipt(&route, options);
-        let started = Instant::now();
-        let catalog = match self.catalog(endpoint, Duration::from_secs(5)).await {
-            Ok(catalog) => catalog,
-            Err(error) => {
-                mark_failure_code(
-                    &mut receipt,
-                    &redact_sensitive_text(&error.to_string()),
-                    RouteErrorCode::DependencyUnavailable,
-                );
-                return Ok(empty_result(receipt));
-            }
-        };
-        let Some(model) = catalog
-            .iter()
-            .find(|item| item.model_id == route.resolved_model)
-        else {
-            mark_failure_code(
-                &mut receipt,
-                &format!(
-                    "model is not advertised by Antigravity: {}",
-                    route.resolved_model
-                ),
-                RouteErrorCode::DependencyUnavailable,
-            );
-            return Ok(empty_result(receipt));
-        };
-        if !model.routable {
-            let code = if model.remaining_quota.is_some_and(|quota| quota <= 0.0) {
-                RouteErrorCode::AntigravityQuotaExhausted
-            } else {
-                RouteErrorCode::DependencyUnavailable
-            };
-            mark_failure_code(
-                &mut receipt,
-                &format!(
-                    "model is not routable or has no quota: {}",
-                    route.resolved_model
-                ),
-                code,
-            );
-            return Ok(empty_result(receipt));
-        }
-        let response = tokio::select! {
-            response = self.post(
-                endpoint,
-                "GetModelResponse",
-                json!({"model": model.placeholder, "prompt": request.prompt}),
-                limit,
-            ) => response,
-            () = crate::supervisor::cancelled() => {
-                receipt.duration_ms = millis(started.elapsed());
-                mark_cancelled(&mut receipt, "Antigravity RPC cancelled by caller; remote outcome may require reconciliation");
-                return Ok(empty_result(receipt));
-            }
-        };
-        if let Some(decision) = receipt.routing_decision.as_mut() {
-            decision.placeholder = Some(model.placeholder.clone());
-        }
-        receipt.duration_ms = millis(started.elapsed());
-        let response = match response {
-            Ok(value) => {
-                antigravity_success(Some(endpoint.clone()))?;
-                value
-            }
-            Err(error) if error.to_string().contains("timed out") => {
-                antigravity_failure()?;
-                mark_timeout(&mut receipt, &error.to_string());
-                return Ok(empty_result(receipt));
-            }
-            Err(error) => {
-                antigravity_failure()?;
-                mark_failure_code(
-                    &mut receipt,
-                    &redact_sensitive_text(&error.to_string()),
-                    RouteErrorCode::DependencyUnavailable,
-                );
-                return Ok(empty_result(receipt));
-            }
-        };
-        let provider_reported_model = response
-            .get("modelId")
-            .or_else(|| response.get("actualModel"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        let (actual_model, identity_source) = if let Some(actual) = provider_reported_model {
-            (Some(actual), Some("provider_reported".to_owned()))
-        } else {
-            (
-                Some(model.model_id.clone()),
-                Some("antigravity_catalog_verified".to_owned()),
-            )
-        };
-        let output = response
-            .get("response")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let (mut tokens_in, mut tokens_out) = (0, 0);
-        collect_usage(&response, &mut tokens_in, &mut tokens_out);
-        finish_receipt(
-            &mut receipt,
-            &route,
-            actual_model,
-            identity_source,
-            &output,
-            tokens_in,
-            tokens_out,
-        );
-        Ok(ExecutionResult {
-            receipt,
-            placeholder: Some(model.placeholder.clone()),
-            structured_output: extract_json(&output),
-            output,
-            session_id: None,
-            exit_code: Some(0),
-        })
-    }
-
-    async fn post(
-        &self,
-        endpoint: &AntigravityEndpoint,
-        method: &str,
-        payload: Value,
-        limit: Duration,
-    ) -> crate::Result<Value> {
-        let url = format!("{}/{CONNECT_SERVICE}/{method}", endpoint.base_url);
-        let body = timeout(limit, async {
-            let response = self
-                .http
-                .post(url)
-                .header("content-type", "application/json")
-                .header("x-codeium-csrf-token", &endpoint.csrf_token)
-                .json(&payload)
-                .send()
-                .await?
-                .error_for_status()?;
-            response.json::<Value>().await
-        })
-        .await
-        .map_err(|_| "Antigravity RPC timed out after dispatch")??;
-        Ok(body)
-    }
-}
-
-fn antigravity_discovery_error_code(message: &str) -> RouteErrorCode {
-    if message.contains("circuit breaker is open") || message.contains("half-open probe") {
-        RouteErrorCode::AntigravityCircuitOpen
-    } else {
-        RouteErrorCode::DependencyUnavailable
-    }
-}
-
-pub async fn refresh_mcp_servers_and_readback(limit: Duration) -> crate::Result<Value> {
-    let client = AntigravityClient::new()?;
-    let endpoint = client
-        .discover()
-        .await?
-        .ok_or("Antigravity language_server is unavailable")?;
-    client.refresh_at(&endpoint, limit).await
-}
-
-fn redact_value(mut value: Value, secret: &str) -> Value {
-    match &mut value {
-        Value::String(text) => {
-            if !secret.is_empty() {
-                *text = text.replace(secret, "[REDACTED]");
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                *item = redact_value(item.take(), secret);
-            }
-        }
-        Value::Object(object) => {
-            for item in object.values_mut() {
-                *item = redact_value(item.take(), secret);
-            }
-        }
-        _ => {}
-    }
-    value
 }
 
 pub fn resolve_codex_binary() -> PathBuf {
@@ -570,7 +202,7 @@ async fn execute_codex_with_binary_and_schema(
     binary: &Path,
     options: &ExecutionOptions,
     output_schema: Option<&Value>,
-    readiness_fifo: Option<&Path>,
+    readiness_marker: Option<&Path>,
 ) -> crate::Result<ExecutionResult> {
     verify_input_budget(&request, options)?;
     let route = validate_route(&request)?;
@@ -583,7 +215,7 @@ async fn execute_codex_with_binary_and_schema(
     append_codex_common(&mut args, &route, options, &workspace)?;
     capture.append_arguments(&mut args);
     args.push("-".to_owned());
-    run_codex_process(
+    Box::pin(run_codex_process(
         &route,
         &request,
         options,
@@ -593,9 +225,9 @@ async fn execute_codex_with_binary_and_schema(
         CodexProcessIo {
             binary,
             output_file: Some(&capture.output_file),
-            readiness_fifo,
+            readiness_marker,
         },
-    )
+    ))
     .await
 }
 
@@ -605,123 +237,89 @@ pub async fn health() -> crate::Result<Value> {
 
 pub(crate) async fn health_with_models() -> crate::Result<(Value, Vec<AntigravityModel>)> {
     let codex_probe = async {
-        let result = timeout(
-            Duration::from_secs(5),
-            Command::new(resolve_codex_binary())
-                .env("PATH", enriched_command_path())
-                .arg("--version")
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await;
-        match result {
-            Ok(Ok(output)) => json!({
-                "ready": output.status.success(),
-                "version": String::from_utf8_lossy(&output.stdout).trim(),
+        match cli_io::probe(&resolve_codex_binary(), &["--version"]).await {
+            Ok(version) => json!({
+                "ready": true,
+                "version": version.trim(),
                 "auth_context": "codex_chatgpt_oauth",
                 "independent_of_antigravity_rpc": true,
             }),
-            Ok(Err(error)) => json!({"ready": false, "error": error.to_string()}),
-            Err(_) => json!({"ready": false, "error": "Codex version probe timed out"}),
+            Err(error) => json!({"ready": false, "error": redact_stderr(&error.to_string())}),
         }
     };
     let antigravity_probe = async {
-        let client = match AntigravityClient::new() {
-            Ok(client) => client,
+        let Some(binary) = resolve_antigravity_binary() else {
+            return (
+                json!({"connected":false,"ready":false,"transport":"cli","error":"Antigravity CLI executable not found or not a regular file"}),
+                Vec::new(),
+            );
+        };
+        let version = match cli_io::probe(&binary, &["--version"]).await {
+            Ok(version) => version.trim().to_owned(),
             Err(error) => {
                 return (
-                    json!({"connected": false, "error": error.to_string()}),
+                    json!({"connected":false,"ready":false,"transport":"cli","error":redact_stderr(&error.to_string())}),
                     Vec::new(),
                 );
             }
         };
-        let endpoint = match client.discover().await {
-            Ok(Some(endpoint)) => endpoint,
-            Ok(None) => {
-                return (
-                    json!({
-                        "connected": false,
-                        "auth_context": "antigravity_local_csrf",
-                        "csrf_token_redacted": true,
-                        "independent_of_codex_cli_oauth": true,
-                        "routable_models": [],
-                    }),
-                    Vec::new(),
-                );
-            }
+        let readonly_admission_verified = antigravity_cli::verified_readonly_binary(&binary).await;
+        let catalog = match cli_io::probe(&binary, &["models"]).await {
+            Ok(catalog) => catalog,
             Err(error) => {
                 return (
-                    json!({
-                        "connected": false,
-                        "auth_context": "antigravity_local_csrf",
-                        "csrf_token_redacted": true,
-                        "error": redact_stderr(&error.to_string()),
-                    }),
+                    json!({"connected":true,"ready":true,"transport":"cli","version":version,"catalog_ready":false,"readonly_admission_verified":readonly_admission_verified,"error":redact_stderr(&error.to_string())}),
                     Vec::new(),
                 );
             }
         };
-        let models = match client.catalog(&endpoint, Duration::from_secs(5)).await {
-            Ok(models) => models,
-            Err(error) => {
-                return (
-                    json!({
-                        "connected": true,
-                        "endpoint": endpoint.base_url,
-                        "auth_context": "antigravity_local_csrf",
-                        "csrf_token_redacted": true,
-                        "catalog_ready": false,
-                        "error": redact_stderr(&error.to_string()),
-                    }),
-                    Vec::new(),
-                );
+        let mut ids = BTreeSet::new();
+        for token in catalog.split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '.'))
+        {
+            if let Some(model) = crate::routing::normalize_model(token)
+                && (model.starts_with("gemini-") || model.starts_with("claude-"))
+            {
+                ids.insert(model);
             }
-        };
+        }
+        let models = ids
+            .iter()
+            .map(|id| AntigravityModel {
+                label: id.clone(),
+                model_id: id.clone(),
+                placeholder: id.clone(),
+                remaining_quota: None,
+                routable: id.rsplit_once('-').is_some_and(|(_, effort)| {
+                    validate_route(&RouteRequest {
+                        provider: crate::routing::Provider::Antigravity,
+                        engine: Engine::AntigravityCli,
+                        model: id.clone(),
+                        effort: effort.to_owned(),
+                        prompt: "catalog preflight".to_owned(),
+                    })
+                    .is_ok()
+                }),
+            })
+            .collect::<Vec<_>>();
         let routable = models
             .iter()
-            .filter(|model| model.routable)
-            .map(|model| model.model_id.clone())
+            .filter(|entry| entry.routable)
+            .map(|entry| entry.model_id.as_str())
             .collect::<Vec<_>>();
         (
-            json!({
-                "connected": true,
-                "endpoint": endpoint.base_url,
-                "auth_context": "antigravity_local_csrf",
-                "csrf_token_redacted": true,
-                "independent_of_codex_cli_oauth": true,
-                "routable_models": routable,
-            }),
+            json!({"connected":true,"ready":true,"transport":"cli","version":version,"auth_context":"antigravity_cli_cached_credentials","catalog_ready":!models.is_empty(),"readonly_admission_verified":readonly_admission_verified,"catalog_scope":"CLI advertised model slugs; live inference and quota require separate receipts","routable_models":routable,"independent_of_codex_cli_oauth":true}),
             models,
         )
     };
-    let (mut codex_cli, (mut antigravity_rpc, models)) =
+    let (mut codex_cli, (mut antigravity_cli, models)) =
         tokio::join!(codex_probe, antigravity_probe);
-    let (circuit_open, consecutive_failures, half_open_probe) = antigravity_circuit_health()?;
     codex_cli["auth_diagnostics"] =
         serde_json::to_value(crate::routing::AuthDiagnostics::default())?;
-    antigravity_rpc["auth_diagnostics"] =
+    antigravity_cli["auth_diagnostics"] =
         serde_json::to_value(crate::routing::AuthDiagnostics::default())?;
-    antigravity_rpc["circuit_breaker_open"] = Value::Bool(circuit_open);
-    antigravity_rpc["consecutive_failures"] = json!(consecutive_failures);
-    antigravity_rpc["half_open_probe"] = Value::Bool(half_open_probe);
     Ok((
-        json!({
-            "ok": true,
-            "routing_contract": {"silent_fallback_enabled": false, "claude_tier_policy": "medium_only"},
-            "auth_boundaries": {"codex_cli_oauth": codex_cli, "antigravity_rpc": antigravity_rpc},
-        }),
+        json!({"ok":true,"routing_contract":{"silent_fallback_enabled":false,"claude_tier_policy":"medium_only"},"auth_boundaries":{"codex_cli_oauth":codex_cli,"antigravity_cli":antigravity_cli,"antigravity_rpc":{"connected":false,"retired":true}}}),
         models,
-    ))
-}
-
-fn antigravity_circuit_health() -> crate::Result<(bool, u8, bool)> {
-    let state = antigravity_state()
-        .lock()
-        .map_err(|_| "Antigravity state lock poisoned")?;
-    Ok((
-        state.open_until.is_some_and(|until| until > Instant::now()),
-        state.consecutive_failures,
-        state.probe_in_flight,
     ))
 }
 
@@ -743,7 +341,7 @@ pub async fn codex_session_followup_with_options(
     append_codex_common(&mut args, &route, options, &workspace)?;
     args.push("-".to_owned());
     let binary = resolve_codex_binary();
-    run_codex_process(
+    Box::pin(run_codex_process(
         &route,
         &request,
         options,
@@ -753,9 +351,9 @@ pub async fn codex_session_followup_with_options(
         CodexProcessIo {
             binary: &binary,
             output_file: None,
-            readiness_fifo: None,
+            readiness_marker: None,
         },
-    )
+    ))
     .await
 }
 
@@ -896,7 +494,7 @@ async fn codex_git_review_with_binary(
     } else if !request.prompt.trim().is_empty() {
         args.push("-".to_owned());
     }
-    run_codex_process(
+    Box::pin(run_codex_process(
         &route,
         &request,
         options,
@@ -906,9 +504,9 @@ async fn codex_git_review_with_binary(
         CodexProcessIo {
             binary,
             output_file: None,
-            readiness_fifo: None,
+            readiness_marker: None,
         },
-    )
+    ))
     .await
 }
 
@@ -945,7 +543,7 @@ fn append_codex_common(
 struct CodexProcessIo<'a> {
     binary: &'a Path,
     output_file: Option<&'a Path>,
-    readiness_fifo: Option<&'a Path>,
+    readiness_marker: Option<&'a Path>,
 }
 
 async fn run_codex_process(
@@ -970,140 +568,202 @@ async fn run_codex_process(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = command.spawn()?;
-    let process_group = child.id();
-    let mut stdin_pipe = child.stdin.take();
-    if let Some(readiness_fifo) = io.readiness_fifo {
-        if let Some(mut stdin) = stdin_pipe.take() {
-            stdin.write_all(request.prompt.as_bytes()).await?;
-            stdin.shutdown().await?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => {
+            receipt.owned_processes_closed = Some(true);
+            mark_failure(&mut receipt, "Codex CLI process could not start");
+            return Ok(empty_result(receipt));
         }
-        await_child_readiness(&mut child, readiness_fifo).await?;
-    }
-    let mut stdout_pipe = child
-        .stdout
-        .take()
-        .ok_or("Codex child stdout was not piped")?;
-    let mut stderr_pipe = child
-        .stderr
-        .take()
-        .ok_or("Codex child stderr was not piped")?;
-    let (mut stdout_bytes, mut stderr_bytes) = (Vec::new(), Vec::new());
-    enum WaitOutcome {
-        Completed(std::io::Result<std::process::ExitStatus>),
-        TimedOut,
-        Cancelled,
-    }
-    let wait_outcome = {
-        let stdin_writer = async {
-            if let Some(mut stdin) = stdin_pipe.take() {
-                stdin.write_all(request.prompt.as_bytes()).await?;
-                stdin.shutdown().await?;
-            }
-            Ok::<_, std::io::Error>(())
+    };
+    let group = child.id();
+    let (Some(mut stdin), Some(stdout), Some(stderr)) =
+        (child.stdin.take(), child.stdout.take(), child.stderr.take())
+    else {
+        let _cleanup = terminate_process_group(&mut child, group).await;
+        receipt.owned_processes_closed =
+            Some(crate::verification::owned_process_group_closed(group).await);
+        mark_failure(&mut receipt, "Codex CLI pipes unavailable");
+        return Ok(empty_result(receipt));
+    };
+    let prompt = request.prompt.clone();
+    let writer = tokio::spawn(async move {
+        stdin.write_all(prompt.as_bytes()).await?;
+        stdin.shutdown().await
+    });
+    let (sender, mut lines) = tokio::sync::mpsc::channel(2);
+    let reader = tokio::spawn(cli_io::read_lines(stdout, sender));
+    let errors = tokio::spawn(cli_io::read_stderr(stderr));
+    let mut failure: Option<&'static str> = None;
+    if let Some(marker) = io.readiness_marker {
+        let ready = tokio::select! {
+            value=tokio::time::timeout(Duration::from_secs(30),await_child_readiness(&mut child,marker))=>matches!(value,Ok(Ok(()))),
+            ()=crate::supervisor::cancelled()=>false,
         };
-        let execution = async {
-            let (_, status, _, _) = tokio::try_join!(
-                stdin_writer,
-                child.wait(),
-                stdout_pipe.read_to_end(&mut stdout_bytes),
-                stderr_pipe.read_to_end(&mut stderr_bytes),
-            )?;
-            Ok::<_, std::io::Error>(status)
-        };
-        tokio::pin!(execution);
+        if !ready {
+            failure = Some("cli_readiness_unconfirmed");
+        }
+    }
+    let deadline = crate::execution_policy::ExecutionDeadline::from_limit(limit);
+    let mut parsed = CodexJsonl::default();
+    let mut sequence = 0_u64;
+    let mut stdout_bytes = 0_u64;
+    let mut status = None;
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let mut natural_group_closed = true;
+    let mut exit_drain: Option<tokio::time::Instant> = None;
+    let mut stdout_open = true;
+    while failure.is_none() && (stdout_open || status.is_none()) {
         tokio::select! {
-            result = &mut execution => WaitOutcome::Completed(result),
-            () = tokio::time::sleep(limit) => WaitOutcome::TimedOut,
-            () = crate::supervisor::cancelled() => WaitOutcome::Cancelled,
+            ()=deadline.wait()=>{timed_out=true;break;}
+            ()=crate::supervisor::cancelled()=>{cancelled=true;break;}
+            ()=async {match exit_drain {Some(at)=>tokio::time::sleep_until(at).await,None=>std::future::pending::<()>().await}}=>{failure=Some("cli_pipe_drain_unconfirmed");break;}
+            value=child.wait(),if status.is_none()=>{
+                match value {Ok(value)=>status=Some(value),Err(_)=>{failure=Some("cli_wait_failed");break;}}
+                natural_group_closed=crate::verification::owned_process_group_closed(group).await;
+                if !natural_group_closed {let _cleanup=terminate_process_group(&mut child,group).await;}
+                exit_drain=Some(tokio::time::Instant::now()+Duration::from_secs(2));
+            }
+            line=lines.recv(),if stdout_open=>{
+                let Some(line)=line else {stdout_open=false;continue;};
+                let line=match line {Ok(line)=>line,Err(code)=>{failure=Some(code);break;}};
+                stdout_bytes=stdout_bytes.saturating_add(line.len() as u64);
+                let Ok(text)=std::str::from_utf8(&line)else{failure=Some("cli_stdout_invalid_utf8");break;};
+                if text.len()>cli_io::MAX_RESULT_BYTES {failure=Some("cli_result_byte_budget_exceeded");break;}
+                let next=parse_codex_jsonl(text);
+                if let Some(session)=next.session_id {
+                    if parsed.session_id.as_ref().is_some_and(|old|old!=&session){failure=Some("cli_session_changed");break;}
+                    parsed.session_id=Some(session);
+                }
+                if let Some(model)=next.actual_model {
+                    if parsed.actual_model.as_ref().is_some_and(|old|old!=&model){failure=Some("cli_model_changed");break;}
+                    parsed.actual_model=Some(model);
+                }
+                parsed.tokens_in=parsed.tokens_in.max(next.tokens_in);parsed.tokens_out=parsed.tokens_out.max(next.tokens_out);
+                parsed.context_window=next.context_window.or(parsed.context_window);
+                parsed.current_context_tokens=next.current_context_tokens.or(parsed.current_context_tokens);
+                if let Some(message)=next.messages.last() {
+                    if message.len()>cli_io::MAX_RESULT_BYTES {failure=Some("cli_result_byte_budget_exceeded");break;}
+                    parsed.messages.clear();parsed.messages.push(message.clone());
+                }
+                sequence=sequence.saturating_add(1);
+                if let Some(observer)=&options.progress {
+                    let terminal=serde_json::from_str::<Value>(text).ok().is_some_and(|v|v["type"]=="turn.completed");
+                    let progress=crate::routing::ExecutionProgress{
+                        engine:Engine::CodexCli,session_id:parsed.session_id.clone(),sequence,step_index:None,
+                        phase:if terminal {crate::routing::ExecutionPhase::ResultObserved}else{crate::routing::ExecutionPhase::Running},
+                        observed_model:parsed.actual_model.clone(),observed_at:chrono::Utc::now().to_rfc3339(),stdout_bytes,
+                        usage:terminal.then(||crate::routing::ExecutionUsage{scope:crate::routing::UsageScope::CurrentTurn,input_tokens:parsed.tokens_in,output_tokens:parsed.tokens_out,thinking_tokens:0,cache_read_tokens:0,total_tokens:parsed.tokens_in.saturating_add(parsed.tokens_out),turns:Some(1)}),
+                    };
+                    let notify=observer(progress);tokio::pin!(notify);
+                    let committed=tokio::select! {
+                        value=tokio::time::timeout(Duration::from_secs(30),&mut notify)=>matches!(value,Ok(Ok(()))),
+                        ()=deadline.wait()=>{timed_out=true;false},
+                        ()=crate::supervisor::cancelled()=>{cancelled=true;false},
+                    };
+                    if !committed {failure=Some("cli_progress_commit_failed");break;}
+                }
+            }
         }
-    };
-    let status = match wait_outcome {
-        WaitOutcome::Completed(Ok(status)) => status,
-        WaitOutcome::Completed(Err(error)) => {
-            terminate_process_group(&mut child, process_group).await?;
-            return Err(error.into());
-        }
-        WaitOutcome::TimedOut => {
-            terminate_process_group(&mut child, process_group).await?;
-            receipt.duration_ms = millis(started.elapsed());
-            mark_timeout(
-                &mut receipt,
-                "Codex CLI timed out after dispatch; query this request ID before retrying",
-            );
-            return Ok(empty_result(receipt));
-        }
-        WaitOutcome::Cancelled => {
-            terminate_process_group(&mut child, process_group).await?;
-            receipt.duration_ms = millis(started.elapsed());
-            mark_cancelled(&mut receipt, "Codex CLI execution cancelled by caller");
-            return Ok(empty_result(receipt));
-        }
-    };
-    receipt.owned_processes_closed =
-        Some(crate::verification::owned_process_group_closed(process_group).await);
+    }
+    let known_closed = status.is_some() && natural_group_closed;
+    let cleanup = known_closed || terminate_process_group(&mut child, group).await.is_ok();
+    drop(lines);
+    let (stdout_done, stderr, input_done) = tokio::join!(
+        cli_io::finish_task(reader),
+        cli_io::finish_task(errors),
+        cli_io::finish_task(writer),
+    );
+    if stdout_done.is_none()
+        || !matches!(stderr, Some(Ok(_)))
+        || !matches!(input_done, Some(Ok(())))
+    {
+        failure.get_or_insert("cli_owned_io_unconfirmed");
+    }
+    let stderr = stderr.and_then(Result::ok).map(|stderr| stderr.bytes);
+    receipt.owned_processes_closed = Some(
+        known_closed || (cleanup && crate::verification::owned_process_group_closed(group).await),
+    );
     receipt.duration_ms = millis(started.elapsed());
-    let stdout = String::from_utf8_lossy(&stdout_bytes).into_owned();
-    let auth_diagnostics = classify_stderr_auth(&String::from_utf8_lossy(&stderr_bytes));
-    let stderr = auth_diagnostics.sanitized_stderr.clone();
-    receipt.auth_diagnostics = auth_diagnostics;
-    let parsed = parse_codex_jsonl(&stdout);
-    let final_output = io
+    if let Some(stderr) = stderr {
+        receipt.auth_diagnostics = classify_stderr_auth(&String::from_utf8_lossy(&stderr));
+    }
+    let final_output = if let Some(path) = io
         .output_file
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .filter(|text| !text.trim().is_empty())
-        .map(|text| text.trim().to_owned())
-        .or_else(|| parsed.messages.last().cloned())
-        .unwrap_or_else(|| stdout.trim().to_owned());
-    if status.success() {
-        let output_digest = digest_output(&final_output);
-        let session_proof = if let Some(session_id) = parsed.session_id.clone() {
-            let workspace_path = workspace.to_path_buf();
-            let digest = output_digest.clone();
+        .filter(|_| receipt.owned_processes_closed == Some(true))
+    {
+        let path = path.to_path_buf();
+        match tokio::task::spawn_blocking(move || cli_io::read_result_file(&path)).await {
+            Ok(Ok(Some(text))) if !text.trim().is_empty() => text.trim().to_owned(),
+            Ok(Ok(_)) => parsed.messages.pop().unwrap_or_default(),
+            _ => {
+                failure.get_or_insert("cli_result_file_unavailable_or_oversized");
+                String::new()
+            }
+        }
+    } else {
+        parsed.messages.pop().unwrap_or_default()
+    };
+    if cancelled {
+        mark_cancelled(
+            &mut receipt,
+            "Codex CLI cancelled; inspect the original session before any new request",
+        );
+    } else if timed_out {
+        mark_timeout(
+            &mut receipt,
+            "Codex CLI caller deadline elapsed; inspect the original session before any new request",
+        );
+    } else if let Some(code) = failure {
+        mark_failure(&mut receipt, code);
+    } else if status
+        .as_ref()
+        .is_some_and(std::process::ExitStatus::success)
+    {
+        let digest = digest_output(&final_output);
+        let proof = if let Some(session) = parsed.session_id.clone() {
+            let workspace = workspace.to_path_buf();
             tokio::task::spawn_blocking(move || {
-                prove_codex_session_identity(&session_id, &workspace_path, &digest)
+                prove_codex_session_identity(&session, &workspace, &digest)
             })
-            .await?
+            .await
+            .ok()
+            .flatten()
         } else {
             None
         };
-        let (actual_model, identity_source) = if let Some(actual) = parsed.actual_model.clone() {
-            (Some(actual), Some("codex_jsonl_reported".to_owned()))
-        } else if let Some(proof) = &session_proof {
+        let (actual, source) = if let Some(actual) = parsed.actual_model.clone() {
+            (Some(actual), Some("codex_jsonl_reported".into()))
+        } else if let Some(proof) = &proof {
             (Some(proof.model.clone()), Some(proof.source.clone()))
         } else {
             (None, None)
         };
-        let context_window = parsed.context_window.or_else(|| {
-            session_proof
-                .as_ref()
-                .and_then(|proof| proof.context_window)
-        });
-        let current_context_tokens = parsed.current_context_tokens.or_else(|| {
-            session_proof
-                .as_ref()
-                .and_then(|proof| proof.current_context_tokens)
-        });
         finish_receipt(
             &mut receipt,
             route,
-            actual_model,
-            identity_source,
+            actual,
+            source,
             &final_output,
             parsed.tokens_in,
             parsed.tokens_out,
         );
-        receipt.context_window = context_window;
-        receipt.current_context_tokens = current_context_tokens;
+        receipt.context_window = parsed
+            .context_window
+            .or_else(|| proof.as_ref().and_then(|p| p.context_window));
+        receipt.current_context_tokens = parsed
+            .current_context_tokens
+            .or_else(|| proof.as_ref().and_then(|p| p.current_context_tokens));
+        if !natural_group_closed {
+            mark_timeout(
+                &mut receipt,
+                "CLI leader exited with active descendants; forced cleanup does not confirm job completion",
+            );
+        }
     } else {
-        mark_failure(
-            &mut receipt,
-            if stderr.is_empty() {
-                &final_output
-            } else {
-                &stderr
-            },
-        );
+        let diagnostics = receipt.auth_diagnostics.sanitized_stderr.clone();
+        mark_failure(&mut receipt, &diagnostics);
     }
     Ok(ExecutionResult {
         structured_output: extract_json(&final_output),
@@ -1111,7 +771,8 @@ async fn run_codex_process(
         placeholder: None,
         output: final_output,
         session_id: parsed.session_id,
-        exit_code: status.code(),
+        exit_code: status.and_then(|s| s.code()),
+        search_evidence: None,
     })
 }
 
@@ -1201,7 +862,8 @@ fn prove_codex_session_identity_at(
                     .is_some_and(|name| name.ends_with(&format!("{session_id}.jsonl")))
         })?;
     let workspace = workspace.canonicalize().ok()?;
-    let source = std::fs::read_to_string(artifact.path()).ok()?;
+    use std::io::{BufRead, Read};
+    let mut source = std::io::BufReader::new(std::fs::File::open(artifact.path()).ok()?);
     let mut session_metadata_matches = false;
     let mut current_model: Option<String> = None;
     let mut current_cwd_matches = false;
@@ -1212,8 +874,20 @@ fn prove_codex_session_identity_at(
     let mut matched_generation = None;
     let mut context_window = None;
     let mut current_context_tokens = None;
-    for line in source.lines() {
-        let Ok(event) = serde_json::from_str::<Value>(line) else {
+    loop {
+        let mut line = Vec::new();
+        let size = source
+            .by_ref()
+            .take(cli_io::MAX_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .ok()?;
+        if size == 0 {
+            break;
+        }
+        if line.len() > cli_io::MAX_LINE_BYTES {
+            return None;
+        }
+        let Ok(event) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
         match event["type"].as_str() {
@@ -1441,6 +1115,7 @@ fn empty_result(receipt: Receipt) -> ExecutionResult {
         structured_output: None,
         session_id: None,
         exit_code: None,
+        search_evidence: None,
     }
 }
 
@@ -1466,89 +1141,6 @@ fn extract_json(text: &str) -> Option<Value> {
         }
     }
     None
-}
-
-fn parse_antigravity_catalog(value: &Value) -> crate::Result<Vec<AntigravityModel>> {
-    let entries = value
-        .get("clientModelConfigs")
-        .and_then(Value::as_array)
-        .ok_or("missing clientModelConfigs")?;
-    Ok(entries
-        .iter()
-        .filter_map(|item| {
-            let model_id = item.get("modelId")?.as_str()?.to_owned();
-            let placeholder = item.get("modelOrAlias")?.get("model")?.as_str()?.to_owned();
-            let remaining_quota = item
-                .get("quotaInfo")
-                .and_then(|q| q.get("remainingFraction"))
-                .and_then(Value::as_f64);
-            let claude_wrong_tier =
-                model_id.starts_with("claude-") && !model_id.ends_with("-medium");
-            Some(AntigravityModel {
-                label: item
-                    .get("label")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                model_id,
-                routable: !placeholder.is_empty()
-                    && remaining_quota.is_none_or(|quota| quota > 0.0)
-                    && !claude_wrong_tier,
-                placeholder,
-                remaining_quota,
-            })
-        })
-        .collect())
-}
-
-fn endpoint_candidates(
-    ps_output: &str,
-    fallback: Option<&str>,
-) -> crate::Result<Vec<(u32, String)>> {
-    let token_re = CSRF_TOKEN_RE
-        .as_ref()
-        .ok_or("CSRF token regex unavailable")?;
-    Ok(ps_output
-        .lines()
-        .filter_map(|line| {
-            if !line.contains("language_server") {
-                return None;
-            }
-            let mut pieces = line.trim().splitn(2, char::is_whitespace);
-            let pid = pieces.next()?.parse().ok()?;
-            let command = pieces.next()?;
-            let token = token_re
-                .captures(command)
-                .and_then(|cap| cap.get(1))
-                .map(|m| m.as_str())
-                .or(fallback)?;
-            Some((pid, token.to_owned()))
-        })
-        .collect())
-}
-
-fn listen_ports(output: &str) -> crate::Result<Vec<u16>> {
-    let port_re = LISTEN_PORT_RE
-        .as_ref()
-        .ok_or("listen port regex unavailable")?;
-    Ok(port_re
-        .captures_iter(output)
-        .filter_map(|cap| cap.get(1)?.as_str().parse().ok())
-        .collect())
-}
-
-async fn probe_command(args: &[&str], limit: Duration) -> crate::Result<String> {
-    let (program, command_args) = args.split_first().ok_or("empty probe command")?;
-    let output = timeout(
-        limit,
-        Command::new(program)
-            .args(command_args)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| "probe command timed out")??;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 async fn terminate_process_group(
@@ -1582,24 +1174,24 @@ async fn terminate_process_group(
 
 async fn await_child_readiness(
     child: &mut tokio::process::Child,
-    readiness_fifo: &Path,
+    readiness_marker: &Path,
 ) -> crate::Result<()> {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true);
-    let open = options.open(readiness_fifo);
-    tokio::pin!(open);
-    let mut reader = tokio::select! {
-        result = &mut open => result?,
-        status = child.wait() => {
-            return Err(format!("child exited before readiness handshake: {}", status?).into());
+    let marker = async {
+        loop {
+            match tokio::fs::read(readiness_marker).await {
+                Ok(bytes) if bytes == b"R" => return Ok(()),
+                Ok(bytes) if bytes.is_empty() => {}
+                Ok(_) => return Err("child readiness handshake returned an invalid marker".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     };
-    let mut ready = [0_u8; 1];
-    reader.read_exact(&mut ready).await?;
-    if ready != *b"R" {
-        return Err("child readiness handshake returned an invalid marker".into());
+    tokio::select! {
+        result = marker => result,
+        status = child.wait() => Err(format!("child exited before readiness handshake: {}", status?).into()),
     }
-    Ok(())
 }
 
 fn validate_identifier(value: &str, label: &str) -> crate::Result<()> {

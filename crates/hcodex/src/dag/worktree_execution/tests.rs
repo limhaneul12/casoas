@@ -103,7 +103,7 @@ fn node(id: &str, writes: bool) -> DagNode {
 fn response(model: &str, code: Option<Value>) -> Value {
     json!({"ok":true,"result":{"receipt":{"actual_model":model,"requested_model":model,
         "status":"succeeded","outcome_state":"confirmed_success","model_mismatch":false,
-        "engine":if code.is_some(){"antigravity_rpc"}else{"codex_cli"},"owned_processes_closed":true},
+        "engine":if code.is_some(){"antigravity_cli"}else{"codex_cli"},"owned_processes_closed":true},
         "structured_output":{"crafted_code":code.map(|v|v.to_string()),"summary":"fixture"}}})
 }
 fn artifact(before: &WorkspaceManifest, source: String) -> Value {

@@ -142,7 +142,7 @@ impl WorktreeCampaign {
         if ownership::lock_path_identity(&lock_path)? != lock_identity {
             return Err("worktree lock path replaced during acquisition".into());
         }
-        clean(&original, timeout).await?;
+        require_clean_original(&original, timeout).await?;
         let head = git(&original, &["rev-parse", "HEAD"], timeout)
             .await?
             .trim()
@@ -294,7 +294,7 @@ impl WorktreeCampaign {
     async fn create_nodes(&self, node_ids: &[String], all: &Inventory) -> Result<()> {
         let timeout = self.timeout;
         for id in node_ids {
-            clean(&self.original, timeout).await?;
+            require_clean_original(&self.original, timeout).await?;
             let path = self
                 .nodes
                 .lock()
@@ -339,7 +339,7 @@ impl WorktreeCampaign {
                 .ok_or("node disappeared")?
                 .initial = initial;
         }
-        clean(&self.original, timeout).await?;
+        require_clean_original(&self.original, timeout).await?;
         self.verify_identity(&self.original).await?;
         Ok(())
     }
@@ -822,7 +822,7 @@ fn real_directory(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-async fn clean(root: &Path, timeout: Duration) -> Result<()> {
+pub(crate) async fn require_clean_original(root: &Path, timeout: Duration) -> Result<()> {
     if !git(
         root,
         &["status", "--porcelain=v1", "--untracked-files=all"],
@@ -836,6 +836,10 @@ async fn clean(root: &Path, timeout: Duration) -> Result<()> {
         );
     }
     Ok(())
+}
+#[cfg(test)]
+async fn clean(root: &Path, timeout: Duration) -> Result<()> {
+    require_clean_original(root, timeout).await
 }
 #[cfg(test)]
 mod tests;

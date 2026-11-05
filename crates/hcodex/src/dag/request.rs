@@ -21,7 +21,9 @@ use super::{
     SettlementReceipt,
 };
 
+mod projection;
 mod resume;
+use projection::{LiveProjection, ProjectionDelivery};
 pub use resume::{PreparedResume, prepare_resume_request};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -408,8 +410,10 @@ async fn handle_request_inner(
             // Keep both futures owned until they finish. In particular, a failed
             // checkpoint write must not drop durable provider waiters mid-dispatch.
             let (execution, checkpoints) = tokio::join!(execution_future, checkpoint_future);
-            checkpoints?;
-            execution?
+            let delivery = checkpoints?;
+            let mut response = execution?;
+            response["live_projection"] = serde_json::to_value(delivery)?;
+            response
         };
         let final_workspace = workspace.clone();
         let final_manifest =
@@ -513,9 +517,9 @@ async fn cancel_on_checkpoint_failure<F>(
     gateway: &Gateway,
     campaign_id: &str,
     checkpoints: F,
-) -> Result<()>
+) -> Result<ProjectionDelivery>
 where
-    F: Future<Output = Result<()>>,
+    F: Future<Output = Result<ProjectionDelivery>>,
 {
     let result = checkpoints.await;
     if result.is_err() {
@@ -593,8 +597,11 @@ fn validate_request(request: &DagRequest) -> Result<()> {
     if request.campaign_goal.trim().is_empty() {
         return Err("campaign_goal must not be empty".into());
     }
-    if !(0.0 < request.timeout_seconds && request.timeout_seconds <= 86_400.0) {
-        return Err("timeout_seconds must be in (0, 86400]".into());
+    let timeout = request.timeout_seconds;
+    if !(0.0..=86_400.0).contains(&timeout)
+        || (timeout > 0.0 && Duration::from_secs_f64(timeout).is_zero())
+    {
+        return Err("timeout_seconds must be a representable duration up to 86400 seconds, or zero for no deadline".into());
     }
     if !(1_024..=2_000_000).contains(&request.max_input_bytes) {
         return Err("max_input_bytes must be between 1024 and 2000000".into());
@@ -765,16 +772,15 @@ async fn persist_node_checkpoints(
     config_identity: String,
     observer: Option<mpsc::Sender<DagExecutionEvent>>,
     context: Option<Arc<CheckpointContext>>,
-) -> Result<()> {
+) -> Result<ProjectionDelivery> {
     let mut reports = BTreeMap::new();
+    let mut projection = LiveProjection::new(observer);
     while let Some(event) = events.recv().await {
         if let DagExecutionEvent::ProviderFinished { node_id, output } = &event {
             reports.insert(node_id.clone(), AgentReport::from_output("", Some(output)));
         }
         let DagExecutionEvent::NodeSettled { receipt } = &event else {
-            if let Some(sender) = &observer {
-                let _ignored_observer_backpressure = sender.try_send(event);
-            }
+            projection.intermediate(event);
             continue;
         };
         let receipt = receipt.clone();
@@ -785,11 +791,8 @@ async fn persist_node_checkpoints(
                 |report| report.with_summary(&receipt.output_summary),
             );
             context.persist(receipt, report).await?;
-            if let Some(sender) = &observer {
-                // Persistence and commit notification precede UI backpressure;
-                // terminal transitions must not silently disappear.
-                let _ignored_closed_observer = sender.send(event).await;
-            }
+            // Persistence and commit notification precede lag/terminal delivery.
+            projection.settled(event).await;
             continue;
         }
         let checkpoint_id = format!("ckp-{campaign_id}-{}", receipt.node_id);
@@ -820,11 +823,9 @@ async fn persist_node_checkpoints(
             .await?;
         // A visible settlement is backed by its durable checkpoint. Observer
         // backpressure must not stand between receipt creation and persistence.
-        if let Some(sender) = &observer {
-            let _ignored_closed_observer = sender.send(event).await;
-        }
+        projection.settled(event).await;
     }
-    Ok(())
+    Ok(projection.finish())
 }
 
 pub(super) fn checkpoint_metadata(
@@ -1079,7 +1080,7 @@ const fn default_parallel() -> usize {
     3
 }
 const fn default_timeout() -> f64 {
-    3_600.0
+    0.0
 }
 const fn default_max_input() -> u64 {
     256_000

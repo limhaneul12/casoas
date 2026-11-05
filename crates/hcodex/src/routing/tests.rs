@@ -48,7 +48,7 @@ fn historical_interactive_aliases_preserve_model_family_and_medium_gate() -> cra
         validate_route(&request(
             "sonnet-high",
             Provider::Antigravity,
-            Engine::AntigravityRpc,
+            Engine::AntigravityCli,
             "high"
         ))
         .is_err()
@@ -76,7 +76,7 @@ fn flash_aliases_resolve_to_catalog_models_without_changing_requested_identity()
         let route = validate_route(&request(
             alias,
             Provider::Antigravity,
-            Engine::AntigravityRpc,
+            Engine::AntigravityCli,
             "high",
         ))?;
         assert_eq!(route.resolved_model, "gemini-3.8-flash-high");
@@ -90,7 +90,7 @@ fn flash_aliases_resolve_to_catalog_models_without_changing_requested_identity()
         let route = validate_route(&request(
             model,
             Provider::Antigravity,
-            Engine::AntigravityRpc,
+            Engine::AntigravityCli,
             "xhigh",
         ))?;
         assert_eq!(route.resolved_model, model);
@@ -114,7 +114,7 @@ fn validates_exact_engine_and_tier_contracts() {
         validate_route(&request(
             "argon4",
             Provider::Antigravity,
-            Engine::AntigravityRpc,
+            Engine::AntigravityCli,
             "high"
         ))
         .is_ok()
@@ -123,7 +123,7 @@ fn validates_exact_engine_and_tier_contracts() {
         validate_route(&request(
             "opus-5.5",
             Provider::Antigravity,
-            Engine::AntigravityRpc,
+            Engine::AntigravityCli,
             "medium"
         ))
         .is_ok()
@@ -132,7 +132,7 @@ fn validates_exact_engine_and_tier_contracts() {
         validate_route(&request(
             "claude-opus-5-5-medium",
             Provider::Antigravity,
-            Engine::AntigravityRpc,
+            Engine::AntigravityCli,
             "high"
         ))
         .is_err()
@@ -186,7 +186,7 @@ fn route_rejections_keep_exact_machine_codes() {
     let claude_tier = validate_route(&request(
         "claude-opus-5-5-high",
         Provider::Antigravity,
-        Engine::AntigravityRpc,
+        Engine::AntigravityCli,
         "high",
     ));
     assert_eq!(
@@ -214,4 +214,23 @@ fn auth_classifier_redacts_and_isolates_external_oauth() {
     assert!(!diagnostics.sanitized_stderr.contains("topsecret"));
     assert!(!diagnostics.sanitized_stderr.contains("1234567890abcdef"));
     assert!(diagnostics.sanitized_stderr.contains("***REDACTED***"));
+}
+
+#[test]
+fn historical_rpc_engine_decodes_but_cannot_start_new_execution() -> crate::Result<()> {
+    let engine: Engine = serde_json::from_str("\"antigravity_rpc\"")?;
+    assert_eq!(engine, Engine::AntigravityRpc);
+    assert_eq!(
+        serde_json::from_str::<Engine>("\"antigravity_local_rpc\"")?,
+        engine
+    );
+    let rejected = validate_route(&RouteRequest {
+        provider: Provider::Antigravity,
+        engine,
+        model: "gemini-4-argon-high".into(),
+        effort: "high".into(),
+        prompt: "old input".into(),
+    });
+    assert!(rejected.is_err());
+    Ok(())
 }

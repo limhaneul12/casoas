@@ -22,6 +22,14 @@ const COMMANDS: &[&str] = &[
     "/council",
     "/votes",
     "/recovery",
+    "/research",
+    "/research-status",
+    "/space",
+    "/planning",
+    "/building",
+    "/workflow",
+    "/workflow-status",
+    "/workflow-cancel",
     "/todo",
     "/plan",
     "/prompts",
@@ -481,6 +489,14 @@ fn command_entries() -> Vec<CatalogEntry> {
                     | "/dag-plan"
                     | "/triad"
                     | "/triad-review"
+                    | "/research"
+                    | "/research-status"
+                    | "/space"
+                    | "/planning"
+                    | "/building"
+                    | "/workflow"
+                    | "/workflow-status"
+                    | "/workflow-cancel"
             );
             let (detail, keywords) = command_description(value);
             entry(
@@ -667,6 +683,26 @@ fn command_description(command: &str) -> (&'static str, &'static str) {
         "/clear" => ("대화와 화면 초기화", "화면 지우기 초기화"),
         "/diff" | "/review" => ("변경 파일 비교/리뷰", "변경 코드 리뷰 감사 점검"),
         "/resume" => ("DAG 체크포인트 재개", "재개 이어하기 복구"),
+        "/research" => (
+            "파일·문서·HTTPS 근거 조사",
+            "리서치 조사 출처 근거 보고서 research",
+        ),
+        "/research-status" => (
+            "저장된 리서치 결과 조회",
+            "리서치 상태 보고서 조회 research status",
+        ),
+        "/space" => (
+            "Research·Planning·Building 공간 전환",
+            "작업 공간 탭 research planning building",
+        ),
+        "/planning" => ("독립 기획 실행", "기획 계획 planning research handoff"),
+        "/building" => ("저장된 기획으로 개발", "빌드 개발 worktree plan"),
+        "/workflow" => (
+            "조사·기획·개발 연결 실행",
+            "workflow research planning building chain",
+        ),
+        "/workflow-status" => ("저장된 workflow 공간 복원", "workflow 상태 복원 조회"),
+        "/workflow-cancel" => ("현재 프로세스 workflow 취소", "workflow 취소 cancel drain"),
         "/sonnet" => ("Claude Sonnet에게 질문", "소넷 클로드 질문"),
         "/opus" => ("Claude Opus에게 질문", "오퍼스 클로드 질문"),
         "/argon" => ("Argon에게 질문", "아르곤 제미나이 질문"),

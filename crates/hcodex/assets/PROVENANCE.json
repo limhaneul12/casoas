@@ -1,12 +1,9 @@
 {
   "schema_version": 1,
-  "source": "repository plugin/heterarchy-codex",
-  "purpose": "Standalone hcodex setup fallback",
+  "source": "repository hcodex skill bundle",
+  "purpose": "Standalone backend CLI skill synchronization",
   "files": {
-    "mcp_config.json": "sha256:cb2237e9cbdf771336e6abdfcecf4686db9eb0a83d1afa6fe74ce1d4fa2ad98d",
-    "plugin.json": "sha256:0734fed9361cac3dd8b9cccfbedc8bd4a5376be6b6ab9e99480d8dd0ea084470",
-    "rules/AGENTS.md": "sha256:3849d0e1aafafb6dbaef62292db32d6be73d06b9da9a312dbfe809d889c0505f",
-    "skills/codex-heterarchy/SKILL.md": "sha256:185d925fa938aad12f2f5429c2a3393cda3976a990f4fa6121ccad7e93c29f74",
+    "skills/codex-heterarchy/SKILL.md": "sha256:9161b37000af118d8a54370b048e46717482aa59c05caf70cd8db3302f9121a9",
     "skills/codex-heterarchy/agents/openai.yaml": "sha256:81fc9c8ee667d5c1ce0aa471d047f0ac8e319e08aa8f93573cff80845dd37813"
   }
 }

@@ -68,6 +68,7 @@ async fn run_profile(
     #[cfg(unix)]
     process.process_group(0);
     let started = Instant::now();
+    let deadline = crate::execution_policy::ExecutionDeadline::from_limit(limit);
     let mut child = process.spawn()?;
     // Retain group identity even if the direct child exits before descendants
     // release inherited pipes. Child::id becomes None after wait completes.
@@ -86,42 +87,70 @@ async fn run_profile(
         TimedOut,
         Cancelled,
     }
-    let result = {
-        let operation = async {
-            let (status, (), ()) = tokio::try_join!(
-                child.wait(),
+    let (outcome, exit_code, naturally_closed) = {
+        let reading = async {
+            tokio::try_join!(
                 hash_stream(&mut stdout, &mut stdout_hash),
-                hash_stream(&mut stderr, &mut stderr_hash),
+                hash_stream(&mut stderr, &mut stderr_hash)
             )?;
-            Ok::<_, std::io::Error>(status)
+            Ok::<_, std::io::Error>(())
         };
-        tokio::pin!(operation);
-        tokio::select! {
-            result = &mut operation => WaitResult::Completed(result),
-            () = tokio::time::sleep(limit) => WaitResult::TimedOut,
-            () = crate::supervisor::cancelled() => WaitResult::Cancelled,
+        tokio::pin!(reading);
+        let mut read_done = false;
+        let mut read_error = None;
+        let result = loop {
+            tokio::select! {
+                status=child.wait()=>break WaitResult::Completed(status),
+                result=&mut reading,if !read_done=>{
+                    read_done=true;
+                    if let Err(error)=result {read_error=Some(error);break WaitResult::Cancelled;}
+                }
+                ()=deadline.wait()=>break WaitResult::TimedOut,
+                ()=crate::supervisor::cancelled()=>break WaitResult::Cancelled,
+            }
+        };
+        let completed = matches!(&result, WaitResult::Completed(Ok(_)));
+        let naturally_closed = completed && owned_process_group_closed(process_group).await;
+        let unexpected_children = completed && !naturally_closed;
+        // A leader can exit while descendants retain stdio. Close the owned
+        // group before draining; no job deadline is needed to discover this.
+        if !naturally_closed {
+            let cleanup = terminate_and_reap(&mut child, process_group).await;
+            if !read_done
+                && let Ok(Err(error)) =
+                    tokio::time::timeout(Duration::from_secs(2), &mut reading).await
+            {
+                read_error = Some(error);
+            }
+            cleanup?;
+        } else if !read_done {
+            match tokio::time::timeout(Duration::from_secs(2), &mut reading).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => read_error = Some(error),
+                Err(_) => return Err("verification pipe drain exceeded its cleanup budget".into()),
+            }
         }
-    };
-    let (outcome, exit_code) = match result {
-        WaitResult::Completed(Ok(status)) => (GateOutcome::Completed, status.code()),
-        WaitResult::Completed(Err(error)) => {
-            terminate_and_reap(&mut child, process_group).await?;
+        if let Some(error) = read_error {
             return Err(error.into());
         }
-        WaitResult::TimedOut | WaitResult::Cancelled => {
-            terminate_and_reap(&mut child, process_group).await?;
-            (
-                if matches!(result, WaitResult::Cancelled) {
-                    GateOutcome::Cancelled
+        match result {
+            WaitResult::Completed(Ok(status)) => (
+                if unexpected_children {
+                    GateOutcome::OwnedProcessesRemain
                 } else {
-                    GateOutcome::TimedOut
+                    GateOutcome::Completed
                 },
-                None,
-            )
+                status.code(),
+                naturally_closed,
+            ),
+            WaitResult::Completed(Err(error)) => return Err(error.into()),
+            WaitResult::TimedOut => (GateOutcome::TimedOut, None, false),
+            WaitResult::Cancelled => (GateOutcome::Cancelled, None, false),
         }
     };
     let mut proof = proof(outcome, exit_code, started, stdout_hash, stderr_hash);
-    proof.owned_processes_closed = owned_process_group_closed(process_group).await;
+    proof.owned_processes_closed =
+        naturally_closed || owned_process_group_closed(process_group).await;
     if proof.outcome == GateOutcome::Completed && !proof.owned_processes_closed {
         proof.outcome = GateOutcome::OwnedProcessesRemain;
     }
@@ -374,19 +403,20 @@ mod tests {
         )
         .await?;
         assert_eq!(proof.exit_code, Some(0));
-        assert!(!proof.owned_processes_closed);
+        assert!(proof.owned_processes_closed);
         assert_eq!(proof.outcome, GateOutcome::OwnedProcessesRemain);
         Ok(())
     }
 
     #[tokio::test]
-    async fn timeout_reaps_group_after_leader_exits_with_inherited_pipes() -> crate::Result<()> {
+    async fn unbounded_gate_reaps_group_after_leader_exits_with_inherited_pipes()
+    -> crate::Result<()> {
         let root = tempfile::tempdir()?;
         let workspace = root.path().to_path_buf();
         let task = tokio::spawn(async move {
             run(
                 &workspace,
-                Duration::from_secs(1),
+                Duration::ZERO,
                 "sh",
                 &[
                     "-c",
@@ -397,8 +427,9 @@ mod tests {
         });
         let pids = ready_pids(&root.path().join("ready")).await?;
         let proof = task.await??;
-        assert_eq!(proof.outcome, GateOutcome::TimedOut);
-        assert_eq!(proof.exit_code, None);
+        assert_eq!(proof.outcome, GateOutcome::OwnedProcessesRemain);
+        assert_eq!(proof.exit_code, Some(0));
+        assert!(proof.owned_processes_closed);
         assert_reaped_and_not_running(&pids).await
     }
 

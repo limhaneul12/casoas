@@ -155,6 +155,8 @@ fn project_job(job: &JobRecord, export: Option<&JobRecord>) -> Value {
         "outcome_state":job.outcome_state,
         "model":job.model.as_deref().and_then(bounded_label).and_then(normalize_model),
         "attempt_count":job.attempt_count,
+        "session_id":job.session_id.as_deref().filter(|id| id.len() <= 256 && !id.chars().any(char::is_control)),
+        "execution_progress":job.execution_progress(),
         "cancel_requested":job.cancel_requested,
         "recorded_provider_evidence":recorded_provider_evidence,
         "execution_export_id":export.map(|record|&record.job_id),

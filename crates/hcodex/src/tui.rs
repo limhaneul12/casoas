@@ -34,7 +34,7 @@ use tokio::time::MissedTickBehavior;
 pub use completion::{CompletionItem, CompletionKind, TuiCatalog};
 pub use model::{
     DagLaneView, LaneState, TokenUsage, TranscriptEntry, TuiAction, TuiApp, TuiTheme, TuiUpdate,
-    action_from_input,
+    WorkspaceArtifactView, WorkspacePane, WorkspaceUpdate, action_from_input,
 };
 pub use render::draw;
 

@@ -101,7 +101,11 @@ struct HarnessPolicy {
 
 impl HarnessPolicy {
     fn load(root: &Path) -> Result<Self, String> {
-        let config = read_toml(&harness_root(root).join("HARNESS.toml"))?;
+        Self::load_path(&root.join("xtask/HARNESS.toml"))
+    }
+
+    fn load_path(path: &Path) -> Result<Self, String> {
+        let config = read_toml(path)?;
         let toolchain = required_table(&config, "toolchain")?;
         let rust_version = match required_str(toolchain, "policy")? {
             "current-stable" => RustVersionPolicy::CurrentStable,
@@ -151,6 +155,7 @@ fn main() {
     let command = std::env::args().nth(1).unwrap_or_else(|| "help".to_owned());
     let result = match command.as_str() {
         "rules" => rules(),
+        "local-harness" => local_harness(),
         "fmt" => fmt(),
         "check" => check(),
         "test" => test(),
@@ -172,7 +177,9 @@ fn main() {
 }
 
 fn help() {
-    println!("cargo xtask <rules|fmt|check|test|ci|deps|doctor|extended|perf>");
+    println!(
+        "cargo run --package xtask -- <rules|local-harness|fmt|check|test|ci|deps|doctor|extended|perf>"
+    );
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
@@ -281,10 +288,20 @@ fn verify_declared_toolchain_available(
 
 fn rules() -> Result<(), String> {
     let root = workspace_root()?;
-    let harness = harness_root(&root);
     let toolchain = ToolchainPolicy::load(&root)?;
     let policy = HarnessPolicy::load(&root)?;
+    verify_declared_toolchain_available(&root, &toolchain)?;
+    verify_cargo_baseline(&root, &policy)?;
+    verify_research_manifest(&root)?;
+    verify_workspace_lints(&root, &toolchain, &policy)?;
+    println!("xtask rules: PASS (portable policy and public asset integrity)");
+    Ok(())
+}
 
+/// Explicit developer-only validation; ignored local instructions are not CI inputs.
+fn local_harness() -> Result<(), String> {
+    let root = workspace_root()?;
+    let harness = harness_root(&root);
     for required in [
         "PROJECT_PROFILE.md",
         "HARNESS.toml",
@@ -296,11 +313,9 @@ fn rules() -> Result<(), String> {
     verify_group(&harness, "normal_dev_rules", NORMAL_RULES)?;
     verify_group(&harness, "type_dev_rules", TYPE_RULES)?;
     verify_group(&harness, "async_dev_rules", ASYNC_RULES)?;
-    verify_declared_toolchain_available(&root, &toolchain)?;
-    verify_cargo_baseline(&root, &policy)?;
+    let _local_policy = HarnessPolicy::load_path(&harness.join("HARNESS.toml"))?;
     verify_manifest(&root)?;
-    verify_workspace_lints(&root, &toolchain, &policy)?;
-    println!("xtask rules: PASS");
+    println!("xtask local-harness: PASS (local Rust/shared materialization integrity)");
     Ok(())
 }
 
@@ -611,7 +626,6 @@ fn perf() -> Result<(), String> {
 }
 
 fn verify_manifest(root: &Path) -> Result<(), String> {
-    use sha2::{Digest, Sha256};
     let manifest = read_toml(&harness_root(root).join("HARNESS_MANIFEST.toml"))?;
     if manifest
         .get("schema_version")
@@ -625,6 +639,57 @@ fn verify_manifest(root: &Path) -> Result<(), String> {
     if files.is_empty() {
         return Err("empty harness integrity manifest".into());
     }
+    verify_integrity_files(root, files)
+}
+
+fn verify_research_manifest(root: &Path) -> Result<(), String> {
+    let package = root.join("crates/hcodex");
+    let manifest = read_toml(&package.join("research-assets.toml"))?;
+    if manifest
+        .get("schema_version")
+        .and_then(toml::Value::as_integer)
+        != Some(1)
+        || manifest.get("runtime_rules").and_then(toml::Value::as_str)
+            != Some("assets/research-rules.md")
+        || manifest.get("fixture_corpus").and_then(toml::Value::as_str)
+            != Some("tests/fixtures/research_contract_cases.json")
+    {
+        return Err("invalid public research asset identity".into());
+    }
+    let files = required_table(&manifest, "files")?;
+    let expected = [
+        "assets/research-rules.md",
+        "tests/fixtures/research_contract_cases.json",
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if files.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected {
+        return Err("public research asset inventory differs from its required contract".into());
+    }
+    for relative in &expected {
+        let metadata = fs::symlink_metadata(package.join(relative))
+            .map_err(|error| format!("public research asset {relative}: {error}"))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "public research asset must be a regular file: {relative}"
+            ));
+        }
+    }
+    verify_integrity_files(&package, files)?;
+    require_file(&package.join("src/research/validate.rs"))?;
+    let verification = required_table(&manifest, "verification")?;
+    if required_bool(verification, "network")?
+        || required_bool(verification, "model_calls")?
+        || required_bool(verification, "human_judge")?
+        || required_str(verification, "semantic_verification")? != "NOT_MECHANICALLY_PROVEN"
+    {
+        return Err("research canonical checks must be deterministic integrity checks".into());
+    }
+    Ok(())
+}
+
+fn verify_integrity_files(root: &Path, files: &toml::value::Table) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
     for (relative, expected) in files {
         let path = Path::new(relative);
         if path.is_absolute()
@@ -667,6 +732,91 @@ mod tests {
         let selected = workspace_root_from(&child);
         fs::remove_dir_all(&root).map_err(|e| e.to_string())?;
         assert_eq!(selected?, root.join("isolated"));
+        Ok(())
+    }
+
+    fn fixture_directory(label: &str) -> Result<PathBuf, String> {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("hcodex-{label}-{}-{suffix}", std::process::id()));
+        fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        Ok(root)
+    }
+
+    #[test]
+    fn portable_policy_loads_without_private_agent_or_cargo_directories() -> Result<(), String> {
+        let root = fixture_directory("portable-policy")?;
+        fs::create_dir(root.join("xtask")).map_err(|error| error.to_string())?;
+        fs::write(root.join("xtask/HARNESS.toml"),"[toolchain]\npolicy='current-stable'\n[verification]\nsupply_chain=false\n[unsafe]\nmode='forbid'\napproved_crates=[]\n").map_err(|error|error.to_string())?;
+        let policy = HarnessPolicy::load(&root);
+        fs::create_dir_all(root.join(".agents/rust_dev_harness"))
+            .map_err(|error| error.to_string())?;
+        fs::write(
+            root.join(".agents/rust_dev_harness/HARNESS.toml"),
+            "not valid policy",
+        )
+        .map_err(|error| error.to_string())?;
+        let with_private_files = HarnessPolicy::load(&root);
+        fs::remove_dir_all(&root).map_err(|error| error.to_string())?;
+        let expected = HarnessPolicy {
+            rust_version: RustVersionPolicy::CurrentStable,
+            supply_chain: false,
+            unsafe_policy: UnsafePolicy::Forbid,
+        };
+        assert_eq!(policy?, expected);
+        assert_eq!(with_private_files?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn research_integrity_uses_public_assets_and_rejects_tampering() -> Result<(), String> {
+        use sha2::{Digest, Sha256};
+        let root = fixture_directory("public-research")?;
+        let package = root.join("crates/hcodex");
+        fs::create_dir_all(package.join("assets")).map_err(|error| error.to_string())?;
+        fs::create_dir_all(package.join("tests/fixtures")).map_err(|error| error.to_string())?;
+        fs::create_dir_all(package.join("src/research")).map_err(|error| error.to_string())?;
+        let rules = "Research citation integrity is not semantic proof.\n";
+        let corpus = "{\"schema_version\":1,\"cases\":[]}\n";
+        fs::write(package.join("assets/research-rules.md"), rules)
+            .map_err(|error| error.to_string())?;
+        fs::write(
+            package.join("tests/fixtures/research_contract_cases.json"),
+            corpus,
+        )
+        .map_err(|error| error.to_string())?;
+        fs::write(
+            package.join("src/research/validate.rs"),
+            "// fixture validator\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let manifest = format!(
+            "schema_version=1\nruntime_rules='assets/research-rules.md'\nfixture_corpus='tests/fixtures/research_contract_cases.json'\n[verification]\nnetwork=false\nmodel_calls=false\nhuman_judge=false\nsemantic_verification='NOT_MECHANICALLY_PROVEN'\n[files]\n'assets/research-rules.md'='{:x}'\n'{}'='{:x}'\n",
+            Sha256::digest(rules.as_bytes()),
+            "tests/fixtures/research_contract_cases.json",
+            Sha256::digest(corpus.as_bytes())
+        );
+        fs::write(package.join("research-assets.toml"), &manifest)
+            .map_err(|error| error.to_string())?;
+        let valid = verify_research_manifest(&root);
+        fs::write(package.join("assets/research-rules.md"), "tampered\n")
+            .map_err(|error| error.to_string())?;
+        let tampered = verify_research_manifest(&root);
+        fs::write(package.join("assets/research-rules.md"), rules)
+            .map_err(|error| error.to_string())?;
+        fs::write(
+            package.join("research-assets.toml"),
+            format!("{manifest}'private-policy'='unapproved'\n"),
+        )
+        .map_err(|error| error.to_string())?;
+        let extra = verify_research_manifest(&root);
+        fs::remove_dir_all(&root).map_err(|error| error.to_string())?;
+        valid?;
+        assert!(tampered.is_err());
+        assert!(extra.is_err());
         Ok(())
     }
 

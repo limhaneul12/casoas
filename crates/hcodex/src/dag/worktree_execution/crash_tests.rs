@@ -103,7 +103,7 @@ fn mock_gateway(state: &Path, workspace: &Path, calls: &Path, pause_phase: &str)
         receipt.output_digest = Some(digest_output(&output));
         receipt.owned_processes_closed = Some(true);
         close_receipt(&mut receipt);
-        Ok(ExecutionResult {receipt,placeholder:None,output,structured_output:Some(data),session_id:Some(format!("fixture-{label}")),exit_code:Some(0)})
+        Ok(ExecutionResult {receipt,placeholder:None,output,structured_output:Some(data),session_id:Some(format!("fixture-{label}")),exit_code:Some(0),search_evidence:None})
     })
 }
 
@@ -555,7 +555,7 @@ async fn pending_node_with_existing_provider_identity_is_never_dispatched() -> R
                     job_id: Some(id.clone()),
                     idempotency_key: Some(id.clone()),
                     provider: Some("antigravity".into()),
-                    engine: Some("antigravity_local_rpc".into()),
+                    engine: Some("antigravity_cli".into()),
                     created_at: None,
                 })?;
                 match status {

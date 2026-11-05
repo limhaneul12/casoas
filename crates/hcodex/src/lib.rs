@@ -10,9 +10,10 @@ pub mod gateway;
 mod git;
 pub mod http_runtime;
 pub mod lifecycle;
-pub mod mcp;
 pub mod recovery;
 mod recovery_artifacts;
+pub mod research;
+pub mod research_cli;
 pub mod routing;
 pub mod runtime;
 pub mod storage;
@@ -22,3 +23,8 @@ pub mod triad;
 pub mod tui;
 pub(crate) mod verification;
 pub mod workbench;
+
+pub mod workspace_cli;
+pub mod workspaces;
+
+pub mod execution_policy;

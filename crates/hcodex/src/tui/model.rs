@@ -9,6 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{CompletionItem, CompletionKind, TuiCatalog, is_quit_key};
 use crate::Result;
+use crate::workspaces::{WorkspaceKind, WorkspaceRunStatus};
+
+mod workspaces;
+pub use workspaces::{WorkspaceArtifactView, WorkspacePane, WorkspaceUpdate};
+use workspaces::{panes, terminal};
 
 const TRANSCRIPT_LIMIT: usize = 500;
 const VIEW_HISTORY_LIMIT: usize = 50;
@@ -30,6 +35,14 @@ pub enum TuiAction {
     RunCouncil(String),
     ShowVotes(String),
     ShowRecovery(String),
+    RunResearch(String),
+    ShowResearchStatus(String),
+    SelectWorkspace(WorkspaceKind),
+    RunPlanning(String),
+    RunBuilding(String),
+    RunWorkflow(String),
+    ShowWorkflowStatus(String),
+    CancelWorkflow(String),
     ShowPrompts(Option<String>),
     Back,
     ShowModels,
@@ -92,6 +105,20 @@ pub enum TuiUpdate {
     RuntimeUnavailable {
         action: TuiAction,
         reason: String,
+    },
+    WorkspaceStarted {
+        run_id: String,
+        selected: Vec<WorkspaceKind>,
+        objective: String,
+    },
+    WorkspaceScoped {
+        run_id: String,
+        workspace: WorkspaceKind,
+        update: WorkspaceUpdate,
+    },
+    WorkspaceFinished {
+        run_id: String,
+        status: WorkspaceRunStatus,
     },
 }
 
@@ -231,7 +258,7 @@ pub struct DagLaneView {
 }
 
 #[derive(Clone, Debug)]
-struct ViewState {
+pub(super) struct ViewState {
     title: String,
     body: Vec<String>,
     scroll: usize,
@@ -242,8 +269,6 @@ struct ViewState {
 pub struct TuiApp {
     workspace: PathBuf,
     catalog: TuiCatalog,
-    input: String,
-    cursor: usize,
     completion_index: usize,
     completions: Vec<CompletionItem>,
     completion_dismissed: bool,
@@ -252,9 +277,8 @@ pub struct TuiApp {
     input_history: VecDeque<String>,
     history_index: Option<usize>,
     history_draft: String,
-    transcript: VecDeque<TranscriptEntry>,
-    lanes: Vec<DagLaneView>,
-    lane_clocks: BTreeMap<String, (Instant, Duration)>,
+    active_workspace: WorkspaceKind,
+    workspace_panes: BTreeMap<WorkspaceKind, WorkspacePane>,
     active_model: String,
     active_skills: Vec<String>,
     effort: String,
@@ -264,11 +288,9 @@ pub struct TuiApp {
     dag_mode: bool,
     motion_enabled: bool,
     dag_transition: Option<(bool, usize)>,
-    done: usize,
-    total: usize,
     tokens: TokenUsage,
-    current_view: Option<ViewState>,
-    view_history: Vec<ViewState>,
+    overlay_view: Option<ViewState>,
+    overlay_history: Vec<ViewState>,
     skill_cursor: usize,
     viewport_width: u16,
     quit: bool,
@@ -291,8 +313,6 @@ impl TuiApp {
         Self {
             workspace,
             catalog,
-            input: String::new(),
-            cursor: 0,
             completion_index: 0,
             completions: Vec::new(),
             completion_dismissed: false,
@@ -301,11 +321,8 @@ impl TuiApp {
             input_history: VecDeque::new(),
             history_index: None,
             history_draft: String::new(),
-            transcript: VecDeque::from([TranscriptEntry::root(
-                "Heterarchy Codex Rust workbench ready",
-            )]),
-            lanes: Vec::new(),
-            lane_clocks: BTreeMap::new(),
+            active_workspace: WorkspaceKind::Building,
+            workspace_panes: panes(),
             active_model: "gemini-4-argon-high".to_owned(),
             active_skills: vec!["codex-heterarchy".to_owned()],
             effort: "high".to_owned(),
@@ -315,11 +332,9 @@ impl TuiApp {
             dag_mode: false,
             motion_enabled,
             dag_transition: None,
-            done: 0,
-            total: 0,
             tokens: TokenUsage::default(),
-            current_view: None,
-            view_history: Vec::new(),
+            overlay_view: None,
+            overlay_history: Vec::new(),
             skill_cursor: 0,
             viewport_width: 80,
             quit: false,
@@ -328,19 +343,55 @@ impl TuiApp {
         }
     }
 
+    fn pane_mut(&mut self, kind: WorkspaceKind) -> &mut WorkspacePane {
+        self.workspace_panes
+            .entry(kind)
+            .or_insert_with(|| WorkspacePane::new(kind))
+    }
+
+    fn active_pane_mut(&mut self) -> &mut WorkspacePane {
+        self.pane_mut(self.active_workspace)
+    }
+
+    fn active_view(&self) -> Option<&ViewState> {
+        self.overlay_view
+            .as_ref()
+            .or(self.active_workspace_pane().current_view.as_ref())
+    }
+
+    fn active_view_mut(&mut self) -> Option<&mut ViewState> {
+        if self.overlay_view.is_some() {
+            return self.overlay_view.as_mut();
+        }
+        self.active_pane_mut().current_view.as_mut()
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<Option<TuiAction>> {
         if is_quit_key(key)
             || key.code == KeyCode::Char('d')
                 && key.modifiers.contains(KeyModifiers::CONTROL)
-                && self.input.is_empty()
+                && self.input().is_empty()
         {
             self.quit = true;
             return Ok(Some(TuiAction::Quit));
         }
-        if let Some(view) = &mut self.current_view {
+        if key.modifiers == KeyModifiers::ALT {
+            let workspace = match key.code {
+                KeyCode::Char('1') => Some(WorkspaceKind::Research),
+                KeyCode::Char('2') => Some(WorkspaceKind::Planning),
+                KeyCode::Char('3') => Some(WorkspaceKind::Building),
+                _ => None,
+            };
+            if let Some(workspace) = workspace {
+                self.select_workspace(workspace);
+                return Ok(Some(TuiAction::SelectWorkspace(workspace)));
+            }
+        }
+        let viewport_width = self.viewport_width;
+        if let Some(view) = self.active_view_mut() {
             match key.code {
                 KeyCode::PageDown => {
-                    let rows = view_row_count(&view.body, self.viewport_width);
+                    let rows = view_row_count(&view.body, viewport_width);
                     view.scroll = view.scroll.saturating_add(10).min(rows.saturating_sub(1));
                     return Ok(None);
                 }
@@ -351,8 +402,8 @@ impl TuiApp {
                 _ => {}
             }
         }
-        if self.current_view.is_some()
-            && self.input.is_empty()
+        if self.current_view().is_some()
+            && self.input().is_empty()
             && self.completions.is_empty()
             && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
         {
@@ -367,9 +418,8 @@ impl TuiApp {
                 _ => {}
             }
             if self
-                .current_view
-                .as_ref()
-                .is_some_and(|view| view.title == "Discovered skills")
+                .current_view()
+                .is_some_and(|(title, _)| title == "Discovered skills")
             {
                 match key.code {
                     KeyCode::Up => {
@@ -405,9 +455,9 @@ impl TuiApp {
                 self.completion_dismissed = true;
                 self.completion_forced = false;
                 self.completion_navigated = false;
-            } else if self.current_view.is_some() {
+            } else if self.current_view().is_some() {
                 self.back();
-            } else if !self.input.is_empty() {
+            } else if !self.input().is_empty() {
                 self.clear_input();
             } else {
                 self.back();
@@ -415,7 +465,10 @@ impl TuiApp {
             }
             return Ok(None);
         }
-        if self.current_view.is_some() && key.code == KeyCode::Backspace && self.input.is_empty() {
+        if self.current_view().is_some()
+            && key.code == KeyCode::Backspace
+            && self.input().is_empty()
+        {
             self.back();
             return Ok(None);
         }
@@ -443,16 +496,18 @@ impl TuiApp {
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete(),
             KeyCode::Left => self.move_left(),
-            KeyCode::Right if self.cursor == self.input.len() && !self.completions.is_empty() => {
+            KeyCode::Right
+                if self.cursor() == self.input().len() && !self.completions.is_empty() =>
+            {
                 self.apply_completion()
             }
             KeyCode::Right => self.move_right(),
             KeyCode::Home => {
-                self.cursor = 0;
+                self.active_pane_mut().cursor = 0;
                 self.refresh_completions();
             }
             KeyCode::End => {
-                self.cursor = self.input.len();
+                self.active_pane_mut().cursor = self.input().len();
                 self.refresh_completions();
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -481,34 +536,24 @@ impl TuiApp {
     pub fn handle_paste(&mut self, text: &str) {
         self.reset_completion_intent();
         let sanitized = sanitize_paste(text);
-        self.input.insert_str(self.cursor, &sanitized);
-        self.cursor += sanitized.len();
+        let pane = self.active_pane_mut();
+        pane.input.insert_str(pane.cursor, &sanitized);
+        pane.cursor += sanitized.len();
         self.refresh_completions();
     }
 
     pub fn apply_update(&mut self, update: TuiUpdate) {
         match update {
             TuiUpdate::ValidatedAction(action) => self.apply_local_action(&action),
-            TuiUpdate::Transcript(entry) => self.push_transcript(entry),
+            TuiUpdate::Transcript(entry) => {
+                self.push_workspace_transcript(WorkspaceKind::Building, entry)
+            }
             TuiUpdate::DagSnapshot(lanes) => {
-                self.lane_clocks.clear();
-                for lane in &lanes {
-                    if matches!(lane.state, LaneState::Running | LaneState::Stopped) {
-                        self.lane_clocks.insert(
-                            lane.id.clone(),
-                            (Instant::now(), lane.elapsed.unwrap_or_default()),
-                        );
-                    }
-                }
-                self.done = lanes
-                    .iter()
-                    .filter(|lane| lane.state == LaneState::Accepted)
-                    .count();
-                self.total = lanes.len();
-                self.lanes = lanes;
+                Self::replace_lanes(self.pane_mut(WorkspaceKind::Building), lanes);
             }
             TuiUpdate::DagInterrupted(reason) => {
-                for lane in &mut self.lanes {
+                let pane = self.pane_mut(WorkspaceKind::Building);
+                for lane in &mut pane.lanes {
                     if matches!(
                         lane.state,
                         LaneState::Running | LaneState::Stopped | LaneState::HandedOut
@@ -519,7 +564,7 @@ impl TuiApp {
                         );
                     }
                 }
-                self.lane_clocks.clear();
+                pane.lane_clocks.clear();
             }
             TuiUpdate::LaneState {
                 node_id,
@@ -527,27 +572,29 @@ impl TuiApp {
                 note,
                 elapsed,
             } => {
-                if let Some(lane) = self.lanes.iter_mut().find(|lane| lane.id == node_id) {
+                let pane = self.pane_mut(WorkspaceKind::Building);
+                if let Some(lane) = pane.lanes.iter_mut().find(|lane| lane.id == node_id) {
                     if matches!(state, LaneState::Running | LaneState::Stopped) {
-                        self.lane_clocks
+                        pane.lane_clocks
                             .entry(node_id)
                             .or_insert_with(|| (Instant::now(), elapsed.unwrap_or_default()));
                     } else {
-                        self.lane_clocks.remove(&node_id);
+                        pane.lane_clocks.remove(&node_id);
                     }
                     lane.state = state;
                     lane.note = note;
                     lane.elapsed = elapsed;
                 }
-                self.done = self
+                pane.done = pane
                     .lanes
                     .iter()
                     .filter(|lane| lane.state == LaneState::Accepted)
                     .count();
             }
             TuiUpdate::HeaderProgress { done, total } => {
-                self.done = done;
-                self.total = total;
+                let pane = self.pane_mut(WorkspaceKind::Building);
+                pane.done = done;
+                pane.total = total;
             }
             TuiUpdate::Tokens(tokens) => self.tokens = tokens,
             TuiUpdate::ActiveModel(model) => self.active_model = model,
@@ -556,11 +603,16 @@ impl TuiApp {
             TuiUpdate::PermissionMode(mode) => self.permission_mode = mode,
             TuiUpdate::Theme(theme) => self.theme = theme,
             TuiUpdate::CompactHistory => {
-                if self.view_history.len() > 1 {
-                    self.view_history.drain(..self.view_history.len() - 1);
+                if self.overlay_history.len() > 1 {
+                    self.overlay_history.drain(..self.overlay_history.len() - 1);
                 }
-                while self.transcript.len() > 50 {
-                    self.transcript.pop_front();
+                for pane in self.workspace_panes.values_mut() {
+                    if pane.view_history.len() > 1 {
+                        pane.view_history.drain(..pane.view_history.len() - 1);
+                    }
+                    while pane.transcript.len() > 50 {
+                        pane.transcript.pop_front();
+                    }
                 }
             }
             TuiUpdate::ActiveSkills(skills) => {
@@ -572,6 +624,19 @@ impl TuiApp {
             TuiUpdate::RuntimeUnavailable { action, reason } => self.push_transcript(
                 TranscriptEntry::root(format!("Runtime unavailable for {action:?}: {reason}")),
             ),
+            TuiUpdate::WorkspaceStarted {
+                run_id,
+                selected,
+                objective,
+            } => self.start_workspace_run(run_id, selected, objective),
+            TuiUpdate::WorkspaceScoped {
+                run_id,
+                workspace,
+                update,
+            } => self.apply_workspace_update(&run_id, workspace, update),
+            TuiUpdate::WorkspaceFinished { run_id, status } => {
+                self.finish_workspace_run(&run_id, status)
+            }
         }
     }
 
@@ -583,9 +648,11 @@ impl TuiApp {
         }) {
             self.dag_transition = None;
         }
-        for lane in &mut self.lanes {
-            if let Some((started, base)) = self.lane_clocks.get(&lane.id) {
-                lane.elapsed = Some(*base + started.elapsed());
+        for pane in self.workspace_panes.values_mut() {
+            for lane in &mut pane.lanes {
+                if let Some((started, base)) = pane.lane_clocks.get(&lane.id) {
+                    lane.elapsed = Some(*base + started.elapsed());
+                }
             }
         }
     }
@@ -597,14 +664,39 @@ impl TuiApp {
     pub fn workspace(&self) -> &PathBuf {
         &self.workspace
     }
+    pub fn active_workspace(&self) -> WorkspaceKind {
+        self.active_workspace
+    }
+    pub fn workspace_pane(&self, kind: WorkspaceKind) -> &WorkspacePane {
+        &self.workspace_panes[&kind]
+    }
+    pub fn active_workspace_pane(&self) -> &WorkspacePane {
+        self.workspace_pane(self.active_workspace)
+    }
+    pub fn workspace_tabs(&self) -> [(WorkspaceKind, &WorkspacePane); 3] {
+        [
+            (
+                WorkspaceKind::Research,
+                self.workspace_pane(WorkspaceKind::Research),
+            ),
+            (
+                WorkspaceKind::Planning,
+                self.workspace_pane(WorkspaceKind::Planning),
+            ),
+            (
+                WorkspaceKind::Building,
+                self.workspace_pane(WorkspaceKind::Building),
+            ),
+        ]
+    }
     pub fn git_branch(&self) -> Option<&str> {
         self.catalog.git_branch()
     }
     pub fn input(&self) -> &str {
-        &self.input
+        &self.active_workspace_pane().input
     }
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.active_workspace_pane().cursor
     }
     pub fn completions(&self) -> &[CompletionItem] {
         &self.completions
@@ -613,11 +705,11 @@ impl TuiApp {
         self.completion_index
     }
     pub fn completion_ghost(&self) -> Option<String> {
-        if self.cursor != self.input.len() || self.input.is_empty() {
+        if self.cursor() != self.input().len() || self.input().is_empty() {
             return None;
         }
         let item = self.completions.get(self.completion_index)?;
-        let typed = self.input.get(item.replace_start..self.cursor)?;
+        let typed = self.input().get(item.replace_start..self.cursor())?;
         if item.value.to_lowercase().starts_with(&typed.to_lowercase()) {
             Some(format!(
                 "{}  [{}: {}]",
@@ -630,10 +722,10 @@ impl TuiApp {
         }
     }
     pub fn transcript(&self) -> &VecDeque<TranscriptEntry> {
-        &self.transcript
+        &self.active_workspace_pane().transcript
     }
     pub fn lanes(&self) -> &[DagLaneView] {
-        &self.lanes
+        &self.active_workspace_pane().lanes
     }
     pub fn active_model(&self) -> &str {
         &self.active_model
@@ -668,7 +760,7 @@ impl TuiApp {
         })
     }
     pub fn progress(&self) -> (usize, usize) {
-        (self.done, self.total)
+        self.active_workspace_pane().progress()
     }
     pub fn token_status(&self) -> String {
         self.tokens.status()
@@ -686,18 +778,19 @@ impl TuiApp {
         self.shimmer_tick
     }
     pub fn current_view(&self) -> Option<(&str, &[String])> {
-        self.current_view
+        self.overlay_view
             .as_ref()
+            .or(self.active_workspace_pane().current_view.as_ref())
             .map(|view| (view.title.as_str(), view.body.as_slice()))
     }
     pub fn view_scroll(&self) -> usize {
-        self.current_view.as_ref().map_or(0, |view| view.scroll)
+        self.active_view().map_or(0, |view| view.scroll)
     }
     pub fn skill_cursor(&self) -> usize {
         self.skill_cursor
     }
     pub fn selected_skill_line_index(&self) -> Option<usize> {
-        let view = self.current_view.as_ref()?;
+        let view = self.overlay_view.as_ref()?;
         if view.title != "Discovered skills" {
             return None;
         }
@@ -710,7 +803,7 @@ impl TuiApp {
             return;
         }
         self.viewport_width = width;
-        if let Some(view) = &mut self.current_view {
+        if let Some(view) = self.active_view_mut() {
             let rows = view_row_count(&view.body, width);
             view.scroll = view.scroll.min(rows.saturating_sub(1));
         }
@@ -718,52 +811,61 @@ impl TuiApp {
 
     fn insert(&mut self, character: char) {
         self.reset_completion_intent();
-        self.input.insert(self.cursor, character);
-        self.cursor += character.len_utf8();
+        let pane = self.active_pane_mut();
+        pane.input.insert(pane.cursor, character);
+        pane.cursor += character.len_utf8();
         self.refresh_completions();
     }
 
     fn backspace(&mut self) {
-        if self.cursor == 0 {
+        if self.cursor() == 0 {
             return;
         }
         self.reset_completion_intent();
-        let previous = self.input[..self.cursor]
+        let cursor = self.cursor();
+        let previous = self.input()[..cursor]
             .char_indices()
             .next_back()
             .map_or(0, |(index, _)| index);
-        self.input.drain(previous..self.cursor);
-        self.cursor = previous;
+        let pane = self.active_pane_mut();
+        pane.input.drain(previous..pane.cursor);
+        pane.cursor = previous;
         self.refresh_completions();
     }
 
     fn delete(&mut self) {
-        if self.cursor >= self.input.len() {
+        if self.cursor() >= self.input().len() {
             return;
         }
         self.reset_completion_intent();
-        let next = self.input[self.cursor..]
+        let cursor = self.cursor();
+        let next = self.input()[cursor..]
             .char_indices()
             .nth(1)
-            .map_or(self.input.len(), |(index, _)| self.cursor + index);
-        self.input.drain(self.cursor..next);
+            .map_or(self.input().len(), |(index, _)| cursor + index);
+        let pane = self.active_pane_mut();
+        pane.input.drain(pane.cursor..next);
         self.refresh_completions();
     }
 
     fn move_left(&mut self) {
-        self.cursor = self.input[..self.cursor]
+        let cursor = self.cursor();
+        let next = self.input()[..cursor]
             .char_indices()
             .next_back()
             .map_or(0, |(index, _)| index);
+        self.active_pane_mut().cursor = next;
         self.refresh_completions();
     }
 
     fn move_right(&mut self) {
-        if self.cursor < self.input.len() {
-            self.cursor = self.input[self.cursor..]
+        let cursor = self.cursor();
+        if cursor < self.input().len() {
+            let next = self.input()[cursor..]
                 .char_indices()
                 .nth(1)
-                .map_or(self.input.len(), |(index, _)| self.cursor + index);
+                .map_or(self.input().len(), |(index, _)| cursor + index);
+            self.active_pane_mut().cursor = next;
         }
         self.refresh_completions();
     }
@@ -774,8 +876,8 @@ impl TuiApp {
             return;
         }
         self.completions = self.catalog.complete_with_state(
-            &self.input,
-            self.cursor,
+            self.input(),
+            self.cursor(),
             64,
             &self.active_skills,
             self.completion_forced,
@@ -791,8 +893,9 @@ impl TuiApp {
     }
 
     fn clear_input(&mut self) {
-        self.input.clear();
-        self.cursor = 0;
+        let pane = self.active_pane_mut();
+        pane.input.clear();
+        pane.cursor = 0;
         self.completions.clear();
         self.history_index = None;
         self.history_draft.clear();
@@ -800,14 +903,16 @@ impl TuiApp {
     }
 
     fn delete_previous_word(&mut self) {
-        let trimmed = self.input[..self.cursor].trim_end_matches(char::is_whitespace);
+        let cursor = self.cursor();
+        let trimmed = self.input()[..cursor].trim_end_matches(char::is_whitespace);
         let cut = trimmed
             .char_indices()
             .rev()
             .find(|(_, value)| value.is_whitespace())
             .map_or(0, |(index, value)| index + value.len_utf8());
-        self.input.drain(cut..self.cursor);
-        self.cursor = cut;
+        let pane = self.active_pane_mut();
+        pane.input.drain(cut..pane.cursor);
+        pane.cursor = cut;
         self.reset_completion_intent();
         self.refresh_completions();
     }
@@ -822,14 +927,16 @@ impl TuiApp {
         }
         let index = match self.history_index {
             None => {
-                self.history_draft = self.input.clone();
+                self.history_draft = self.input().to_owned();
                 self.input_history.len() - 1
             }
             Some(index) => index.saturating_sub(1),
         };
         self.history_index = Some(index);
-        self.input.clone_from(&self.input_history[index]);
-        self.cursor = self.input.len();
+        let value = self.input_history[index].clone();
+        let pane = self.active_pane_mut();
+        pane.input = value;
+        pane.cursor = pane.input.len();
         self.reset_completion_intent();
         self.completions.clear();
         self.completion_index = 0;
@@ -843,16 +950,19 @@ impl TuiApp {
         if let Some(index) = self.history_index {
             if index + 1 < self.input_history.len() {
                 self.history_index = Some(index + 1);
-                self.input.clone_from(&self.input_history[index + 1]);
+                let value = self.input_history[index + 1].clone();
+                self.active_pane_mut().input = value;
             } else {
                 self.history_index = None;
-                self.input.clone_from(&self.history_draft);
+                let value = self.history_draft.clone();
+                self.active_pane_mut().input = value;
             }
-            self.cursor = self.input.len();
+            let cursor = self.input().len();
+            self.active_pane_mut().cursor = cursor;
             self.reset_completion_intent();
             self.completions.clear();
             self.completion_index = 0;
-        } else if !self.input.trim().is_empty() {
+        } else if !self.input().trim().is_empty() {
             self.completion_dismissed = false;
             self.refresh_completions();
         }
@@ -877,7 +987,8 @@ impl TuiApp {
             return;
         };
         let token_start = item.replace_start;
-        if self.input.get(token_start..self.cursor).is_none() {
+        let cursor = self.cursor();
+        if self.input().get(token_start..cursor).is_none() {
             return;
         }
         let mut inserted = item.value;
@@ -898,24 +1009,31 @@ impl TuiApp {
                 | "/promt"
                 | "/trace"
                 | "/theme"
+                | "/space"
+                | "/planning"
+                | "/building"
+                | "/workflow"
+                | "/workflow-status"
+                | "/workflow-cancel"
         );
         let directory = inserted.ends_with('/') || inserted.ends_with("/\"");
         if (item.kind == CompletionKind::Skill
             || item.kind == CompletionKind::File && !directory
             || item.kind == CompletionKind::Command && (!item.submit_on_enter || takes_argument))
-            && !self.input[self.cursor..].starts_with(char::is_whitespace)
+            && !self.input()[cursor..].starts_with(char::is_whitespace)
         {
             inserted.push(' ');
         }
-        self.input
-            .replace_range(token_start..self.cursor, &inserted);
-        self.cursor = token_start + inserted.len();
+        let pane = self.active_pane_mut();
+        pane.input
+            .replace_range(token_start..pane.cursor, &inserted);
+        pane.cursor = token_start + inserted.len();
         self.reset_completion_intent();
         self.refresh_completions();
     }
 
     fn submit(&mut self) -> Result<Option<TuiAction>> {
-        let cleaned = self.input.trim();
+        let cleaned = self.input().trim();
         let exact_command = self.catalog.is_exact_command(cleaned);
         let single_trigger = cleaned.starts_with(['/', '$'])
             && (!cleaned.contains(char::is_whitespace)
@@ -926,15 +1044,17 @@ impl TuiApp {
         if !self.completions.is_empty() && (self.completion_navigated || single_trigger) {
             if self.completions[self.completion_index].submit_on_enter {
                 let selected = &self.completions[self.completion_index];
-                self.input
-                    .replace_range(selected.replace_start..self.cursor, &selected.value);
-                self.cursor = selected.replace_start + selected.value.len();
+                let start = selected.replace_start;
+                let value = selected.value.clone();
+                let pane = self.active_pane_mut();
+                pane.input.replace_range(start..pane.cursor, &value);
+                pane.cursor = start + value.len();
             } else {
                 self.apply_completion();
                 return Ok(None);
             }
         }
-        let text = self.input.trim().to_owned();
+        let text = self.input().trim().to_owned();
         if text.is_empty() {
             return Ok(None);
         }
@@ -953,8 +1073,13 @@ impl TuiApp {
                     TuiAction::SubmitPrompt(text.clone())
                 }
             }
-            TuiAction::SubmitPrompt(prompt) if self.dag_mode && !text.starts_with('/') => {
-                TuiAction::AutoDag(prompt)
+            TuiAction::SubmitPrompt(prompt) if !text.starts_with('/') => {
+                match self.active_workspace {
+                    WorkspaceKind::Research => TuiAction::RunResearch(format!("-- {prompt}")),
+                    WorkspaceKind::Planning => TuiAction::RunPlanning(prompt),
+                    WorkspaceKind::Building if self.dag_mode => TuiAction::AutoDag(prompt),
+                    WorkspaceKind::Building => TuiAction::SubmitPrompt(prompt),
+                }
             }
             action => action,
         };
@@ -972,6 +1097,7 @@ impl TuiApp {
                 }
             }
             TuiAction::ExitDag => self.set_dag_mode(false),
+            TuiAction::SelectWorkspace(workspace) => self.select_workspace(*workspace),
             TuiAction::SelectModel(model) => self.active_model.clone_from(model),
             TuiAction::SelectAndPrompt { model, prompt } => {
                 self.active_model.clone_from(model);
@@ -979,16 +1105,42 @@ impl TuiApp {
             }
             TuiAction::SetEffort(effort) => self.effort.clone_from(effort),
             TuiAction::Clear => {
-                self.transcript.clear();
-                self.lanes.clear();
-                self.done = 0;
-                self.total = 0;
+                let pane = self.active_pane_mut();
+                pane.transcript.clear();
+                pane.lanes.clear();
+                pane.done = 0;
+                pane.total = 0;
                 self.tokens = TokenUsage::default();
-                self.current_view = None;
-                self.view_history.clear();
+                self.overlay_view = None;
+                self.overlay_history.clear();
+                let pane = self.active_pane_mut();
+                pane.current_view = None;
+                pane.view_history.clear();
             }
             TuiAction::Back => self.back(),
             TuiAction::Quit => self.quit = true,
+            TuiAction::RunResearch(prompt) => {
+                self.select_workspace(WorkspaceKind::Research);
+                self.push_transcript(TranscriptEntry::root(format!("> you: {prompt}")));
+            }
+            TuiAction::RunPlanning(prompt) => {
+                self.select_workspace(WorkspaceKind::Planning);
+                self.push_transcript(TranscriptEntry::root(format!("> you: {prompt}")));
+            }
+            TuiAction::RunBuilding(prompt) => {
+                self.select_workspace(WorkspaceKind::Building);
+                self.push_transcript(TranscriptEntry::root(format!("> you: {prompt}")));
+            }
+            TuiAction::RunWorkflow(prompt) => {
+                if let Ok(selected) = crate::workspace_cli::selected_workspaces(
+                    crate::workspace_cli::WorkspaceCommand::Workflow,
+                    prompt,
+                ) && let Some(first) = selected.first()
+                {
+                    self.select_workspace(*first);
+                }
+                self.push_transcript(TranscriptEntry::root(format!("> you: {prompt}")));
+            }
             TuiAction::SubmitPrompt(prompt)
             | TuiAction::RunDag(prompt)
             | TuiAction::AutoDag(prompt)
@@ -1004,6 +1156,21 @@ impl TuiApp {
         self.dag_transition = self.motion_enabled.then_some((enabled, self.shimmer_tick));
     }
 
+    fn select_workspace(&mut self, workspace: WorkspaceKind) {
+        self.active_workspace = workspace;
+        self.overlay_view = None;
+        self.overlay_history.clear();
+        let width = self.viewport_width;
+        if let Some(view) = self.active_pane_mut().current_view.as_mut() {
+            view.scroll = view
+                .scroll
+                .min(view_row_count(&view.body, width).saturating_sub(1));
+        }
+        self.completions.clear();
+        self.reset_completion_intent();
+        self.refresh_completions();
+    }
+
     fn open_view(&mut self, title: String, body: Vec<String>) {
         let body: Vec<String> = body
             .into_iter()
@@ -1014,19 +1181,19 @@ impl TuiApp {
             self.skill_cursor = self.skill_cursor.min(count.saturating_sub(1));
         }
         let mut preserved_scroll = 0usize;
-        if let Some(current) = self.current_view.take() {
+        if let Some(current) = self.overlay_view.take() {
             if current.title == title {
                 preserved_scroll = current
                     .scroll
                     .min(view_row_count(&body, self.viewport_width).saturating_sub(1));
             } else {
-                if self.view_history.len() == VIEW_HISTORY_LIMIT {
-                    self.view_history.remove(0);
+                if self.overlay_history.len() == VIEW_HISTORY_LIMIT {
+                    self.overlay_history.remove(0);
                 }
-                self.view_history.push(current);
+                self.overlay_history.push(current);
             }
         }
-        self.current_view = Some(ViewState {
+        self.overlay_view = Some(ViewState {
             title,
             body,
             scroll: preserved_scroll,
@@ -1034,7 +1201,7 @@ impl TuiApp {
     }
 
     fn move_skill_cursor(&mut self, down: bool) {
-        let Some(view) = &mut self.current_view else {
+        let Some(view) = &mut self.overlay_view else {
             return;
         };
         if view.title != "Discovered skills" {
@@ -1061,7 +1228,7 @@ impl TuiApp {
     }
 
     fn toggle_selected_skill_action(&self) -> Option<TuiAction> {
-        let view = self.current_view.as_ref()?;
+        let view = self.overlay_view.as_ref()?;
         if view.title != "Discovered skills" {
             return None;
         }
@@ -1076,9 +1243,9 @@ impl TuiApp {
         let active_set: std::collections::BTreeSet<&str> =
             self.active_skills.iter().map(String::as_str).collect();
         for view in self
-            .view_history
+            .overlay_history
             .iter_mut()
-            .chain(self.current_view.iter_mut())
+            .chain(self.overlay_view.iter_mut())
         {
             if view.title != "Discovered skills" {
                 continue;
@@ -1116,19 +1283,193 @@ impl TuiApp {
     }
 
     fn back(&mut self) {
-        self.current_view = self.view_history.pop();
-        if let Some(view) = &mut self.current_view {
+        if self.overlay_view.is_some() || !self.overlay_history.is_empty() {
+            self.overlay_view = self.overlay_history.pop();
+        } else {
+            let pane = self.active_pane_mut();
+            pane.current_view = pane.view_history.pop();
+        }
+        let width = self.viewport_width;
+        if let Some(view) = self.active_view_mut() {
             view.scroll = view
                 .scroll
-                .min(view_row_count(&view.body, self.viewport_width).saturating_sub(1));
+                .min(view_row_count(&view.body, width).saturating_sub(1));
         }
     }
 
     fn push_transcript(&mut self, entry: TranscriptEntry) {
-        if self.transcript.len() == TRANSCRIPT_LIMIT {
-            self.transcript.pop_front();
+        self.push_workspace_transcript(self.active_workspace, entry);
+    }
+
+    fn push_workspace_transcript(&mut self, workspace: WorkspaceKind, entry: TranscriptEntry) {
+        let pane = self.pane_mut(workspace);
+        if pane.transcript.len() == TRANSCRIPT_LIMIT {
+            pane.transcript.pop_front();
         }
-        self.transcript.push_back(entry);
+        pane.transcript.push_back(entry);
+    }
+
+    fn replace_lanes(pane: &mut WorkspacePane, lanes: Vec<DagLaneView>) {
+        let previous = std::mem::take(&mut pane.lane_clocks);
+        for lane in &lanes {
+            if matches!(lane.state, LaneState::Running | LaneState::Stopped) {
+                pane.lane_clocks.insert(
+                    lane.id.clone(),
+                    previous
+                        .get(&lane.id)
+                        .copied()
+                        .unwrap_or_else(|| (Instant::now(), lane.elapsed.unwrap_or_default())),
+                );
+            }
+        }
+        pane.done = lanes
+            .iter()
+            .filter(|lane| lane.state == LaneState::Accepted)
+            .count();
+        pane.total = lanes.len();
+        pane.lanes = lanes;
+    }
+
+    fn start_workspace_run(
+        &mut self,
+        run_id: String,
+        selected: Vec<WorkspaceKind>,
+        objective: String,
+    ) {
+        let unique = selected
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let available = !selected.is_empty()
+            && unique.len() == selected.len()
+            && selected.iter().all(|workspace| {
+                self.workspace_pane(*workspace).current_run_id.is_none()
+                    && terminal(self.workspace_pane(*workspace).status)
+            });
+        if !available {
+            self.push_transcript(TranscriptEntry::root(format!(
+                "Workflow {run_id} was not projected: one or more selected workspaces are busy"
+            )));
+            return;
+        }
+        for workspace in selected {
+            let pane = self.pane_mut(workspace);
+            pane.current_run_id = Some(run_id.clone());
+            pane.lane_clocks.clear();
+            pane.lanes.clear();
+            pane.done = 0;
+            pane.total = 0;
+            pane.artifact = None;
+            pane.status = WorkspaceRunStatus::Reserved;
+            pane.detail = "Reserved by workflow; awaiting stage admission".to_owned();
+            pane.objective.clone_from(&objective);
+        }
+    }
+
+    fn apply_workspace_update(
+        &mut self,
+        run_id: &str,
+        workspace: WorkspaceKind,
+        update: WorkspaceUpdate,
+    ) {
+        if self.workspace_pane(workspace).current_run_id.as_deref() != Some(run_id) {
+            let ignored = self
+                .workspace_pane(workspace)
+                .ignored_updates
+                .saturating_add(1);
+            self.pane_mut(workspace).ignored_updates = ignored;
+            return;
+        }
+        let viewport_width = self.viewport_width;
+        let pane = self.pane_mut(workspace);
+        match update {
+            WorkspaceUpdate::Status { status, detail } => {
+                pane.status = status;
+                pane.detail = detail;
+            }
+            WorkspaceUpdate::Transcript(entry) => {
+                if pane.transcript.len() == TRANSCRIPT_LIMIT {
+                    pane.transcript.pop_front();
+                }
+                pane.transcript.push_back(entry);
+            }
+            WorkspaceUpdate::View { title, body } => {
+                Self::set_pane_view(pane, title, body, viewport_width)
+            }
+            WorkspaceUpdate::Lanes(lanes) => Self::replace_lanes(pane, lanes),
+            WorkspaceUpdate::Progress { done, total } => {
+                pane.done = done;
+                pane.total = total;
+            }
+            WorkspaceUpdate::Artifact(artifact) => pane.artifact = Some(artifact),
+        }
+    }
+
+    fn set_pane_view(
+        pane: &mut WorkspacePane,
+        title: String,
+        body: Vec<String>,
+        viewport_width: u16,
+    ) {
+        let body = body
+            .into_iter()
+            .flat_map(|line| line.split('\n').map(str::to_owned).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let mut preserved_scroll = 0;
+        if let Some(current) = pane.current_view.take() {
+            if current.title == title {
+                preserved_scroll = current
+                    .scroll
+                    .min(view_row_count(&body, viewport_width).saturating_sub(1));
+            } else {
+                if pane.view_history.len() == VIEW_HISTORY_LIMIT {
+                    pane.view_history.remove(0);
+                }
+                pane.view_history.push(current);
+            }
+        }
+        pane.current_view = Some(ViewState {
+            title,
+            body,
+            scroll: preserved_scroll,
+        });
+    }
+
+    fn finish_workspace_run(&mut self, run_id: &str, status: WorkspaceRunStatus) {
+        for pane in self.workspace_panes.values_mut() {
+            if pane.current_run_id.as_deref() != Some(run_id) {
+                continue;
+            }
+            if pane.status == WorkspaceRunStatus::Reserved {
+                pane.status = WorkspaceRunStatus::Blocked;
+                pane.detail = "Not admitted before workflow termination".into();
+            } else if !terminal(pane.status) {
+                pane.status = if matches!(
+                    status,
+                    WorkspaceRunStatus::Completed
+                        | WorkspaceRunStatus::BuildReady
+                        | WorkspaceRunStatus::Settled
+                ) {
+                    WorkspaceRunStatus::Stopped
+                } else {
+                    status
+                };
+                pane.detail = format!(
+                    "Workflow finished with {status:?}; inspect the stage's persisted result"
+                );
+            }
+            for lane in &mut pane.lanes {
+                if matches!(
+                    lane.state,
+                    LaneState::Running | LaneState::Stopped | LaneState::HandedOut
+                ) {
+                    lane.state = LaneState::Unverified;
+                    lane.note = "Stage ended without an observed settlement receipt".into();
+                }
+            }
+            pane.lane_clocks.clear();
+            pane.current_run_id = None;
+        }
     }
 }
 
@@ -1216,6 +1557,23 @@ pub fn action_from_input(text: &str) -> TuiAction {
         "/council" => TuiAction::RunCouncil(argument.unwrap_or_default().to_owned()),
         "/votes" => TuiAction::ShowVotes(argument.unwrap_or_default().to_owned()),
         "/recovery" => TuiAction::ShowRecovery(argument.unwrap_or_default().to_owned()),
+        "/research" => TuiAction::RunResearch(argument.unwrap_or_default().to_owned()),
+        "/research-status" => {
+            TuiAction::ShowResearchStatus(argument.unwrap_or_default().to_owned())
+        }
+        "/space" => argument
+            .and_then(|value| value.parse::<WorkspaceKind>().ok())
+            .map_or_else(
+                || TuiAction::UnknownCommand(text.to_owned()),
+                TuiAction::SelectWorkspace,
+            ),
+        "/planning" => TuiAction::RunPlanning(argument.unwrap_or_default().to_owned()),
+        "/building" => TuiAction::RunBuilding(argument.unwrap_or_default().to_owned()),
+        "/workflow" => TuiAction::RunWorkflow(argument.unwrap_or_default().to_owned()),
+        "/workflow-status" => {
+            TuiAction::ShowWorkflowStatus(argument.unwrap_or_default().to_owned())
+        }
+        "/workflow-cancel" => TuiAction::CancelWorkflow(argument.unwrap_or_default().to_owned()),
         "/prompts" | "/promt" | "/trace" if argument.is_some_and(is_back_token) => TuiAction::Back,
         "/prompts" | "/promt" | "/trace" | "/prompt-trace" => {
             TuiAction::ShowPrompts(argument.map(str::to_owned))

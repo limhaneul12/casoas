@@ -1,4 +1,4 @@
-//! Application service shared by MCP, CLI, and terminal adapters.
+//! Common application backend used by CLI and terminal adapters.
 mod contracts;
 mod grounding;
 
@@ -12,15 +12,16 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use contracts::{
     BudgetEnvelope, background_response, budget_response, deduplicated_response, job_list_response,
     job_status_response, model_execution_response, rejection_response, verified_at_utc,
 };
-use grounding::{
-    boundary_schema, build_route_request, grounded_prompt, normalize_boundary, structured_prompt,
-};
+use grounding::{boundary_schema, grounded_prompt, normalize_boundary};
+
+pub(crate) use grounding::build_route_request;
 
 #[cfg(test)]
 type TestProvider = std::sync::Arc<
@@ -38,8 +39,51 @@ pub struct Gateway {
     supervisor: Supervisor,
     codex_binary: Option<PathBuf>,
     sandbox_mode: crate::routing::SandboxMode,
+    storage: Arc<tokio::sync::OnceCell<CachedStore>>,
     #[cfg(test)]
     test_provider: Option<TestProvider>,
+    #[cfg(test)]
+    pub(crate) test_research_sources: Option<TestResearchSources>,
+}
+
+#[cfg(test)]
+type TestResearchSources = std::sync::Arc<
+    dyn Fn(&crate::research::ResearchRequest) -> crate::Result<crate::research::SourceBundle>
+        + Send
+        + Sync,
+>;
+
+struct CachedStore {
+    root: PathBuf,
+    identity: [Option<(u64, u64)>; 3],
+    store: Store,
+}
+fn storage_identity(root: &Path) -> crate::Result<[Option<(u64, u64)>; 3]> {
+    let mut identity = [None; 3];
+    for (index, path) in [
+        root.to_path_buf(),
+        root.join("jobs/jobs.db"),
+        root.join("handoffs/handoffs.db"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let metadata = std::fs::metadata(path)?;
+        if (index == 0 && !metadata.is_dir()) || (index != 0 && !metadata.is_file()) {
+            return Err("Gateway state binding is not a directory with regular databases".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            identity[index] = Some((metadata.dev(), metadata.ino()));
+        }
+    }
+    Ok(identity)
+}
+#[derive(Default)]
+struct ProgressCommitState {
+    at: Option<Instant>,
+    value: Option<crate::routing::ExecutionProgress>,
 }
 
 struct ProviderInvocation {
@@ -65,8 +109,11 @@ impl Gateway {
             supervisor: Supervisor::new(8),
             codex_binary: None,
             sandbox_mode: crate::routing::SandboxMode::ReadOnly,
+            storage: Arc::new(tokio::sync::OnceCell::new()),
             #[cfg(test)]
             test_provider: None,
+            #[cfg(test)]
+            test_research_sources: None,
         }
     }
     pub fn with_sandbox(mut self, mode: crate::routing::SandboxMode) -> Self {
@@ -152,19 +199,21 @@ impl Gateway {
             .get("version")
             .cloned()
             .unwrap_or_else(|| Value::String("unavailable".to_owned()));
-        let agy_boundary = health["auth_boundaries"]["antigravity_rpc"].clone();
+        let agy_boundary = health["auth_boundaries"]["antigravity_cli"].clone();
         health["agy_bridge_ready"] = agy_boundary
             .get("connected")
             .cloned()
             .unwrap_or(Value::Bool(false));
-        health["agy_endpoint"] = agy_boundary.get("endpoint").cloned().unwrap_or(Value::Null);
+        health["agy_endpoint"] = Value::Null;
+        health["antigravity_transport"] = json!("cli");
+        health["antigravity_binary"] = json!(crate::runtime::resolve_antigravity_binary());
         health["antigravity_models"] = Value::Array(
             antigravity_models
                 .iter()
                 .map(|model| {
                     let mut value = serde_json::to_value(model)?;
                     value["provider"] = Value::String("antigravity".to_owned());
-                    value["engine"] = Value::String("antigravity_local_rpc".to_owned());
+                    value["engine"] = Value::String("antigravity_cli".to_owned());
                     Ok(value)
                 })
                 .collect::<crate::Result<Vec<_>>>()?,
@@ -216,8 +265,109 @@ impl Gateway {
         F: FnOnce(Store) -> crate::Result<T> + Send + 'static,
     {
         let root = self.state_root.clone();
-        tokio::task::spawn_blocking(move || operation(Store::open(&root)?)).await?
+        let cached = self
+            .storage
+            .get_or_try_init(|| async {
+                let opening = root.clone();
+                tokio::task::spawn_blocking(move || {
+                    let store = Store::open(&opening)?;
+                    let root = opening.canonicalize()?;
+                    let identity = storage_identity(&root)?;
+                    Ok::<_, crate::Error>(CachedStore {
+                        root,
+                        identity,
+                        store,
+                    })
+                })
+                .await?
+            })
+            .await?;
+        let store = cached.store.clone();
+        let expected = cached.root.clone();
+        let identity = cached.identity;
+        tokio::task::spawn_blocking(move||{
+            if root.canonicalize()?!=expected || storage_identity(&expected)?!=identity {return Err("Gateway state root or database identity changed after storage admission; create a new Gateway".into());}
+            operation(store)
+        }).await?
     }
+    fn execution_observer(&self, job_id: String) -> crate::runtime::ProgressObserver {
+        let gateway = self.clone();
+        let state = Arc::new(tokio::sync::Mutex::new(ProgressCommitState::default()));
+        Arc::new(move |progress: crate::routing::ExecutionProgress| {
+            let gateway = gateway.clone();
+            let job_id = job_id.clone();
+            let state = Arc::clone(&state);
+            Box::pin(async move {
+                let mut last = state.lock().await;
+                let critical = last.value.as_ref().is_none_or(|old| {
+                    old.session_id != progress.session_id
+                        || old.observed_model != progress.observed_model
+                        || old.phase != progress.phase
+                }) || matches!(
+                    progress.phase,
+                    crate::routing::ExecutionPhase::ResultObserved
+                        | crate::routing::ExecutionPhase::Stopped
+                );
+                if !critical
+                    && last
+                        .at
+                        .is_some_and(|at| at.elapsed() < Duration::from_millis(250))
+                {
+                    return Ok(());
+                }
+                let save = progress.clone();
+                let saved = gateway
+                    .database(move |store| store.checkpoint_execution(&job_id, save))
+                    .await?
+                    .ok_or("execution observation lost its original job record")?;
+                if progress.phase == crate::routing::ExecutionPhase::AwaitingInput
+                    && (saved.status != JobStatus::Running
+                        || saved.session_id != progress.session_id)
+                {
+                    return Err("CLI session binding did not commit on an active job before prompt admission".into());
+                }
+                last.at = Some(Instant::now());
+                last.value = Some(progress);
+                Ok(())
+            })
+        })
+    }
+
+    async fn observe_owner_while<F>(
+        &self,
+        job_id: &str,
+        provider: F,
+    ) -> crate::Result<crate::runtime::ExecutionResult>
+    where
+        F: Future<Output = crate::Result<crate::runtime::ExecutionResult>> + Send,
+    {
+        tokio::pin!(provider);
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                result=&mut provider=>return result,
+                _=heartbeat.tick()=>{
+                    let id=job_id.to_owned();
+                    if let Err(error)=self.database(move|store|store.heartbeat_execution_owner(&id)).await {
+                        let owner=crate::supervisor::current_job_id().unwrap_or_else(||job_id.to_owned());
+                        self.cancel_supervised(&owner).await;
+                        // Keep the same provider future alive until its owned I/O
+                        // and children drain. A heartbeat error is not a retry.
+                        let mut execution=provider.await?;
+                        execution.receipt.status=ReceiptStatus::TimedOutUnknown;
+                        execution.receipt.outcome_state="outcome_unknown".into();
+                        let message=format!("Execution owner heartbeat could not be persisted; inspect original job/session IDs: {error}");
+                        execution.receipt.error=Some(message.clone());execution.receipt.failure_reason=Some(message);
+                        crate::routing::close_receipt(&mut execution.receipt);
+                        return Ok(execution);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn call<'a>(
         &'a self,
         name: &'a str,
@@ -243,42 +393,46 @@ impl Gateway {
                     id.clone()
                 };
                 let cancel = args["cancel"].as_bool().unwrap_or(false);
-                let (record, cancel_id) = self
+                let mut record = self
                     .database(move |store| {
-                        let record = if id.is_empty() {
+                        if id.is_empty() {
                             key.as_deref()
                                 .map(|key| store.find_job_by_idempotency_key(key))
-                                .transpose()?
-                                .flatten()
+                                .transpose()
+                                .map(Option::flatten)
                         } else {
-                            store.get_job(&id)?
-                        };
-                        let record = match record {
-                            Some(record)
-                                if cancel
-                                    && matches!(
-                                        record.status,
-                                        JobStatus::Running | JobStatus::TimedOutUnknown
-                                    ) =>
-                            {
-                                store.cancel_job(
-                                    &record.job_id,
-                                    "user requested cancellation".into(),
-                                )?
-                            }
-                            other => other,
-                        };
-                        let cancel_id = record
-                            .as_ref()
-                            .filter(|record| cancel && record.status == JobStatus::Cancelled)
-                            .map(|record| record.job_id.clone());
-                        Ok((record, cancel_id))
+                            store.get_job(&id)
+                        }
                     })
                     .await?;
-                if let Some(cancel_id) = cancel_id {
-                    self.supervisor.cancel(&cancel_id).await;
+                let mut cancellation_signalled = false;
+                if cancel
+                    && let Some(job) = &record
+                    && matches!(job.status, JobStatus::Running | JobStatus::TimedOutUnknown)
+                {
+                    let id = job.job_id.clone();
+                    cancellation_signalled = self.supervisor.cancel(&id).await;
+                    if cancellation_signalled {
+                        record = self
+                            .database(move |store| {
+                                store.cancel_job(
+                                    &id,
+                                    "user requested cancellation through owning Gateway".into(),
+                                )
+                            })
+                            .await?;
+                    }
                 }
-                job_status_response(record, &lookup)
+                let mut value = job_status_response(record, &lookup)?;
+                if cancel {
+                    value["cancellation_signalled"] = json!(cancellation_signalled);
+                    if !cancellation_signalled {
+                        value["cancellation_detail"] = json!(
+                            "No matching live control is owned by this Gateway; the durable job was not cancelled."
+                        );
+                    }
+                }
+                Ok(value)
             }
             "codex_job_list" => {
                 let limit = limit(&args);
@@ -450,11 +604,12 @@ impl Gateway {
                     .map(|value| serde_json::from_value(value.clone()))
                     .transpose()?
                     .unwrap_or(self.sandbox_mode);
+                let sandbox_mode = effective_sandbox(route_request.engine, sandbox_mode);
                 let duration = Duration::from_secs_f64(
                     args["timeout_seconds"]
                         .as_f64()
-                        .unwrap_or(3600.0)
-                        .clamp(0.01, 86_400.0),
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 86_400.0),
                 );
                 let max_input_bytes =
                     usize::try_from(args["max_input_bytes"].as_u64().unwrap_or(256_000))?;
@@ -585,6 +740,13 @@ impl Gateway {
         result: crate::Result<Value>,
     ) -> crate::Result<()> {
         if let Ok(value) = &result {
+            if value["deduplicated_existing_request"] == true
+                || value["result_persisted"] == false
+                || value["durable_outcome_prevailed"] == true
+                || value["outcome_state"] == "outcome_unknown"
+            {
+                return Ok(());
+            }
             let returned_id = value
                 .get("job_id")
                 .or_else(|| value.get("collaboration_id"))
@@ -602,6 +764,14 @@ impl Gateway {
         let lookup = job_id.to_owned();
         let existing = self.database(move |store| store.get_job(&lookup)).await?;
         let record = if let Some(record) = existing {
+            if matches!(
+                name,
+                "codex_adversarial_audit" | "codex_rescue_sandbox" | "claude_code_craft"
+            ) {
+                // These operations own their terminal transition. Admission or
+                // readback errors in this wrapper cannot settle an existing job.
+                return Ok(());
+            }
             record
         } else {
             let request = NewJob {
@@ -671,6 +841,32 @@ impl Gateway {
             schema,
         } = invocation;
         match name.as_str() {
+            "research_discover" => {
+                if engine != Engine::CodexCli
+                    || options.sandbox_mode != crate::routing::SandboxMode::ReadOnly
+                {
+                    return Err(
+                        "web discovery requires native Codex and read-only execution".into(),
+                    );
+                }
+                let schema = schema.as_ref().ok_or("discovery response schema missing")?;
+                let policy = crate::runtime::SearchPolicy {
+                    max_search_events: usize::try_from(
+                        args["max_search_events"]
+                            .as_u64()
+                            .ok_or("missing discovery event limit")?,
+                    )?,
+                    max_candidates: usize::try_from(
+                        args["max_candidates"]
+                            .as_u64()
+                            .ok_or("missing discovery candidate limit")?,
+                    )?,
+                };
+                crate::runtime::execute_codex_web_discovery(
+                    request, duration, &options, schema, policy,
+                )
+                .await
+            }
             "codex_git_review" => {
                 let target = crate::runtime::ReviewTarget {
                     uncommitted: args["uncommitted"].as_bool().unwrap_or(true),
@@ -707,15 +903,10 @@ impl Gateway {
                             .await
                     }
                 }
-                Engine::AntigravityRpc => {
-                    let mut request = request;
-                    if let Some(schema) = schema.as_ref() {
-                        request.prompt = structured_prompt(&request.prompt, schema)?;
-                    }
-                    crate::runtime::AntigravityClient::new()?
-                        .execute_with_options(request, duration, &options)
-                        .await
+                Engine::AntigravityCli => {
+                    crate::runtime::execute_antigravity_with_options(request,duration,&options,schema.as_ref()).await
                 }
+                Engine::AntigravityRpc => Err("Antigravity RPC execution is retired; use antigravity_cli; historical RPC records remain readable".into()),
                 Engine::Http => {
                     crate::http_runtime::execute(request, duration, &options, schema.as_ref()).await
                 }
@@ -724,7 +915,7 @@ impl Gateway {
     }
 
     pub async fn execute_tool(&self, name: &str, args: &Value) -> crate::Result<Value> {
-        self.execute_tool_with_default(name, args, None).await
+        Box::pin(self.execute_tool_with_default(name, args, None)).await
     }
 
     async fn configured_codex_default(
@@ -764,12 +955,12 @@ impl Gateway {
             .map(|value| serde_json::from_value(value.clone()))
             .transpose()?
             .unwrap_or(self.sandbox_mode);
-        let duration = Duration::from_secs_f64(
-            args["timeout_seconds"]
-                .as_f64()
-                .unwrap_or(3600.0)
-                .clamp(0.01, 86_400.0),
-        );
+        let seconds = args["timeout_seconds"].as_f64().unwrap_or(0.0);
+        let _policy = crate::execution_policy::ExecutionDeadline::from_seconds(seconds)?;
+        let duration = Duration::from_secs_f64(seconds);
+        if seconds > 0.0 && duration.is_zero() {
+            return Err("positive execution timeout is below clock resolution".into());
+        }
         let max_input_bytes = usize::try_from(args["max_input_bytes"].as_u64().unwrap_or(256_000))?;
         let root = workspace(args);
         let request_id = optional(args, "request_id");
@@ -795,12 +986,16 @@ impl Gateway {
             request.model.clone_from(&configured.model);
         }
         let engine = request.engine;
+        let sandbox_mode = effective_sandbox(engine, sandbox_mode);
         let provider = request.provider;
         let model = requested_model_override
             .clone()
             .unwrap_or_else(|| request.model.clone());
         let route_validation = crate::routing::validate_route(&request);
         let mut metadata = BTreeMap::new();
+        if let Ok(route) = &route_validation {
+            metadata.insert("resolved_model".to_owned(), route.resolved_model.clone());
+        }
         if let Some(configured) = &configured {
             metadata.insert("codex_default_model".to_owned(), configured.model.clone());
             if let Some(origin) = &configured.origin {
@@ -923,6 +1118,7 @@ impl Gateway {
             max_input_bytes,
             sandbox_mode,
             requested_model_override,
+            progress: Some(self.execution_observer(job_id.clone())),
         };
         let schema = boundary_schema(name);
         let runner = self.clone();
@@ -930,16 +1126,22 @@ impl Gateway {
         let provider_args = args.clone();
         let provider_schema = schema.clone();
         let provider = async move {
-            runner
-                .dispatch_provider(ProviderInvocation {
-                    name: provider_name,
-                    args: provider_args,
-                    request,
-                    engine,
-                    duration,
-                    options,
-                    schema: provider_schema,
-                })
+            Box::pin(runner.dispatch_provider(ProviderInvocation {
+                name: provider_name,
+                args: provider_args,
+                request,
+                engine,
+                duration,
+                options,
+                schema: provider_schema,
+            }))
+            .await
+        };
+        let heartbeat_gateway = self.clone();
+        let heartbeat_id = job_id.clone();
+        let provider = async move {
+            heartbeat_gateway
+                .observe_owner_while(&heartbeat_id, provider)
                 .await
         };
         let result = if crate::supervisor::current_job_id().is_some() {
@@ -983,7 +1185,16 @@ impl Gateway {
                 let schema_valid = value.get("schema_valid").and_then(Value::as_bool);
                 let mut final_budget = budget.clone();
                 final_budget.elapsed_seconds = execution.receipt.duration_ms as f64 / 1000.0;
-                final_budget.time_budget_exceeded = status == ReceiptStatus::TimedOutUnknown;
+                final_budget.time_budget_exceeded = !duration.is_zero()
+                    && execution
+                        .receipt
+                        .failure_reason
+                        .as_deref()
+                        .is_some_and(|reason| {
+                            reason.contains("timed out after dispatch")
+                                || reason.contains("job deadline")
+                                || reason.contains("execution deadline")
+                        });
                 final_budget.termination_reason = match status {
                     ReceiptStatus::Completed => "completed",
                     ReceiptStatus::TimedOutUnknown => "timed_out_unknown",
@@ -1012,15 +1223,15 @@ impl Gateway {
                 if let Some(source) = execution.receipt.identity_source.as_ref() {
                     metadata_updates.insert("identity_source".to_owned(), source.clone());
                 }
-                self.database(move |store| {
+                let persisted=self.database(move |store| {
                     match status {
                         ReceiptStatus::TimedOutUnknown => {
                             store.mark_timed_out_unknown(
                                 &saved_id,
-                                "outcome unknown after timeout".into(),
+                                "execution outcome unknown; inspect the original job and session observations".into(),
                                 Some(saved),
                                 receipt,
-                            )?;
+                            )
                         }
                         ReceiptStatus::Completed => {
                             store.complete_job_with_details(
@@ -1030,7 +1241,7 @@ impl Gateway {
                                 receipt,
                                 actual_model,
                                 metadata_updates,
-                            )?;
+                            )
                         }
                         ReceiptStatus::Cancelled => {
                             let reason = execution_failure_message(&saved);
@@ -1039,16 +1250,40 @@ impl Gateway {
                                 reason,
                                 Some(saved),
                                 receipt,
-                            )?;
+                            )
                         }
                         _ => {
                             let failure = execution_failure_message(&saved);
-                            store.fail_job_with_result(&saved_id, failure, Some(saved), receipt)?;
+                            store.fail_job_with_result(&saved_id, failure, Some(saved), receipt)
                         }
                     }
-                    Ok(())
-                })
-                .await?;
+                }).await;
+                let expected = match status {
+                    ReceiptStatus::Completed => JobStatus::Completed,
+                    ReceiptStatus::TimedOutUnknown => JobStatus::TimedOutUnknown,
+                    ReceiptStatus::Cancelled => JobStatus::Cancelled,
+                    _ => JobStatus::Failed,
+                };
+                match persisted {
+                    Ok(Some(record)) if record.status == expected && record.result.is_some() => {}
+                    Ok(Some(record)) => {
+                        let mut observed = deduplicated_response(&record)?;
+                        observed["ok"] = false.into();
+                        observed["durable_outcome_prevailed"] = true.into();
+                        return Ok(observed);
+                    }
+                    other => {
+                        response["ok"] = false.into();
+                        response["status"] = "timed_out_unknown".into();
+                        response["outcome_state"] = "outcome_unknown".into();
+                        response["result_persisted"] = false.into();
+                        response["observed_session_id"] = json!(execution.session_id);
+                        response["error"] = json!(match other {
+                            Err(error) => format!("Final observation was not persisted: {error}"),
+                            _ => "Original job record was not observed at final commit".into(),
+                        });
+                    }
+                }
                 Ok(response)
             }
             Err(error) => {
@@ -1123,6 +1358,17 @@ fn request_identity_digest(value: &Value) -> crate::Result<String> {
     Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
 }
 
+fn effective_sandbox(
+    engine: Engine,
+    requested: crate::routing::SandboxMode,
+) -> crate::routing::SandboxMode {
+    if engine == Engine::AntigravityCli {
+        crate::routing::SandboxMode::ReadOnly
+    } else {
+        requested
+    }
+}
+
 fn provider_request_identity(
     name: &str,
     args: &Value,
@@ -1181,7 +1427,7 @@ pub(crate) fn triad_request_identity(args: &Value) -> crate::Result<String> {
             "codex_reasoning_effort": optional(args, "codex_reasoning_effort")
                 .unwrap_or_else(|| "xhigh".to_owned()),
             "invoke_argon_rpc": args["invoke_argon_rpc"].as_bool().unwrap_or(true),
-            "timeout_seconds": args["timeout_seconds"].as_f64().unwrap_or(3600.0),
+            "timeout_seconds": args["timeout_seconds"].as_f64().unwrap_or(0.0),
             "max_input_bytes": args["max_input_bytes"].as_u64().unwrap_or(256_000),
             "max_rounds": args["max_rounds"].as_u64().unwrap_or(1).clamp(1, 3),
             "run_verification_gates": args["run_verification_gates"].as_bool().unwrap_or(false),
@@ -1246,3 +1492,6 @@ fn field<T: DeserializeOwned>(args: &Value, key: &str) -> crate::Result<T> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cli_observation_tests;

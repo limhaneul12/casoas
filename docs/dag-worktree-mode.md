@@ -12,8 +12,9 @@ original request ID; a continuation never retries it under another ID.
 `hcodex --worktree-name feature-auth` creates/reopens a persistent detached session
 worktree and opens the TUI. From that session, `/dag-mode` and executing DAG
 commands default to node worktree isolation without repeating `--worktree`.
-Named startup is terminal/DAG-only; it cannot be combined with MCP/server/setup
-management. Legacy startup without the flag keeps its existing defaults.
+Named startup is terminal/DAG-only; it cannot be combined with setup, sync,
+prune, recovery or initial resume management. Startup without the flag keeps its
+existing defaults.
 
 Names accept 1..64 ASCII letters/digits/hyphen/underscore. Names are scoped by
 canonical original repo and configured external state root. A closed, bounded
@@ -108,11 +109,12 @@ message queue is introduced.
 ### Runtime identity observations
 
 `status`, `board` and their TUI views distinguish source HEAD/dirty/scoped hashes,
-the installed file, the current process, and registered MCP startup observations.
-Missing historical startup fields stay unknown. An on-disk binary hash after
+the installed CLI file, the current process, and backend capabilities. Missing
+historical startup fields stay unknown. An on-disk binary hash after
 replacement is not a loaded-image identity, and matching package versions do not
 prove matching code. Source-to-binary linkage and CI remain unverified unless an
-actual bound receipt supplies that evidence. Display does not restart services.
+actual bound receipt supplies that evidence. Display does not start or restart a
+service. The retired `registered_mcp` observation is not a backend-health signal.
 
 Worktrees isolate source working copies, not network, credentials, provider
 sessions or shared Git object/ref storage. Cooperative ownership/path fences
@@ -130,7 +132,11 @@ This avoids cross-worktree artifact reuse; verification commands select their
 workspace from runtime cwd rather than a cached compile-time directory.
 Source/private inputs are bounded to 4,096 files / 64 MiB in this first release.
 
-## Executed verification — 2026-11-04
+## Historical verification — 2026-11-04
+
+The following evidence predates the pure-backend cutover. Counts that include an
+MCP fixture describe that historical release and do not claim a current MCP
+entry point. Current verification is recorded in [backend-cutover.md](backend-cutover.md).
 
 Final local `make ci` exited 0: rules/manifest integrity, formatting, workspace
 check, strict all-target/all-feature Clippy, and **278 tests passed**, zero

@@ -1035,18 +1035,22 @@ pub(super) fn models_summary(
     active_effort: &str,
     effect_summary: &str,
 ) -> Vec<String> {
-    let agy_ready = health["agy_bridge_ready"].as_bool().unwrap_or(false);
+    let agy = &health["auth_boundaries"]["antigravity_cli"];
+    let agy_status = if agy["readonly_admission_verified"].as_bool() == Some(true)
+        && agy["catalog_ready"].as_bool() == Some(true)
+    {
+        "policy verified"
+    } else if agy["ready"].as_bool() == Some(true) {
+        "binary available"
+    } else {
+        "unavailable"
+    };
     let codex_ready = health["codex_cli_routable"].as_bool().unwrap_or(false);
     vec![
         format!("Models & Routing Page [2:Models] · Active: {active_model}:{active_effort}"),
         format!("Effect Matrix: {effect_summary}"),
         format!(
-            "Bridge Readiness: AGY={} · Codex={}",
-            if agy_ready {
-                "● routable"
-            } else {
-                "○ offline"
-            },
+            "CLI Readiness: Antigravity={agy_status} · Codex={}",
             if codex_ready {
                 "● routable"
             } else {
@@ -1064,7 +1068,7 @@ pub(super) fn status_summary(health: &Value, jobs: &Value, inbox: &Value) -> Vec
     let handoff_count = inbox["handoffs"].as_array().map_or(0, Vec::len);
     let mut lines = vec![
         format!(
-            "Operational Status Page [6:Status] · Bridge: {status} · Jobs: {job_count} · Handoffs: {handoff_count}"
+            "Operational Status Page [6:Status] · Backend: {status} · Jobs: {job_count} · Handoffs: {handoff_count}"
         ),
         "────────────────────────────────────────────────────────────────────────────────────────"
             .to_owned(),
@@ -1145,25 +1149,6 @@ fn runtime_identity_summary(identity: &Value) -> Vec<String> {
     let dirty = source["dirty"]
         .as_bool()
         .map_or("unknown", |dirty| if dirty { "dirty" } else { "clean" });
-    let processes = identity["registered_mcp"].as_array();
-    let mismatched = processes.map_or(0, |rows| {
-        rows.iter()
-            .filter(|row| row["installed_comparison"] == "different_recorded_disk_hash")
-            .count()
-    });
-    let unknown = processes.map_or(0, |rows| {
-        rows.iter().filter(|row| row["state"] == "unknown").count()
-    });
-    let registered = if identity["registry_observation"] == "observed" {
-        format!(
-            "Registered MCP startup observations · disk mismatch={mismatched} · unknown={unknown} · registry=observed"
-        )
-    } else {
-        format!(
-            "Registered MCP startup observations · unavailable · registry={}",
-            text(&identity["registry_observation"])
-        )
-    };
     vec![
         format!(
             "Source identity · {} · {dirty} · HEAD={} · scope={}",
@@ -1180,7 +1165,6 @@ fn runtime_identity_summary(identity: &Value) -> Vec<String> {
             "Current process · package={} · loaded image unverified",
             text(&identity["current_process"]["package_version"])
         ),
-        registered,
         "Source-to-binary linkage unverified; CI evidence not supplied by this observation."
             .to_owned(),
     ]
@@ -1299,6 +1283,8 @@ pub(super) fn help_lines() -> Vec<String> {
         "/council [--file relative/path ... --] <proposal> · run the Review Council; quoted paths are CLI-only".to_owned(),
         "/votes <collaboration_id> · actual role ballots, receipts and scoped source freshness".to_owned(),
         "/recovery <job_id> · read-only job and worktree observations; no cleanup or retry".to_owned(),
+        "/research [--file path|--document path|--url HTTPS] [--plan-only] -- question · source-linked read-only research".to_owned(),
+        "/research-status <request_id> · observe the saved research report; no source fetch or provider call".to_owned(),
         "/compact · compact local view/prompt history without rewriting receipt usage".to_owned(),
         "/theme [name] · inspect or change the active rendered palette".to_owned(),
         "/diff · SHA-256 changes since session baseline, including non-Git/untracked files".to_owned(),
@@ -1332,18 +1318,14 @@ mod identity_tests {
             "source":{"state":"observed","dirty":true,"head":"abc123","scope":"git_listed_rust_sql_cargo_toolchain"},
             "installed_cli":{"state":"observed","sha256":"sha256:fixture"},
             "current_process":{"package_version":"0.3.0\u{1b}[31m"},
-            "registry_observation":"observed",
-            "registered_mcp":[
-                {"state":"observed","installed_comparison":"different_recorded_disk_hash"},
-                {"state":"unknown","installed_comparison":"unknown"}
-            ]
+            "capabilities":{"backend":"in_process","mcp_server":false}
         });
         let board = workboard_summary(&json!({"items":[],"runtime_identity":identity}));
         assert!(board.iter().any(|line| line.contains("dirty")));
         assert!(
             board
                 .iter()
-                .any(|line| line.contains("disk mismatch=1 · unknown=1"))
+                .any(|line| line.contains("Installed CLI disk · observed · sha256:fixture"))
         );
         assert!(
             board

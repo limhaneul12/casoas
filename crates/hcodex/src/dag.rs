@@ -13,6 +13,7 @@ mod worktree_execution;
 mod worktrees;
 
 pub use execution::{DagExecutionEvent, execute, execute_with_observer};
+pub(crate) use execution::{default_gate_command, gate_command_supported, validate_node_route};
 pub(crate) use patch::normalize_relative;
 pub use patch::{PatchArtifact, PatchEdit, apply_scoped_patch};
 pub use planner::DagPlanner;
@@ -27,4 +28,5 @@ pub use types::{
     SettlementReceipt, SettlementStage, WorkspaceManifest,
 };
 pub(crate) use worktrees::inspection::inspect as inspect_worktree_recovery;
+pub(crate) use worktrees::require_clean_original;
 pub use worktrees::{NamedWorktree, open_named_worktree};

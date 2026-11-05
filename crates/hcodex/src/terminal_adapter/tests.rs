@@ -6,6 +6,46 @@ use crate::routing::SandboxMode;
 use crate::tui::TuiTheme;
 use std::path::Path;
 
+#[tokio::test]
+async fn research_plan_and_missing_status_do_not_initialize_state_or_dispatch() -> crate::Result<()>
+{
+    let workspace = tempfile::tempdir()?;
+    let state = workspace.path().join("absent-research-state");
+    let handler = AppHandler::new(Gateway::new(state.clone()), workspace.path().to_path_buf())?;
+    let (updates, mut receiver) = mpsc::channel(16);
+    handler
+        .dispatch(
+            TuiAction::RunResearch("--plan-only -- compare source contracts".to_owned()),
+            updates.clone(),
+        )
+        .await?;
+    handler
+        .dispatch(
+            TuiAction::ShowResearchStatus("research-absent".to_owned()),
+            updates,
+        )
+        .await?;
+    let mut titles = Vec::new();
+    while let Some(update) = receiver.recv().await {
+        match update {
+            TuiUpdate::View { title, .. } => titles.push(title),
+            TuiUpdate::WorkspaceScoped {
+                workspace: crate::workspaces::WorkspaceKind::Research,
+                update: crate::tui::WorkspaceUpdate::View { title, .. },
+                ..
+            } => titles.push(title),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        titles,
+        ["Research plan · no execution", "Research observation"]
+    );
+    assert!(!state.exists());
+    assert_eq!(handler.gateway.active_background_jobs().await, 0);
+    Ok(())
+}
+
 #[test]
 fn council_file_scope_is_bound_into_the_review_request_without_dispatch() -> crate::Result<()> {
     let workspace = tempfile::tempdir()?;
@@ -1123,9 +1163,8 @@ fn usage_is_summed_only_from_real_receipt_fields() {
     assert_eq!(extract_context_usage(&retry_context), None);
 }
 
-#[test]
-fn settlement_view_requires_real_gate_evidence_for_verified_label() {
-    let receipt = SettlementReceipt {
+fn verified_settlement_receipt() -> SettlementReceipt {
+    SettlementReceipt {
         node_id: "n1".to_owned(),
         state: NodeState::Settled,
         settlement_stage: SettlementStage::Settled,
@@ -1151,7 +1190,12 @@ fn settlement_view_requires_real_gate_evidence_for_verified_label() {
             exit_code: Some(0),
             stdout_digest: Some("sha256:evidence".to_owned()),
         },
-    };
+    }
+}
+
+#[test]
+fn settlement_view_requires_real_gate_evidence_for_verified_label() {
+    let receipt = verified_settlement_receipt();
     let (state, note) = settlement_view(&receipt);
     assert_eq!(state, LaneState::Accepted);
     assert!(note.contains("SETTLED · verified"));
@@ -1473,5 +1517,65 @@ async fn heterogeneous_codex_role_defaults_and_file_scoped_titles_round_trip() -
         }
     }
     assert!(messages.contains("Loaded $codegraph-operator from"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn projection_lag_warns_without_receipt_and_settlement_restores_lane_truth()
+-> crate::Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let state_root = tempfile::tempdir()?;
+    let handler = AppHandler::new(
+        Gateway::new(state_root.path().to_path_buf()),
+        workspace.path().to_path_buf(),
+    )?;
+    handler.state.lock().await.last_dag_result = Some(json!({"node_receipts":[]}));
+    let (updates, mut receiver) = mpsc::channel(8);
+    let nodes = BTreeMap::new();
+    let mut started = BTreeMap::new();
+    handler
+        .apply_dag_event(
+            DagExecutionEvent::ProjectionLagged { dropped_events: 3 },
+            &nodes,
+            &mut started,
+            &updates,
+        )
+        .await?;
+    assert!(matches!(
+        receiver.try_recv()?,
+        TuiUpdate::Transcript(entry) if entry.message.contains("3 intermediate updates omitted")
+            && entry.message.contains("settled/final state")
+    ));
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(
+        handler
+            .state
+            .lock()
+            .await
+            .last_dag_result
+            .as_ref()
+            .map(|result| &result["node_receipts"]),
+        Some(&json!([]))
+    );
+
+    handler
+        .apply_dag_event(
+            DagExecutionEvent::NodeSettled {
+                receipt: verified_settlement_receipt(),
+            },
+            &nodes,
+            &mut started,
+            &updates,
+        )
+        .await?;
+    assert!(matches!(
+        receiver.try_recv()?,
+        TuiUpdate::LaneState { node_id, state: LaneState::Accepted, note, elapsed: None }
+            if node_id == "n1" && note.contains("SETTLED · verified")
+    ));
+    let state = handler.state.lock().await;
+    let result = state.last_dag_result.as_ref().ok_or("missing DAG result")?;
+    assert_eq!(result["node_receipts"].as_array().map(Vec::len), Some(1));
+    assert_eq!(result["node_receipts"][0]["node_id"], "n1");
     Ok(())
 }

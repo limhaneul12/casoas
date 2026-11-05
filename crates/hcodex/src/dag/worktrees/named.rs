@@ -45,7 +45,7 @@ pub async fn open_named_worktree(
     }
     let original = original.canonicalize()?;
     let timeout = Duration::from_secs(30);
-    clean(&original, timeout).await?;
+    require_clean_original(&original, timeout).await?;
     let top = PathBuf::from(
         git(&original, &["rev-parse", "--show-toplevel"], timeout)
             .await?

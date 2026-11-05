@@ -2,6 +2,7 @@
 plugin/
 .codex/
 .agents/
+.cargo/
 .omx/
 .hcodex/
 .codegraph/
@@ -18,18 +19,7 @@ dist/
 # Rust build artifacts
 /target/
 
-# Materialized Rust rules are required by clean-checkout mechanical verification.
-!.agents/
-.agents/*
-!.agents/README.md
-!.agents/rust_dev_harness/
-!.agents/shared/
-.cargo
-!.cargo/
-.cargo/*
-!.cargo/config.toml
-
-# The distributable Rust MCP plugin is source, not a generated installation.
+# The distributable hcodex skill bundle is source, not a generated installation.
 !plugin/
 plugin/*
 !plugin/heterarchy-codex/

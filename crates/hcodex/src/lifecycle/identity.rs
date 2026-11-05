@@ -1,4 +1,4 @@
-//! Read-only, scoped observations of source, installation and MCP process identity.
+//! Read-only, scoped observations of source, installation and current process identity.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, Metadata};
@@ -10,13 +10,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use super::{OwnedProcessHandle, config, processes};
+use super::config;
 
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_SOURCE_FILES: usize = 4096;
-const MAX_REGISTRY_BYTES: u64 = 64 * 1024;
-const MAX_REGISTERED: usize = 32;
 static OBSERVATIONS: Semaphore = Semaphore::const_new(2);
 
 #[derive(Clone)]
@@ -71,22 +69,7 @@ pub(crate) async fn observe(workspace: &Path, home: Option<&Path>) -> Value {
     let home = home.map(Path::to_path_buf);
     let disk =
         tokio::task::spawn_blocking(move || disk_observations(&repository, home.as_deref())).await;
-    let (installed, current, handles, registry_state) = match disk {
-        Ok(value) => value,
-        Err(_) => (None, None, Vec::new(), "unknown"),
-    };
-    let mut registered = Vec::new();
-    let process_deadline = Instant::now() + Duration::from_secs(5);
-    for handle in handles {
-        if Instant::now() >= process_deadline {
-            let mut view = project_process(&handle, false, installed.as_ref());
-            view["reason"] = json!("process_probe_budget_exceeded");
-            registered.push(view);
-        } else {
-            registered
-                .push(process_observation(&handle, installed.as_ref(), process_deadline).await);
-        }
-    }
+    let (installed, current) = disk.unwrap_or((None, None));
     json!({
         "observation_only":true,
         "source":source,
@@ -97,8 +80,7 @@ pub(crate) async fn observe(workspace: &Path, home: Option<&Path>) -> Value {
             "executable_on_disk":binary_value(current.as_ref()),
             "loaded_image_identity":"unverified",
         },
-        "registered_mcp":registered,
-        "registry_observation":registry_state,
+        "capabilities":{"backend":"in_process","mcp_server":false,"realtime_projection":"bounded_soft_realtime"},
         "verification":{"source_to_binary":"unverified","ci":"not_supplied"},
     })
 }
@@ -116,21 +98,12 @@ fn binary_value(snapshot: Option<&BinarySnapshot>) -> Value {
 fn disk_observations(
     repository: &Path,
     home: Option<&Path>,
-) -> (
-    Option<BinarySnapshot>,
-    Option<BinarySnapshot>,
-    Vec<OwnedProcessHandle>,
-    &'static str,
-) {
-    let selected = match home.map(config::inspect) {
-        Some(Ok(config)) => match config.command {
-            Some(command) => resolve_command(&command),
-            None => config::resolve_hcodex_binary(repository).ok(),
-        },
-        Some(Err(_)) => None,
-        None => config::resolve_hcodex_binary(repository).ok(),
-    };
-    let installed = selected.as_deref().and_then(binary_snapshot);
+) -> (Option<BinarySnapshot>, Option<BinarySnapshot>) {
+    let installed_path = home
+        .map(|home| home.join(".cargo/bin/hcodex"))
+        .filter(|path| path.is_file())
+        .or_else(|| config::resolve_hcodex_binary(repository).ok());
+    let installed = installed_path.as_deref().and_then(binary_snapshot);
     let current_path = std::env::current_exe()
         .ok()
         .and_then(|path| path.canonicalize().ok());
@@ -139,140 +112,7 @@ fn disk_observations(
         (_, Some(path)) => binary_snapshot(path),
         _ => None,
     };
-    let (handles, state) = match home.map(read_handles) {
-        Some(Ok(handles)) => (handles, "observed"),
-        Some(Err(())) => (Vec::new(), "unknown"),
-        None => (Vec::new(), "unavailable"),
-    };
-    (installed, current, handles, state)
-}
-
-fn resolve_command(command: &str) -> Option<PathBuf> {
-    if command.is_empty() || command.chars().any(char::is_control) {
-        return None;
-    }
-    let path = Path::new(command);
-    if path.is_absolute() {
-        return path.canonicalize().ok();
-    }
-    if path.components().count() != 1 {
-        return None;
-    }
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|path| path.join(command))
-            .find_map(|candidate| candidate.canonicalize().ok())
-    })
-}
-
-fn read_handles(home: &Path) -> Result<Vec<OwnedProcessHandle>, ()> {
-    let path = processes::registry_path(home);
-    let before = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(_) => return Err(()),
-    };
-    if !before.is_file() || before.file_type().is_symlink() || before.len() > MAX_REGISTRY_BYTES {
-        return Err(());
-    }
-    let file = File::open(&path).map_err(|_| ())?;
-    if !same_file(&before, &file.metadata().map_err(|_| ())?) {
-        return Err(());
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_REGISTRY_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ())?;
-    if bytes.len() > MAX_REGISTRY_BYTES as usize
-        || !same_file(&before, &fs::symlink_metadata(path).map_err(|_| ())?)
-    {
-        return Err(());
-    }
-    let handles: Vec<OwnedProcessHandle> = serde_json::from_slice(&bytes).map_err(|_| ())?;
-    if handles.len() > MAX_REGISTERED {
-        return Err(());
-    }
-    Ok(handles)
-}
-
-async fn process_observation(
-    handle: &OwnedProcessHandle,
-    installed: Option<&BinarySnapshot>,
-    deadline: Instant,
-) -> Value {
-    let pid = handle.pid;
-    let live_start = processes::observe_start_identity(pid).await.ok().flatten();
-    if handle.start_identity.is_empty()
-        || live_start.as_deref() != Some(handle.start_identity.as_str())
-    {
-        return project_process(handle, false, installed);
-    }
-    if Instant::now() >= deadline {
-        return project_process(handle, false, installed);
-    }
-    let command = processes::observe_command(pid).await.ok().flatten();
-    if Instant::now() >= deadline {
-        return project_process(handle, false, installed);
-    }
-    let after = processes::observe_start_identity(pid).await.ok().flatten();
-    let live = !handle.start_identity.is_empty()
-        && live_start.as_deref() == Some(handle.start_identity.as_str())
-        && after == live_start
-        && handle.arguments == ["mcp"]
-        && command
-            .as_deref()
-            .is_some_and(|command| processes::command_matches(&handle.executable, command));
-    project_process(handle, live, installed)
-}
-
-fn project_process(
-    handle: &OwnedProcessHandle,
-    live: bool,
-    installed: Option<&BinarySnapshot>,
-) -> Value {
-    let recorded = handle
-        .startup_binary_sha256
-        .as_deref()
-        .filter(|value| valid_digest(value));
-    let comparison = match (live, recorded, installed) {
-        (true, Some(recorded), Some(installed)) if recorded == installed.sha256 => {
-            "same_recorded_disk_hash"
-        }
-        (true, Some(_), Some(_)) => "different_recorded_disk_hash",
-        _ => "unknown",
-    };
-    json!({
-        "pid":handle.pid,
-        "state":if live && recorded.is_some() {"observed"} else {"unknown"},
-        "process_observation":if live {"pid_start_and_command_match"} else {"unknown"},
-        "reason":if !live {"process_identity_unproven"} else if recorded.is_none() {"historical_identity_unavailable"} else {"startup_disk_observation_available"},
-        "recorded_binary_sha256":recorded,
-        "registrant_package_version":handle.registrant_package_version.as_deref().filter(|value| valid_version(value)),
-        "installed_comparison":comparison,
-        "scope":"recorded_startup_disk_observation_not_loaded_image",
-    })
-}
-
-fn valid_digest(value: &str) -> bool {
-    value.len() == 71
-        && value.starts_with("sha256:")
-        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn valid_version(value: &str) -> bool {
-    if value.len() > 64
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b".-+".contains(&byte))
-    {
-        return false;
-    }
-    let core = value.split(['-', '+']).next().unwrap_or_default();
-    let parts: Vec<_> = core.split('.').collect();
-    parts.len() == 3
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    (installed, current)
 }
 
 async fn source_observation(workspace: &Path) -> Value {

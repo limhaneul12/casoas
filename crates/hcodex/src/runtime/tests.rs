@@ -116,174 +116,6 @@ fn codex_session_identity_requires_session_cwd_settings_and_output_digest() -> c
     );
     Ok(())
 }
-#[test]
-fn antigravity_catalog_rejects_wrong_tier_and_no_quota() -> crate::Result<()> {
-    let catalog = parse_antigravity_catalog(&json!({"clientModelConfigs": [
-        {"label":"Opus","modelId":"claude-opus-5-5-high","modelOrAlias":{"model":"M1"},"quotaInfo":{"remainingFraction":1.0}},
-        {"label":"Argon","modelId":"gemini-4-argon-high","modelOrAlias":{"model":"M2"},"quotaInfo":{"remainingFraction":0.0}},
-        {"label":"Sonnet","modelId":"claude-sonnet-5-5-medium","modelOrAlias":{"model":"M3"},"quotaInfo":{"remainingFraction":0.5}}]}))?;
-    assert!(!catalog[0].routable);
-    assert!(!catalog[1].routable);
-    assert!(catalog[2].routable);
-    Ok(())
-}
-#[test]
-fn parses_endpoint_and_port() -> crate::Result<()> {
-    assert_eq!(
-        endpoint_candidates(" 123 /app/language_server --csrf_token secret", None)?,
-        [(123, "secret".to_owned())]
-    );
-    assert_eq!(listen_ports("TCP 127.0.0.1:61069 (LISTEN)")?, [61069]);
-    Ok(())
-}
-
-#[test]
-fn antigravity_circuit_opens_after_three_failures_and_success_resets() -> crate::Result<()> {
-    antigravity_success(None)?;
-    antigravity_failure()?;
-    antigravity_failure()?;
-    antigravity_failure()?;
-    {
-        let state = antigravity_state()
-            .lock()
-            .map_err(|_| "Antigravity state lock poisoned")?;
-        assert_eq!(state.consecutive_failures, 3);
-        assert!(state.open_until.is_some_and(|until| until > Instant::now()));
-    }
-    antigravity_success(None)?;
-    let state = antigravity_state()
-        .lock()
-        .map_err(|_| "Antigravity state lock poisoned")?;
-    assert_eq!(state.consecutive_failures, 0);
-    assert!(state.open_until.is_none());
-    Ok(())
-}
-
-#[test]
-fn antigravity_discovery_errors_have_typed_codes() {
-    assert_eq!(
-        antigravity_discovery_error_code("Antigravity circuit breaker is open"),
-        RouteErrorCode::AntigravityCircuitOpen
-    );
-    assert_eq!(
-        antigravity_discovery_error_code("language_server unavailable"),
-        RouteErrorCode::DependencyUnavailable
-    );
-}
-
-#[tokio::test]
-async fn antigravity_zero_quota_returns_confirmed_failure_receipt() -> crate::Result<()> {
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await?;
-        let mut request = vec![0_u8; 16_384];
-        let _size = stream.read(&mut request).await?;
-        let body = r#"{"clientModelConfigs":[{"label":"Sonnet","modelId":"claude-sonnet-5-5-medium","modelOrAlias":{"model":"M3"},"quotaInfo":{"remainingFraction":0.0}}]}"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(response.as_bytes()).await?;
-        Ok::<_, crate::Error>(())
-    });
-    let endpoint = AntigravityEndpoint {
-        base_url: format!("http://{address}"),
-        csrf_token: "secret".to_owned(),
-        pid: 1,
-    };
-    let request = RouteRequest {
-        provider: crate::routing::Provider::Antigravity,
-        engine: Engine::AntigravityRpc,
-        model: "claude-sonnet-5-5-medium".to_owned(),
-        effort: "medium".to_owned(),
-        prompt: "review".to_owned(),
-    };
-    let result = AntigravityClient::new()?
-        .execute_at_with_options(
-            request,
-            Duration::from_secs(2),
-            &endpoint,
-            &ExecutionOptions::default(),
-        )
-        .await?;
-    server.await??;
-    assert_eq!(result.receipt.status, ReceiptStatus::Failed);
-    assert_eq!(result.receipt.outcome_state, "confirmed_failure");
-    assert_eq!(
-        result.receipt.error_code,
-        Some(RouteErrorCode::AntigravityQuotaExhausted)
-    );
-    assert_eq!(result.receipt.failure_reason, result.receipt.error);
-    Ok(())
-}
-
-#[tokio::test]
-async fn antigravity_success_exposes_only_selected_catalog_placeholder() -> crate::Result<()> {
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    let server = tokio::spawn(async move {
-        for index in 0..2 {
-            let (mut stream, _) = listener.accept().await?;
-            let mut request = vec![0_u8; 16_384];
-            let _size = stream.read(&mut request).await?;
-            let body = if index == 0 {
-                r#"{"clientModelConfigs":[{"label":"Sonnet","modelId":"claude-sonnet-5-5-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M404"},"quotaInfo":{"remainingFraction":0.8}}]}"#
-            } else {
-                r#"{"modelId":"claude-sonnet-5-5-medium","response":"{\"verdict\":\"PASS\"}"}"#
-            };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await?;
-        }
-        Ok::<_, crate::Error>(())
-    });
-    let endpoint = AntigravityEndpoint {
-        base_url: format!("http://{address}"),
-        csrf_token: "secret".to_owned(),
-        pid: 1,
-    };
-    let request = RouteRequest {
-        provider: crate::routing::Provider::Antigravity,
-        engine: Engine::AntigravityRpc,
-        model: "claude-sonnet-5-5-medium".to_owned(),
-        effort: "medium".to_owned(),
-        prompt: "review".to_owned(),
-    };
-    let result = AntigravityClient::new()?
-        .execute_at_with_options(
-            request,
-            Duration::from_secs(2),
-            &endpoint,
-            &ExecutionOptions::default(),
-        )
-        .await?;
-    server.await??;
-    assert_eq!(result.receipt.status, ReceiptStatus::Completed);
-    assert_eq!(result.receipt.owned_processes_closed, None);
-    assert_eq!(
-        result.placeholder.as_deref(),
-        Some("MODEL_PLACEHOLDER_M404")
-    );
-    assert_eq!(
-        result
-            .receipt
-            .routing_decision
-            .as_ref()
-            .and_then(|decision| decision.placeholder.as_deref()),
-        Some("MODEL_PLACEHOLDER_M404")
-    );
-    Ok(())
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn native_review_targets_capture_real_argv_and_receipt_identity() -> crate::Result<()> {
@@ -347,14 +179,9 @@ async fn native_review_targets_capture_real_argv_and_receipt_identity() -> crate
     ] {
         let request = codex_request(workspace.path());
         let prompt = request.prompt.clone();
-        let result = codex_git_review_with_binary(
-            request,
-            target,
-            Duration::from_secs(2),
-            &options,
-            &binary,
-        )
-        .await?;
+        let result =
+            codex_git_review_with_binary(request, target, Duration::ZERO, &options, &binary)
+                .await?;
         assert_eq!(result.receipt.status, ReceiptStatus::Completed);
         assert_eq!(result.receipt.actual_model.as_deref(), Some("gpt-6.1-sol"));
         assert_eq!(result.session_id.as_deref(), Some("thr_review"));
@@ -425,7 +252,7 @@ async fn native_review_targets_capture_real_argv_and_receipt_identity() -> crate
             commit_sha: Some("--help".to_owned()),
             ..ReviewTarget::default()
         },
-        Duration::from_secs(2),
+        Duration::ZERO,
         &options,
         &binary,
     )
@@ -440,7 +267,7 @@ async fn native_review_targets_capture_real_argv_and_receipt_identity() -> crate
             uncommitted: true,
             ..ReviewTarget::default()
         },
-        Duration::from_secs(2),
+        Duration::ZERO,
         &options,
         &binary,
     )
@@ -469,7 +296,7 @@ async fn native_review_targets_capture_real_argv_and_receipt_identity() -> crate
             uncommitted: true,
             ..ReviewTarget::default()
         },
-        Duration::from_secs(2),
+        Duration::ZERO,
         &options,
         &binary,
     )
@@ -508,7 +335,7 @@ async fn real_subprocess_jsonl_proves_identity_and_tokens() -> crate::Result<()>
     };
     let result = execute_codex_with_binary_and_options(
         codex_request(workspace.path()),
-        Duration::from_secs(2),
+        Duration::ZERO,
         &binary,
         &options,
     )
@@ -526,8 +353,7 @@ async fn real_subprocess_jsonl_proves_identity_and_tokens() -> crate::Result<()>
 
 #[cfg(unix)]
 #[tokio::test]
-async fn completed_cli_reports_live_background_group_instead_of_cleanup_permission()
--> crate::Result<()> {
+async fn leader_exit_with_active_background_is_unknown_after_owned_cleanup() -> crate::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {
@@ -560,13 +386,13 @@ async fn completed_cli_reports_live_background_group_instead_of_cleanup_permissi
     };
     let result = execute_codex_with_binary_and_options(
         codex_request(workspace.path()),
-        Duration::from_secs(5),
+        Duration::ZERO,
         &binary,
         &options,
     )
     .await?;
-    assert_eq!(result.receipt.status, ReceiptStatus::Completed);
-    assert_eq!(result.receipt.owned_processes_closed, Some(false));
+    assert_eq!(result.receipt.status, ReceiptStatus::TimedOutUnknown);
+    assert_eq!(result.receipt.owned_processes_closed, Some(true));
     Ok(())
 }
 
@@ -618,25 +444,19 @@ async fn subprocess_auth_noise_is_redacted_and_isolated() -> crate::Result<()> {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn timeout_kills_and_reaps_owned_process_group() -> crate::Result<()> {
+async fn timeout_kills_and_reaps_owned_process_group_with_blocked_stdin() -> crate::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let workspace = tempfile::tempdir()?;
     let binary = workspace.path().join("slow-codex");
     let pid_file = workspace.path().join("pid");
-    let readiness_fifo = workspace.path().join("ready.fifo");
-    let fifo_status = std::process::Command::new("mkfifo")
-        .arg(&readiness_fifo)
-        .status()?;
-    if !fifo_status.success() {
-        return Err("mkfifo failed for readiness handshake".into());
-    }
+    let readiness_marker = workspace.path().join("ready.marker");
     std::fs::write(
         &binary,
         format!(
             "#!/bin/sh\necho $$ > '{}'\nprintf R > '{}'\nsleep 30\n",
             pid_file.display(),
-            readiness_fifo.display()
+            readiness_marker.display()
         ),
     )?;
     let mut permissions = std::fs::metadata(&binary)?.permissions();
@@ -646,13 +466,15 @@ async fn timeout_kills_and_reaps_owned_process_group() -> crate::Result<()> {
         workspace_dir: Some(workspace.path().to_path_buf()),
         ..ExecutionOptions::default()
     };
+    let mut request = codex_request(workspace.path());
+    request.prompt = "x".repeat(options.max_input_bytes);
     let result = execute_codex_with_binary_and_schema(
-        codex_request(workspace.path()),
+        request,
         Duration::from_millis(100),
         &binary,
         &options,
         None,
-        Some(&readiness_fifo),
+        Some(&readiness_marker),
     )
     .await?;
     assert_eq!(result.receipt.status, ReceiptStatus::TimedOutUnknown);
@@ -676,48 +498,5 @@ async fn timeout_kills_and_reaps_owned_process_group() -> crate::Result<()> {
         );
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
-    Ok(())
-}
-
-#[tokio::test]
-async fn refresh_readback_is_injectable_and_redacts_csrf() -> crate::Result<()> {
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    let server = tokio::spawn(async move {
-        for _request_index in 0..2 {
-            let (mut stream, _) = listener.accept().await?;
-            let mut request = vec![0_u8; 16_384];
-            let size = stream.read(&mut request).await?;
-            let request = String::from_utf8(request[..size].to_vec())?;
-            let body = if request.contains("RefreshMcpServers") {
-                r#"{"refreshed":true,"echo":"secret-csrf"}"#
-            } else {
-                r#"{"clientModelConfigs":[]}"#
-            };
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).await?;
-        }
-        Ok::<_, crate::Error>(())
-    });
-    let endpoint = AntigravityEndpoint {
-        base_url: format!("http://{address}"),
-        csrf_token: "secret-csrf".to_owned(),
-        pid: 42,
-    };
-    let result = AntigravityClient::new()?
-        .refresh_at(&endpoint, Duration::from_secs(2))
-        .await?;
-    server.await??;
-    let serialized = result.to_string();
-    assert_eq!(result["ok"], true);
-    assert_eq!(result["pid"], 42);
-    assert!(!serialized.contains("secret-csrf"));
-    assert!(serialized.contains("[REDACTED]"));
     Ok(())
 }

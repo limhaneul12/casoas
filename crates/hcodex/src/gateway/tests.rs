@@ -1,6 +1,6 @@
 use super::grounding::{
     boundary_schema, build_route_request, fallback_source_files, grounded_prompt,
-    normalize_boundary, structured_prompt,
+    normalize_boundary,
 };
 use super::*;
 use crate::context::SkillRegistry;
@@ -154,7 +154,8 @@ fn source_attachments_are_grounded_and_canonicalized_for_evidence() -> crate::Re
 fn historical_engine_aliases_and_http_default_remain_distinct() -> crate::Result<()> {
     for (alias, expected) in [
         ("codex-cli", Engine::CodexCli),
-        ("agy", Engine::AntigravityRpc),
+        ("agy", Engine::AntigravityCli),
+        ("antigravity", Engine::AntigravityCli),
         ("rpc", Engine::AntigravityRpc),
         ("antigravity-rpc", Engine::AntigravityRpc),
         ("openai-http", Engine::Http),
@@ -760,12 +761,13 @@ fn triad_argon_internal_tool_uses_frozen_review_schema() -> crate::Result<()> {
     Ok(())
 }
 #[test]
-fn antigravity_prompt_contains_exact_closed_output_contract() -> crate::Result<()> {
+fn antigravity_craft_uses_cli_and_keeps_closed_output_contract() -> crate::Result<()> {
     let schema = boundary_schema("claude_code_craft").ok_or("schema missing")?;
-    let prompt = structured_prompt("Inspect actual source", &schema)?;
-    assert!(prompt.contains("SERVER-OWNED RESPONSE CONTRACT"));
-    assert!(prompt.contains(&serde_json::to_string(&schema)?));
-    assert!(prompt.contains("Runtime owns receipt/evidence generation"));
+    assert_eq!(schema["additionalProperties"], false);
+    let route = build_route_request("claude_code_craft", &json!({}), String::new())?;
+    assert_eq!(route.engine, Engine::AntigravityCli);
+    let rpc = build_route_request("claude_code_craft", &json!({"engine":"rpc"}), String::new())?;
+    assert!(crate::routing::validate_route(&rpc).is_err());
     let mut minimal = json!({"verdict":"PASS","summary":"Reviewed"});
     normalize_boundary("claude_code_craft", &mut minimal)?;
     assert_eq!(minimal["crafted_code"], "");

@@ -1,6 +1,6 @@
 [package]
 name = "hcodex"
-description = "Rust-native tri-polar MCP collaboration, CLI, and DAG terminal workbench"
+description = "Rust-native tri-polar collaboration backend, CLI, and DAG terminal workbench"
 version.workspace = true
 edition.workspace = true
 

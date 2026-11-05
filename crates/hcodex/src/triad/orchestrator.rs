@@ -717,7 +717,7 @@ fn argon_args(args: &Value, sonnet: &Value, codex: &Value) -> Value {
         "workspace_dir": text(args,"workspace_dir"),
         "model": text(args,"argon_model"),
         "reasoning_effort": "high",
-        "engine": "antigravity_local_rpc",
+        "engine": "antigravity_cli",
         "timeout_seconds": args["timeout_seconds"],
         "files_inspected": args["files_inspected"],
         "symbols_inspected": args["symbols_inspected"],
@@ -922,8 +922,8 @@ fn timeout_duration(args: &Value) -> Duration {
     Duration::from_secs_f64(
         args["timeout_seconds"]
             .as_f64()
-            .unwrap_or(3600.0)
-            .clamp(0.01, 86_400.0),
+            .unwrap_or(0.0)
+            .clamp(0.0, 86_400.0),
     )
 }
 

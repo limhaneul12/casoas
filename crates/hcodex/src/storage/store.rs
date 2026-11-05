@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
@@ -15,6 +15,7 @@ use super::domain::{
 };
 use super::sql::{SqlCatalog, validate_text};
 
+mod progress;
 mod recovery;
 pub use recovery::RecoveryRecord;
 
@@ -22,12 +23,13 @@ const DEFAULT_MAX_RETAINED: usize = 1_000;
 const STALE_RUNNING_SECONDS: f64 = 3_600.0;
 const REQUEST_MODEL_IDENTITY: &str = "request_model_identity";
 
+#[derive(Clone)]
 pub struct Store {
-    jobs: Mutex<Connection>,
-    handoffs: Mutex<Connection>,
-    job_sql: SqlCatalog,
-    handoff_sql: SqlCatalog,
-    recovery_sql: SqlCatalog,
+    jobs: Arc<Mutex<Connection>>,
+    handoffs: Arc<Mutex<Connection>>,
+    job_sql: Arc<SqlCatalog>,
+    handoff_sql: Arc<SqlCatalog>,
+    recovery_sql: Arc<SqlCatalog>,
     max_retained_jobs: usize,
     max_retained_handoffs: usize,
 }
@@ -53,11 +55,11 @@ impl Store {
         }
 
         let store = Self {
-            jobs: Mutex::new(jobs),
-            handoffs: Mutex::new(handoffs),
-            job_sql,
-            handoff_sql,
-            recovery_sql,
+            jobs: Arc::new(Mutex::new(jobs)),
+            handoffs: Arc::new(Mutex::new(handoffs)),
+            job_sql: Arc::new(job_sql),
+            handoff_sql: Arc::new(handoff_sql),
+            recovery_sql: Arc::new(recovery_sql),
             max_retained_jobs: DEFAULT_MAX_RETAINED,
             max_retained_handoffs: DEFAULT_MAX_RETAINED,
         };
@@ -86,7 +88,7 @@ impl Store {
         if let Some(mut record) = existing {
             let request_identity_verified = validate_request_identity(&record, &request)?;
             if record.status == JobStatus::Running {
-                if !running_record_is_stale(&record, now_seconds()) {
+                if !running_record_is_stale(&record, now_seconds(), execution_owner()) {
                     transaction.commit()?;
                     return Ok(JobRegistration {
                         record,
@@ -106,6 +108,7 @@ impl Store {
                     JobStatus::RejectedPreDispatch | JobStatus::InputBudgetExceeded
                 )
                 && !record.cancel_requested
+                && record.session_id.is_none()
                 && request_identity_verified;
             if !retryable {
                 transaction.commit()?;
@@ -121,10 +124,13 @@ impl Store {
             record.completed_at = None;
             record.cancel_requested = false;
             record.cancelled_at = None;
-            record.metadata.extend(request.metadata);
-            record
-                .metadata
-                .insert("owner_pid".to_owned(), std::process::id().to_string());
+            record.metadata.extend(
+                request
+                    .metadata
+                    .into_iter()
+                    .filter(|(key, _)| !execution_metadata(key)),
+            );
+            bind_execution_owner(&mut record.metadata);
             self.update_job_on(&transaction, &record)?;
             transaction.commit()?;
             return Ok(JobRegistration {
@@ -328,14 +334,19 @@ impl Store {
         model: Option<String>,
         metadata_updates: BTreeMap<String, String>,
     ) -> crate::Result<Option<JobRecord>> {
-        self.transition_job(job_id, |record| {
+        self.with_job_for_update(job_id, |record, connection| {
             if record.cancel_requested
                 || !matches!(
                     record.status,
                     JobStatus::Running | JobStatus::TimedOutUnknown
                 )
             {
-                return;
+                return Ok(());
+            }
+            if let (Some(bound), Some(final_id)) = (&record.session_id, &session_id)
+                && bound != final_id
+            {
+                return Err("completion changed the committed execution session ID".into());
             }
             record.status = JobStatus::Completed;
             record.outcome_state = OutcomeState::ConfirmedSuccess;
@@ -350,7 +361,12 @@ impl Store {
             if model.is_some() {
                 record.model = model;
             }
-            record.metadata.extend(metadata_updates);
+            record.metadata.extend(
+                metadata_updates
+                    .into_iter()
+                    .filter(|(key, _)| !execution_metadata(key)),
+            );
+            self.update_job_on(connection, record)
         })
     }
 
@@ -499,27 +515,40 @@ impl Store {
     }
 
     pub fn reconcile_stale_running_jobs(&self, stale_age_seconds: f64) -> crate::Result<usize> {
-        let now = now_seconds();
+        let owner = execution_owner();
         let candidates = self.jobs_by_status(JobStatus::Running)?;
+        let observed_at = now_seconds();
         let mut count = 0;
         for record in candidates {
-            if now - record.created_at < stale_age_seconds || !running_record_is_stale(&record, now)
+            if observed_at - record.created_at < stale_age_seconds
+                || !running_record_is_stale(&record, observed_at, owner)
             {
                 continue;
             }
-            if self
-                .mark_timed_out_unknown(
-                    &record.job_id,
-                    record.error.unwrap_or_else(|| {
-                        "Orphaned running job reconciled as timed_out_unknown.".to_owned()
-                    }),
-                    None,
-                    record.receipt,
-                )?
-                .is_some()
-            {
-                count += 1;
-            }
+            let mut reconciled = false;
+            self.with_job_for_update(&record.job_id, |current, connection| {
+                // A different writer can renew ownership after candidate
+                // selection. Re-check liveness under the same write transaction
+                // that would mark this execution unknown.
+                let now = now_seconds();
+                if current.status != JobStatus::Running
+                    || current.cancel_requested
+                    || now - current.created_at < stale_age_seconds
+                    || !running_record_is_stale(current, now, owner)
+                {
+                    return Ok(());
+                }
+                current.status = JobStatus::TimedOutUnknown;
+                current.outcome_state = OutcomeState::OutcomeUnknown;
+                current.completed_at = Some(now);
+                current.error.get_or_insert_with(|| {
+                    "Orphaned running job reconciled as timed_out_unknown.".to_owned()
+                });
+                self.update_job_on(connection, current)?;
+                reconciled = true;
+                Ok(())
+            })?;
+            count += usize::from(reconciled);
         }
         Ok(count)
     }
@@ -873,6 +902,17 @@ impl Store {
         job_id: &str,
         change: impl FnOnce(&mut JobRecord),
     ) -> crate::Result<Option<JobRecord>> {
+        self.with_job_for_update(job_id, |record, connection| {
+            change(record);
+            self.update_job_on(connection, record)
+        })
+    }
+
+    fn with_job_for_update(
+        &self,
+        job_id: &str,
+        update: impl FnOnce(&mut JobRecord, &Connection) -> crate::Result<()>,
+    ) -> crate::Result<Option<JobRecord>> {
         validate_text(job_id, "job ID")?;
         let mut connection = lock(&self.jobs)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -880,8 +920,7 @@ impl Store {
             transaction.commit()?;
             return Ok(None);
         };
-        change(&mut record);
-        self.update_job_on(&transaction, &record)?;
+        update(&mut record, &transaction)?;
         transaction.commit()?;
         Ok(Some(record))
     }
@@ -921,6 +960,11 @@ impl Store {
     }
 
     fn update_job_on(&self, connection: &Connection, record: &JobRecord) -> crate::Result<()> {
+        self.write_job_on(connection, record)?;
+        self.prune_jobs_on(connection)
+    }
+
+    fn write_job_on(&self, connection: &Connection, record: &JobRecord) -> crate::Result<()> {
         validate_job(record)?;
         let serialized = serde_json::to_string(record)?;
         let query = self.job_sql.query("update_job", 9)?;
@@ -945,7 +989,7 @@ impl Store {
             ))
             .into());
         }
-        self.prune_jobs_on(connection)
+        Ok(())
     }
 
     fn prune_jobs_on(&self, connection: &Connection) -> crate::Result<()> {
@@ -1061,7 +1105,7 @@ fn initialize_jobs(connection: &mut Connection, catalog: &SqlCatalog) -> crate::
 fn build_job_record(request: NewJob) -> crate::Result<JobRecord> {
     validate_new_job(&request)?;
     let mut metadata = request.metadata;
-    metadata.insert("owner_pid".to_owned(), std::process::id().to_string());
+    bind_execution_owner(&mut metadata);
     if let Some(model) = normalize_optional(request.model.clone()) {
         metadata.insert(REQUEST_MODEL_IDENTITY.to_owned(), model);
     }
@@ -1188,9 +1232,13 @@ fn validate_checkpoint_identity(record: &JobRecord, request: &NewJob) -> crate::
     let stored = record
         .metadata
         .iter()
-        .filter(|(key, _)| !matches!(key.as_str(), "owner_pid" | REQUEST_MODEL_IDENTITY))
+        .filter(|(key, _)| !execution_metadata(key) && key.as_str() != REQUEST_MODEL_IDENTITY)
         .collect::<BTreeMap<_, _>>();
-    let requested = request.metadata.iter().collect::<BTreeMap<_, _>>();
+    let requested = request
+        .metadata
+        .iter()
+        .filter(|(key, _)| !execution_metadata(key))
+        .collect::<BTreeMap<_, _>>();
     if stored != requested {
         return Err("DAG checkpoint metadata conflicts with existing record".into());
     }
@@ -1287,12 +1335,60 @@ fn workspace_matches(record_workspace: &str, expected: &str) -> bool {
         && normalize_workspace(record_path) == expected
 }
 
-fn running_record_is_stale(record: &JobRecord, now: f64) -> bool {
-    let current_pid = std::process::id().to_string();
-    match record.metadata.get("owner_pid") {
-        Some(pid) if pid == &current_pid => false,
-        _ => now - record.created_at >= STALE_RUNNING_SECONDS,
+const OWNER_INSTANCE_ID: &str = "owner_instance_id";
+const OWNER_HEARTBEAT_AT: &str = "owner_heartbeat_at";
+
+fn execution_metadata(key: &str) -> bool {
+    matches!(
+        key,
+        "owner_pid" | OWNER_INSTANCE_ID | OWNER_HEARTBEAT_AT | progress::PROGRESS_KEY
+    )
+}
+
+fn bind_execution_owner(metadata: &mut BTreeMap<String, String>) {
+    let owner = execution_owner();
+    metadata.remove(progress::PROGRESS_KEY);
+    metadata.insert("owner_pid".to_owned(), owner.pid.clone());
+    metadata.insert(OWNER_INSTANCE_ID.to_owned(), owner.instance.clone());
+    metadata.insert(OWNER_HEARTBEAT_AT.to_owned(), now_seconds().to_string());
+}
+
+struct ExecutionOwner {
+    pid: String,
+    instance: String,
+}
+
+fn execution_owner() -> &'static ExecutionOwner {
+    static OWNER: OnceLock<ExecutionOwner> = OnceLock::new();
+    OWNER.get_or_init(|| ExecutionOwner {
+        pid: std::process::id().to_string(),
+        instance: Uuid::new_v4().to_string(),
+    })
+}
+
+fn owns_execution(record: &JobRecord, owner: &ExecutionOwner) -> bool {
+    record.metadata.get("owner_pid") == Some(&owner.pid)
+        && record.metadata.get(OWNER_INSTANCE_ID) == Some(&owner.instance)
+}
+
+fn running_record_is_stale(record: &JobRecord, now: f64, owner: &ExecutionOwner) -> bool {
+    if record.metadata.get("owner_pid") == Some(&owner.pid)
+        && record
+            .metadata
+            .get(OWNER_INSTANCE_ID)
+            .is_none_or(|instance| instance == &owner.instance)
+    {
+        // Legacy records without a nonce retain their historical same-PID
+        // interpretation. New execution checkpoints require the exact instance.
+        return false;
     }
+    let last_alive = record
+        .metadata
+        .get(OWNER_HEARTBEAT_AT)
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= record.created_at && *value <= now)
+        .unwrap_or(record.created_at);
+    now - last_alive >= STALE_RUNNING_SECONDS
 }
 
 fn parse_role(value: &str) -> Option<TriadRole> {

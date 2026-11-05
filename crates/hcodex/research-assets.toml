@@ -1,0 +1,13 @@
+schema_version = 1
+runtime_rules = "assets/research-rules.md"
+fixture_corpus = "tests/fixtures/research_contract_cases.json"
+
+[files]
+"assets/research-rules.md" = "35347da3559f3610dc9694e2010c4c638749251ed6a897edd413660d2cb2ed51"
+"tests/fixtures/research_contract_cases.json" = "32abc93d6f74fb161b9271f3dcd178327a3c72ecb2c169c3a7c762417090ab54"
+
+[verification]
+network = false
+model_calls = false
+human_judge = false
+semantic_verification = "NOT_MECHANICALLY_PROVEN"

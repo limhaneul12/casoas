@@ -257,7 +257,15 @@ async fn settled_node_events_are_persisted_as_campaign_checkpoints() -> Result<(
     let state = tempdir()?;
     let gateway = Gateway::new(state.path().to_path_buf());
     let receipt = checkpoint_receipt();
-    let (sender, receiver) = mpsc::channel(2);
+    let (sender, receiver) = mpsc::channel(3);
+    sender
+        .send(DagExecutionEvent::NodeStopped {
+            node_id: "a".into(),
+        })
+        .await?;
+    sender
+        .send(DagExecutionEvent::WaveFinished { wave_index: 1 })
+        .await?;
     sender
         .send(DagExecutionEvent::NodeSettled {
             receipt: receipt.clone(),
@@ -290,13 +298,22 @@ async fn settled_node_events_are_persisted_as_campaign_checkpoints() -> Result<(
     })
     .await;
     let _previous = observed.recv().await;
-    persisting.await??;
     persistence??;
+    let lag = observed.recv().await.ok_or("lag marker lost")?;
+    assert!(matches!(
+        lag,
+        DagExecutionEvent::ProjectionLagged { dropped_events: 2 }
+    ));
     let delivered = observed
         .recv()
         .await
         .ok_or("settlement notification lost")?;
     assert!(matches!(delivered, DagExecutionEvent::NodeSettled { .. }));
+    let delivery = persisting.await??;
+    assert_eq!(delivery.dropped_intermediate_events, 2);
+    assert!(delivery.resync_required);
+    assert!(!delivery.observer_closed);
+    assert_eq!(delivery.undelivered_settlements, 0);
     let jobs = gateway
         .database(move |store| store.list_jobs(10, None))
         .await?;
@@ -332,5 +349,26 @@ async fn interactive_auto_spawn_is_derived_from_validated_plan() -> Result<()> {
             .as_str()
             .is_some_and(|summary| summary.contains("5 nodes in 3 waves"))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn closed_observer_retains_loss_counters_without_waiting() -> crate::Result<()> {
+    let (sender, receiver) = mpsc::channel(1);
+    drop(receiver);
+    let mut projection = LiveProjection::new(Some(sender));
+    projection.intermediate(DagExecutionEvent::WaveFinished { wave_index: 1 });
+    projection.intermediate(DagExecutionEvent::WaveFinished { wave_index: 2 });
+    projection
+        .settled(DagExecutionEvent::NodeSettled {
+            receipt: checkpoint_receipt(),
+        })
+        .await;
+    let delivery = projection.finish();
+    assert_eq!(delivery.dropped_intermediate_events, 2);
+    assert_eq!(delivery.undelivered_settlements, 1);
+    assert!(delivery.observer_attached);
+    assert!(delivery.observer_closed);
+    assert!(delivery.resync_required);
     Ok(())
 }

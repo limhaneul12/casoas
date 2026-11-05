@@ -93,11 +93,11 @@ TUI에서는 `/recovery <job_id>`를 사용합니다. 작업판에서 확인한 
 
 이 조회 명령은 새 DB, transcript 수집, 자동 삭제·재전송·worktree resume 권한을 추가하지 않습니다. raw provider 출력·prompt·자유 형식 오류 대신 필요한 ID·상태·모델·검증 결과만 표시합니다. `--worktree-name`과 함께 실행하면 조회 중 새 작업 공간이 만들어지지 않도록 거절합니다.
 
-`hcodex resume <campaign_id>`와 TUI `/resume <campaign_id>`는 [worktree 재개 계약](dag-worktree-mode.md)을 따르는 별도 실행 경로입니다. `status`/`board`의 `runtime_identity`는 소스·설치 파일·현재 프로세스·등록된 MCP의 증거 범위를 분리하며, 과거 필드나 source→binary/CI 연결 증거가 없으면 미검증으로 표시합니다.
+`hcodex resume <campaign_id>`와 TUI `/resume <campaign_id>`는 [worktree 재개 계약](dag-worktree-mode.md)을 따르는 별도 실행 경로입니다. `status`/`board`의 `runtime_identity`는 소스·설치 CLI·현재 프로세스·백엔드 capability의 증거 범위를 분리하며, 과거 필드나 source→binary/CI 연결 증거가 없으면 미검증으로 표시합니다.
 
 ## 설치본 확인
 
-소스와 실행 중 MCP는 서로 다른 버전일 수 있습니다. Review Council health만으로 CLI 기능 설치를 판단하지 말고 실제 선택된 바이너리를 확인합니다.
+소스와 설치된 CLI는 서로 다른 버전일 수 있습니다. Review Council health만으로 CLI 기능 설치를 판단하지 말고 실제 선택된 바이너리를 확인합니다.
 
 ```bash
 hcodex --help
@@ -107,13 +107,17 @@ hcodex votes --help
 hcodex recovery --help
 ```
 
-`--worktree-name`도 같은 방식으로 확인합니다. 스킬 파일 갱신은 바이너리 설치나 MCP 재시작의 증거가 아닙니다.
+`--worktree-name`도 같은 방식으로 확인합니다. 스킬 파일 갱신은 바이너리 설치나 현재 프로세스 이미지의 증거가 아닙니다.
 
 ## 저장 안정성
 
 프로젝트는 기존 bundled SQLite 의존성을 `rusqlite 0.39`로 갱신해 SQLite 3.51.3을 사용합니다. 이전 SQLite 3.51.1에서 연결 open/close 경쟁으로 관측·재현된 교착을 해결하는 upstream 수정이 포함됩니다. 이는 DB actor나 새 저장소 도입이 아닙니다. 전체 제품 안정성은 현재 소스에 대한 canonical `make ci`와 실제 CLI/TUI 검증을 별도로 통과해야 합니다.
 
-## 2026-11-04 검증 기록
+## 2026-11-04 역사 검증 기록
+
+아래 기록은 pure-backend 전환 전 release의 실행 증거입니다. MCP 프로세스와
+fixture에 대한 문장은 당시 범위만 설명하며 현재 제품 entry point를 뜻하지
+않습니다. 현재 전환 범위는 [백엔드 전환](backend-cutover.md)을 따릅니다.
 
 - 현재 소스의 `make ci`: 318개 통과, 실패·무시 0개. 규칙·manifest·format·check·strict Clippy 포함.
 - 실제 CLI file-scoped Council: Argon High, Sonnet Medium, Codex 6.1 Sol의 모델 영수증과 세 PASS 표를 조회했다. 한 파일의 `current_scoped` 판정이며 전체 저장소 승인 증거가 아니다.

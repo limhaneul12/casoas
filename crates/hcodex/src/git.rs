@@ -17,6 +17,12 @@ async fn bounded<R: AsyncRead + Unpin>(r: R) -> std::io::Result<Vec<u8>> {
     Ok(v)
 }
 pub(crate) async fn run(root: &Path, args: &[&str], timeout: Duration) -> Result<String> {
+    // Git is bounded infrastructure I/O, not the model job lifetime.
+    let timeout = if timeout.is_zero() {
+        Duration::from_secs(30)
+    } else {
+        timeout
+    };
     let mut c = Command::new("git");
     c.env("PATH", crate::runtime::enriched_command_path())
         .env("LC_ALL", "C")

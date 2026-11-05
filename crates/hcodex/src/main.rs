@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[command(
     name = "hcodex",
     version,
-    about = "Rust Heterarchy Codex MCP and DAG workbench"
+    about = "Rust Heterarchy Codex backend and DAG workbench"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -23,7 +23,6 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    Mcp,
     #[command(alias = "chat")]
     Tui {
         #[arg(short = 'c', long = "command")]
@@ -61,6 +60,12 @@ enum Command {
     /// Inspect existing recovery evidence without changing jobs or worktrees.
     Recovery {
         job_id: String,
+    },
+    /// Research explicit files, documents and HTTPS sources without changing code.
+    Research(Box<hcodex::research_cli::ResearchArgs>),
+    /// Read one research campaign without dispatching providers or initializing state.
+    ResearchStatus {
+        request_id: String,
     },
     /// Continue a persisted DAG from its verified checkpoint frontier.
     Resume {
@@ -109,12 +114,6 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         arguments: Vec<String>,
     },
-    #[command(aliases=["enable","start"])]
-    On,
-    #[command(aliases=["disable","stop"])]
-    Off,
-    #[command(alias = "reload")]
-    Restart,
     #[command(alias = "install")]
     Setup,
     #[command(alias = "refresh")]
@@ -172,20 +171,18 @@ async fn main() -> Result<()> {
             || matches!(
                 &cli.command,
                 Some(
-                    Command::Mcp
-                        | Command::Setup
+                    Command::Setup
                         | Command::Sync
-                        | Command::On
-                        | Command::Off
-                        | Command::Restart
                         | Command::Prune { .. }
                         | Command::Recovery { .. }
                         | Command::Resume { .. }
+                        | Command::Research(_)
+                        | Command::ResearchStatus { .. }
                 )
             ))
     {
         return Err(
-            "--worktree-name cannot start recovery/resume or server/installation management; use --workspace with an existing session"
+            "--worktree-name cannot start research/recovery/resume or installation management; use --workspace with an existing session"
                 .into(),
         );
     }
@@ -215,20 +212,10 @@ async fn main() -> Result<()> {
         terminal_command(workspace, state_root, input, worktree_mode)
     };
     let output=match command {
-        Command::Mcp=>{
-            let executable=std::env::current_exe()?;
-            let owned=tokio::task::spawn_blocking(move||hcodex::lifecycle::OwnedMcpProcessGuard::register(&home,&executable)).await??;
-            let outcome=hcodex::mcp::run(gateway).await;
-            tokio::task::spawn_blocking(move||owned.unregister()).await??;
-            return outcome;
-        }
         Command::Tui{input:None,initial} if initial.is_empty()=>return if worktree_mode {hcodex::terminal_adapter::run_with_worktrees(workspace,state_root).await}else{hcodex::terminal_adapter::run(workspace,state_root).await},
         Command::Tui{input,initial}=>terminal(workspace,state_root,input.unwrap_or_else(||initial.join(" "))).await?,
         Command::DagMode{arguments}=>terminal(workspace,state_root,format!("/dag-mode {}",arguments.join(" "))).await?,
         Command::DagExit=>serde_json::to_value(hcodex::terminal_adapter::command(workspace,state_root,"/dag-exit".into()).await?)?,
-        Command::On=>hcodex::lifecycle::control("on",&workspace,&home).await?,
-        Command::Off=>hcodex::lifecycle::control("off",&workspace,&home).await?,
-        Command::Restart=>hcodex::lifecycle::control("restart",&workspace,&home).await?,
         Command::Setup=>hcodex::lifecycle::control("setup",&workspace,&home).await?,
         Command::Sync=>hcodex::lifecycle::control("sync",&workspace,&home).await?,
         Command::Status=>gateway.call("codex_bridge_health",json!({"workspace_dir":workspace})).await?,
@@ -238,6 +225,8 @@ async fn main() -> Result<()> {
         Command::Council{files,proposal}=>gateway.call("heterarchy_triad_orchestrate",hcodex::workbench::council_request_with_files(&proposal.join(" "),&workspace,&files)?).await?,
         Command::Votes{collaboration_id}=>hcodex::workbench::votes(&gateway,&workspace,&collaboration_id).await?,
         Command::Recovery{job_id}=>hcodex::workbench::recovery(&state_root,&workspace,&job_id).await?,
+        Command::Research(args)=>hcodex::research_cli::run_foreground(&gateway,(*args).into_request(workspace).await?).await?,
+        Command::ResearchStatus{request_id}=>hcodex::research::status(&gateway,&workspace,&request_id).await?,
         Command::Resume{dag_id}=>terminal(workspace,state_root,format!("/resume {dag_id}")).await?,
         Command::Ask{prompt}|Command::Argon{prompt}=>terminal(workspace,state_root,format!("/argon {}",prompt.join(" "))).await?,
         Command::Sonnet{prompt}=>terminal(workspace,state_root,format!("/sonnet {}",prompt.join(" "))).await?,
@@ -281,6 +270,51 @@ fn campaign_goal(goal: Vec<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_server_controls_are_rejected_before_runtime_initialization() {
+        for command in [
+            "mcp", "on", "enable", "start", "off", "disable", "stop", "restart", "reload",
+        ] {
+            assert!(
+                Cli::try_parse_from(["hcodex", command]).is_err(),
+                "retired server command accepted: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn research_commands_preserve_explicit_scope_and_exact_readback_identity() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "hcodex",
+            "research",
+            "--file",
+            "src/lib.rs",
+            "--document",
+            "docs/spec.md",
+            "--url",
+            "https://example.com/spec",
+            "--plan-only",
+            "--",
+            "compare",
+            "contracts",
+        ])?;
+        let Some(Command::Research(args)) = cli.command else {
+            return Err("research command was not parsed".into());
+        };
+        assert_eq!(args.files, [PathBuf::from("src/lib.rs")]);
+        assert_eq!(args.documents, [PathBuf::from("docs/spec.md")]);
+        assert_eq!(args.urls, ["https://example.com/spec"]);
+        assert_eq!(args.question, ["compare", "contracts"]);
+        assert!(args.plan_only);
+        assert!(matches!(
+            Cli::try_parse_from(["hcodex", "research-status", "research-existing"])?.command,
+            Some(Command::ResearchStatus { request_id }) if request_id == "research-existing"
+        ));
+        assert!(Cli::try_parse_from(["hcodex", "research-status"]).is_err());
+        assert!(Cli::try_parse_from(["hcodex", "research", "--write", "src/lib.rs"]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn named_worktree_flag_preserves_default_and_explicit_terminal_commands() -> Result<()> {

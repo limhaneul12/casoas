@@ -10,11 +10,13 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::text::{inspector_width, wrap_display_line};
-use super::{DagLaneView, LaneState, TuiApp, TuiTheme};
+use super::{DagLaneView, LaneState, TuiApp, TuiTheme, WorkspacePane};
+use crate::workspaces::{WorkspaceKind, WorkspaceRunStatus};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WorkbenchAreas {
     pub header: Rect,
+    pub workspace_rail: Rect,
     pub graph: Rect,
     pub transcript: Rect,
     pub composer: Rect,
@@ -47,6 +49,7 @@ pub(crate) fn workbench_areas(area: Rect, lane_count: usize) -> WorkbenchAreas {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(1),
             graph_constraint,
             Constraint::Min(0),
             Constraint::Length(composer_height),
@@ -55,22 +58,89 @@ pub(crate) fn workbench_areas(area: Rect, lane_count: usize) -> WorkbenchAreas {
         .split(area);
     WorkbenchAreas {
         header: regions[0],
-        graph: regions[1],
-        transcript: regions[2],
-        composer: regions[3],
-        status: regions[4],
+        workspace_rail: regions[1],
+        graph: regions[2],
+        transcript: regions[3],
+        composer: regions[4],
+        status: regions[5],
     }
 }
 
 pub fn draw(frame: &mut Frame<'_>, app: &TuiApp) {
     let areas = workbench_areas(frame.area(), app.lanes().len());
     draw_header(frame, areas.header, app);
+    draw_workspace_rail(frame, areas.workspace_rail, app);
     draw_graph(frame, areas.graph, app);
     draw_transcript(frame, areas.transcript, app);
     draw_composer(frame, areas.composer, app);
     draw_status(frame, areas.status, app);
     draw_view(frame, app);
     draw_completions(frame, app, areas.composer);
+}
+
+fn draw_workspace_rail(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let compact = area.width < 72;
+    let wide = area.width >= 96;
+    let mono = app.theme() == TuiTheme::MinimalMono;
+    let separator = if compact { " │ " } else { "  │  " };
+    let sep_style = Style::default().fg(if mono {
+        Color::DarkGray
+    } else {
+        Color::Indexed(242)
+    });
+    let mut spans = Vec::new();
+    for (index, (kind, pane)) in app.workspace_tabs().into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(separator, sep_style));
+        }
+        let name = if compact {
+            match kind {
+                WorkspaceKind::Research => "R",
+                WorkspaceKind::Planning => "P",
+                WorkspaceKind::Building => "B",
+            }
+        } else {
+            kind.label()
+        };
+        let active = kind == app.active_workspace();
+        let color = if mono {
+            if active { Color::White } else { Color::Gray }
+        } else {
+            match kind {
+                WorkspaceKind::Research => HCODEX_SKY,
+                WorkspaceKind::Planning => Color::Indexed(214),
+                WorkspaceKind::Building => Color::Indexed(48),
+            }
+        };
+        let label = if compact {
+            if area.width >= 48 {
+                format!("{name}{} {}", pane.status_glyph(), pane.status_label())
+            } else {
+                format!("{name}{}", pane.status_glyph())
+            }
+        } else if wide {
+            format!(
+                "Alt+{} {name} {} {}",
+                index + 1,
+                pane.status_glyph(),
+                pane.status_label()
+            )
+        } else {
+            format!("{name} {} {}", pane.status_glyph(), pane.status_label())
+        };
+        let style = if active {
+            Style::default()
+                .fg(color)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(color)
+        };
+        spans.push(Span::styled(label, style));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).alignment(Alignment::Center),
+        area,
+    );
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -119,17 +189,29 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         || format!("layers {max_layer}"),
         |lane| format!("layer {}/{} · {}", lane.layer + 1, max_layer, lane.title),
     );
-    let text = format!(
-        "{phase} · Done {done}/{total} · {lane_meta} · {workspace} · {}",
-        app.permission_mode()
-    );
+    let text = if app.active_workspace() == WorkspaceKind::Building {
+        format!(
+            "{phase} · Done {done}/{total} · {lane_meta} · {workspace} · {}",
+            app.permission_mode()
+        )
+    } else {
+        format!(
+            "{} · {} · {workspace} · read-only",
+            app.active_workspace_pane().status_label(),
+            app.active_workspace().label()
+        )
+    };
     let fitted = fit(&text, area.width as usize);
     let left_used = UnicodeWidthStr::width(fitted.as_str());
     frame.render_widget(
         Paragraph::new(fitted).style(Style::default().fg(theme_accent(app.theme()))),
         area,
     );
-    let badge_text = "[HCODEX · TRI-POLAR]";
+    let (badge_text, badge_suffix) = match app.active_workspace() {
+        WorkspaceKind::Research => ("[HCODEX · RESEARCH]", " · RESEARCH]"),
+        WorkspaceKind::Planning => ("[HCODEX · PLANNING]", " · PLANNING]"),
+        WorkspaceKind::Building => ("[HCODEX · TRI-POLAR]", " · TRI-POLAR]"),
+    };
     let badge_width = UnicodeWidthStr::width(badge_text);
     if area.height > 0
         && usize::from(area.width) >= left_used.saturating_add(badge_width).saturating_add(2)
@@ -155,7 +237,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                     Style::default().fg(HCODEX_SKY).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    " · TRI-POLAR]",
+                    badge_suffix,
                     Style::default()
                         .fg(theme_accent(app.theme()))
                         .add_modifier(Modifier::BOLD),
@@ -167,6 +249,10 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn draw_graph(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if app.active_workspace() != WorkspaceKind::Building {
+        draw_workspace_overview(frame, area, app);
+        return;
+    }
     let edge_count: usize = app.lanes().iter().map(|lane| lane.dependencies.len()).sum();
     let graph_title = if !app.lanes().is_empty() && area.width >= 52 {
         format!(
@@ -278,6 +364,199 @@ fn draw_graph(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     } else {
         draw_dependency_edges(frame, app, &edges);
     }
+}
+
+fn research_handoff_ready(pane: &WorkspacePane) -> bool {
+    matches!(
+        pane.status(),
+        WorkspaceRunStatus::Completed | WorkspaceRunStatus::IncompleteEvidence
+    )
+}
+
+fn build_handoff_ready(pane: &WorkspacePane) -> bool {
+    pane.status() == WorkspaceRunStatus::BuildReady
+        && pane.artifact().is_some_and(|artifact| artifact.ready)
+}
+
+fn workspace_run_reference(id: &str) -> String {
+    if id.starts_with("preview-") {
+        format!("Preview: {id}")
+    } else {
+        format!("Flow: {id}")
+    }
+}
+
+fn workspace_artifact_line(command: &str, id: &str, width: u16) -> String {
+    let line = format!("{command} {id}");
+    if UnicodeWidthStr::width(line.as_str()) <= usize::from(width) {
+        line
+    } else {
+        format!("Artifact: {id}")
+    }
+}
+
+fn draw_workspace_overview(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let kind = app.active_workspace();
+    if kind == WorkspaceKind::Building {
+        return;
+    }
+    let pane = app.active_workspace_pane();
+    let color = if app.theme() == TuiTheme::MinimalMono {
+        Color::Gray
+    } else if kind == WorkspaceKind::Research {
+        HCODEX_SKY
+    } else {
+        Color::Indexed(214)
+    };
+    let title = if area.width >= 56 {
+        format!(
+            " {} · {} {} · read-only ",
+            kind.label(),
+            pane.status_glyph(),
+            pane.status_label()
+        )
+    } else {
+        format!(" {} ", kind.label())
+    };
+    let block = Block::default()
+        .title(Span::styled(
+            title,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Indexed(242)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let max_rows = usize::from(inner.height);
+    let research = app.workspace_pane(WorkspaceKind::Research);
+    let research_artifact = research
+        .artifact()
+        .filter(|_| research_handoff_ready(research));
+    let is_build_ready = kind == WorkspaceKind::Planning && build_handoff_ready(pane);
+    let mut rows = Vec::new();
+    if pane.objective().is_empty() {
+        let hints = match kind {
+            WorkspaceKind::Research => [
+                "/research -- <question>",
+                "Search sources, then investigate and compare evidence.",
+                "/workflow --through planning -- <goal>",
+            ],
+            WorkspaceKind::Planning => [
+                "/planning -- <goal>",
+                "/planning --from <research_id> -- <goal>",
+                "Requirements, scope, decisions and acceptance criteria.",
+            ],
+            WorkspaceKind::Building => return,
+        };
+        rows.extend(hints.into_iter().map(str::to_owned));
+        rows.push(format!("{} · {}", pane.status_label(), pane.detail()));
+        if pane.artifact().is_none() && rows.len() < max_rows {
+            let footer = match (kind, research_artifact) {
+                (WorkspaceKind::Research, _) => {
+                    "Read-only outside repo · standalone or /planning --from <research_id>"
+                        .to_owned()
+                }
+                (WorkspaceKind::Planning, Some(res)) => format!(
+                    "Research handoff ready: /planning --from {} -- <goal>",
+                    res.artifact_id
+                ),
+                (WorkspaceKind::Planning, None) => {
+                    "BuildReady is mechanical only · /building --plan <plan_id> gates clean repo"
+                        .to_owned()
+                }
+                (WorkspaceKind::Building, _) => String::new(),
+            };
+            if !footer.is_empty() {
+                rows.push(footer);
+            }
+        }
+    } else {
+        rows.push(format!("Goal: {}", pane.objective()));
+        match (
+            pane.current_run_id(),
+            pane.artifact().is_some() && max_rows <= 4,
+        ) {
+            (Some(id), true) => {
+                rows.push(format!(
+                    "{} · {} · {}",
+                    workspace_run_reference(id),
+                    pane.status_label(),
+                    pane.detail()
+                ));
+            }
+            (Some(id), false) => {
+                rows.push(format!("{} · {}", pane.status_label(), pane.detail()));
+                rows.push(workspace_run_reference(id));
+            }
+            (None, _) => {
+                rows.push(format!("{} · {}", pane.status_label(), pane.detail()));
+            }
+        }
+    }
+    if let Some(artifact) = pane.artifact() {
+        let artifact_line = match kind {
+            WorkspaceKind::Research if research_handoff_ready(pane) => {
+                workspace_artifact_line("/planning --from", &artifact.artifact_id, inner.width)
+            }
+            WorkspaceKind::Planning if is_build_ready => {
+                workspace_artifact_line("/building --plan", &artifact.artifact_id, inner.width)
+            }
+            WorkspaceKind::Planning => format!(
+                "Artifact: {} · not BuildReady (building gated)",
+                artifact.artifact_id
+            ),
+            WorkspaceKind::Research | WorkspaceKind::Building => {
+                format!("Artifact: {}", artifact.artifact_id)
+            }
+        };
+        rows.push(artifact_line);
+        rows.push(format!("Digest: {}", artifact.digest));
+        if rows.len() < max_rows {
+            let handoff = match kind {
+                WorkspaceKind::Research if research_handoff_ready(pane) => format!(
+                    "Handoff (optional): /planning --from {} -- <goal>",
+                    artifact.artifact_id
+                ),
+                WorkspaceKind::Planning if is_build_ready => {
+                    "Mechanical readiness only · explicit build requires a clean repo".into()
+                }
+                WorkspaceKind::Planning => {
+                    "Building blocked until plan reaches mechanical BuildReady.".to_owned()
+                }
+                WorkspaceKind::Research | WorkspaceKind::Building => String::new(),
+            };
+            if !handoff.is_empty() {
+                rows.push(handoff);
+            }
+        }
+    } else if !pane.objective().is_empty() && rows.len() < max_rows {
+        let note = match kind {
+            WorkspaceKind::Research => {
+                "Read-only outside original · optional handoff: /planning --from <research_id>"
+            }
+            WorkspaceKind::Planning if is_build_ready => {
+                "BuildReady is mechanical readiness only, not semantic approval."
+            }
+            WorkspaceKind::Planning => {
+                "Read-only outside original · Building requires explicit /building --plan <plan_id>"
+            }
+            WorkspaceKind::Building => "",
+        };
+        if !note.is_empty() {
+            rows.push(note.to_owned());
+        }
+    }
+    let rows = rows
+        .into_iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                fit(&line, usize::from(inner.width)),
+                Style::default().fg(color),
+            ))
+        })
+        .take(max_rows)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(rows), inner);
 }
 
 fn draw_routing_preview(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -809,10 +1088,13 @@ fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             }
         }
     }
-    let transcript_title = if area.width >= 56 {
-        " live transcript · delegate_task · AST & code stream "
-    } else {
-        " live transcript "
+    let transcript_title = match app.active_workspace() {
+        WorkspaceKind::Research => " research activity · sources & evidence ",
+        WorkspaceKind::Planning => " planning activity · requirements & decisions ",
+        WorkspaceKind::Building if area.width >= 56 => {
+            " live transcript · delegate_task · AST & code stream "
+        }
+        WorkspaceKind::Building => " live transcript ",
     };
     let title_style = if app.theme() == TuiTheme::MinimalMono {
         Style::default()
@@ -874,7 +1156,12 @@ fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         area.width.saturating_sub(2) as usize,
     );
     let display = if app.input().is_empty() {
-        "> Ask Heterarchy Codex to do anything".to_owned()
+        match app.active_workspace() {
+            WorkspaceKind::Research => "> Ask a research question",
+            WorkspaceKind::Planning => "> Describe what to plan",
+            WorkspaceKind::Building => "> Ask Heterarchy Codex to do anything",
+        }
+        .to_owned()
     } else {
         viewport.text.clone()
     };
@@ -886,13 +1173,22 @@ fn draw_composer(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme_accent(app.theme())));
-    if let Some(badge) = dag_mode_badge(app, usize::from(area.width.saturating_sub(4))) {
+    let badge = if app.active_workspace() == WorkspaceKind::Building {
+        dag_mode_badge(app, usize::from(area.width.saturating_sub(4)))
+    } else {
+        None
+    };
+    if let Some(badge) = badge {
         if usize::from(area.width) >= badge.width() + 24 {
             block = block.title(" composer ");
         }
         block = block.title_top(badge.alignment(Alignment::Center));
     } else {
-        block = block.title(" composer ");
+        block = block.title(match app.active_workspace() {
+            WorkspaceKind::Research => " research question ",
+            WorkspaceKind::Planning => " planning goal ",
+            WorkspaceKind::Building => " composer ",
+        });
     }
     let paragraph = Paragraph::new(display).style(style).block(block);
     frame.render_widget(paragraph, area);
@@ -1128,6 +1424,10 @@ fn expand_tabs(value: &str) -> String {
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    if app.active_workspace() != WorkspaceKind::Building {
+        draw_workspace_status(frame, area, app);
+        return;
+    }
     let skills = if app.active_skills().is_empty() {
         "(no skills)".to_owned()
     } else {
@@ -1244,6 +1544,95 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Paragraph::new(lines).style(Style::default().fg(Color::Gray)),
         area,
     );
+}
+
+fn draw_workspace_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let kind = app.active_workspace();
+    let pane = app.active_workspace_pane();
+    let is_build_ready = kind == WorkspaceKind::Planning && build_handoff_ready(pane);
+    let gate_note = if is_build_ready {
+        " · mechanical ready (not approval)"
+    } else {
+        " · outside original repo"
+    };
+    let reference = if let Some(artifact) = pane.artifact() {
+        match kind {
+            WorkspaceKind::Research if research_handoff_ready(pane) => {
+                workspace_artifact_line("/planning --from", &artifact.artifact_id, area.width)
+            }
+            WorkspaceKind::Planning if is_build_ready => {
+                workspace_artifact_line("/building --plan", &artifact.artifact_id, area.width)
+            }
+            WorkspaceKind::Planning => format!(
+                "Artifact: {} · building gated (not BuildReady)",
+                artifact.artifact_id
+            ),
+            WorkspaceKind::Research | WorkspaceKind::Building => {
+                format!("Artifact: {}", artifact.artifact_id)
+            }
+        }
+    } else if let Some(id) = pane.current_run_id() {
+        workspace_run_reference(id)
+    } else {
+        "/workflow-status <flow_id> · /space building".into()
+    };
+    let handoff_row = if let Some(artifact) = pane.artifact() {
+        match kind {
+            WorkspaceKind::Research if research_handoff_ready(pane) => format!(
+                "Handoff: /planning --from {} -- <goal> · Digest: {}",
+                artifact.artifact_id, artifact.digest
+            ),
+            WorkspaceKind::Planning if is_build_ready => format!(
+                "Explicit gate: /building --plan {} · Digest: {}",
+                artifact.artifact_id, artifact.digest
+            ),
+            WorkspaceKind::Planning => format!(
+                "Hold: {} is not mechanically BuildReady · Digest: {}",
+                artifact.artifact_id, artifact.digest
+            ),
+            WorkspaceKind::Research | WorkspaceKind::Building => {
+                format!("Digest: {}", artifact.digest)
+            }
+        }
+    } else {
+        match kind {
+            WorkspaceKind::Research => {
+                "Standalone: /research -- <q> · Chained: /workflow --through planning -- <goal>"
+                    .into()
+            }
+            WorkspaceKind::Planning => {
+                "Standalone: /planning -- <goal> · Chained: /workflow --stages planning,building -- <goal>"
+                    .into()
+            }
+            WorkspaceKind::Building => "/building --plan <plan_id>".into(),
+        }
+    };
+    let rows = [
+        format!(
+            "read-only · {} · {}{gate_note}",
+            kind.label(),
+            pane.status_label()
+        ),
+        "stage models · see receipts · Alt+1/2/3 · /space".into(),
+        format!(
+            "session {} · draft {} B",
+            app.token_counts_status(),
+            app.input().len()
+        ),
+        reference,
+        handoff_row,
+    ];
+    let rows = rows
+        .into_iter()
+        .map(|line| {
+            Line::from(Span::styled(
+                fit(&line, usize::from(area.width)),
+                Style::default().fg(Color::Gray),
+            ))
+        })
+        .take(usize::from(area.height))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(rows), area);
 }
 
 fn styled_layer_header_line(

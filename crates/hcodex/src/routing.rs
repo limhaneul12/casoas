@@ -23,8 +23,55 @@ pub enum Provider {
 #[serde(rename_all = "snake_case")]
 pub enum Engine {
     CodexCli,
+    #[serde(alias = "antigravity_local_rpc")]
     AntigravityRpc,
+    AntigravityCli,
     Http,
+}
+
+/// Bounded execution observations; never includes model text or tool payloads.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionPhase {
+    Initializing,
+    AwaitingInput,
+    InputSent,
+    Running,
+    ResultObserved,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageScope {
+    SessionCumulative,
+    CurrentTurn,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionUsage {
+    pub scope: UsageScope,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub thinking_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub total_tokens: u64,
+    pub turns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionProgress {
+    pub engine: Engine,
+    pub session_id: Option<String>,
+    pub sequence: u64,
+    pub step_index: Option<u64>,
+    pub phase: ExecutionPhase,
+    pub observed_model: Option<String>,
+    pub observed_at: String,
+    pub stdout_bytes: u64,
+    pub usage: Option<ExecutionUsage>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -286,6 +333,10 @@ pub fn normalize_model(model: &str) -> Option<String> {
 }
 
 pub fn validate_route(request: &RouteRequest) -> crate::Result<Route> {
+    if request.engine == Engine::AntigravityRpc {
+        return Err(route_error(request,RouteErrorCode::UnsupportedEngine,
+            "Antigravity RPC execution is retired; use antigravity_cli. Historical RPC records remain readable.".into()).into());
+    }
     let effort = request.effort.trim().to_ascii_lowercase();
     if !matches!(
         effort.as_str(),
@@ -301,7 +352,7 @@ pub fn validate_route(request: &RouteRequest) -> crate::Result<Route> {
     let provider_matches = matches!(
         (request.provider, request.engine),
         (Provider::OpenaiCodex, Engine::CodexCli)
-            | (Provider::Antigravity, Engine::AntigravityRpc)
+            | (Provider::Antigravity, Engine::AntigravityCli)
             | (Provider::LocalHttp, Engine::Http)
     );
     if !provider_matches {
@@ -334,7 +385,8 @@ pub fn validate_route(request: &RouteRequest) -> crate::Result<Route> {
     };
     let engine_accepts_model = match request.engine {
         Engine::CodexCli | Engine::Http => model.starts_with("gpt-"),
-        Engine::AntigravityRpc => !model.starts_with("gpt-"),
+        Engine::AntigravityCli => !model.starts_with("gpt-"),
+        Engine::AntigravityRpc => false,
     };
     if !engine_accepts_model {
         return Err(route_error(
@@ -359,8 +411,8 @@ pub fn validate_route(request: &RouteRequest) -> crate::Result<Route> {
         .into());
     }
     // Gemini's selected catalogue model owns its tier; generic caller effort
-    // defaults do not create an unavailable "xhigh" RPC model.
-    let effort = if request.engine == Engine::AntigravityRpc && model.starts_with("gemini-") {
+    // defaults do not create an unavailable "xhigh" CLI model.
+    let effort = if request.engine == Engine::AntigravityCli && model.starts_with("gemini-") {
         if model.ends_with("-low") {
             "low"
         } else if model.ends_with("-medium") {
@@ -428,6 +480,7 @@ pub fn new_receipt_with_context(
         call_path: match route.engine {
             Engine::CodexCli => "runtime::codex_cli",
             Engine::AntigravityRpc => "runtime::antigravity_local_rpc",
+            Engine::AntigravityCli => "runtime::antigravity_cli",
             Engine::Http => "http_runtime::chat_completions",
         }
         .into(),
@@ -474,6 +527,7 @@ pub const fn auth_context(engine: Engine) -> &'static str {
     match engine {
         Engine::CodexCli => "codex_chatgpt_oauth",
         Engine::AntigravityRpc => "antigravity_local_csrf",
+        Engine::AntigravityCli => "antigravity_cli_cached_credentials",
         Engine::Http => "http_bearer",
     }
 }

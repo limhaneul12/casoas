@@ -174,12 +174,24 @@ impl CheckpointContext {
     }
 
     pub(super) async fn wait(&self, node_id: &str, timeout: Duration) -> Result<()> {
+        self.wait_until(
+            node_id,
+            crate::execution_policy::ExecutionDeadline::from_limit(timeout),
+        )
+        .await
+    }
+
+    async fn wait_until(
+        &self,
+        node_id: &str,
+        deadline: crate::execution_policy::ExecutionDeadline,
+    ) -> Result<()> {
         let mut receiver = self
             .commits
             .get(node_id)
             .ok_or("context_not_ready: unknown checkpoint node")?
             .subscribe();
-        tokio::time::timeout(timeout, async {
+        let waiting = async {
             loop {
                 let state = receiver.borrow().clone();
                 match state {
@@ -193,22 +205,25 @@ impl CheckpointContext {
                         .map_err(|_| "context_not_ready: checkpoint writer closed")?,
                 }
             }
-        })
-        .await
-        .map_err(|_| "context_not_ready: checkpoint commit deadline exceeded")?
+        };
+        tokio::pin!(waiting);
+        tokio::select! {
+            result=&mut waiting=>result,
+            ()=deadline.wait()=>Err("context_not_ready: checkpoint commit deadline exceeded".into()),
+            ()=crate::supervisor::cancelled()=>Err("context_not_ready: checkpoint wait cancelled".into()),
+        }
     }
 
     pub(super) async fn inherit(&self, node: &DagNode, timeout: Duration) -> Result<String> {
         if node.dependencies.is_empty() {
             return Ok(String::new());
         }
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = crate::execution_policy::ExecutionDeadline::from_limit(timeout);
         for parent in &node.dependencies {
-            self.wait(
-                parent,
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
-            .await?;
+            if deadline.is_elapsed() {
+                return Err("context_not_ready: checkpoint commit deadline exceeded".into());
+            }
+            self.wait_until(parent, deadline).await?;
         }
         let parents = node.dependencies.clone();
         let scope = self.scope();

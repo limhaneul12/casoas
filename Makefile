@@ -1,27 +1,31 @@
 .DEFAULT_GOAL := ci
-.PHONY: ci check harness fmt lint test build install doctor tui status help
+.PHONY: ci check harness local-harness fmt lint test build install doctor tui status help
 
 # Route Cargo through rustup's proxy; rust-toolchain.toml owns the version.
 export PATH := $(HOME)/.cargo/bin:$(PATH)
 CARGO ?= cargo
+XTASK = $(CARGO) run --locked --package xtask --
 
 ci:
-	$(CARGO) xtask ci
+	$(XTASK) ci
 
 check:
-	$(CARGO) xtask check
+	$(XTASK) check
 
 harness:
-	$(CARGO) xtask rules
+	$(XTASK) rules
+
+local-harness:
+	$(XTASK) local-harness
 
 fmt:
-	$(CARGO) xtask fmt
+	$(XTASK) fmt
 
 lint:
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
 
 test:
-	$(CARGO) xtask test
+	$(XTASK) test
 
 build:
 	$(CARGO) build --release --package hcodex
@@ -30,7 +34,7 @@ install:
 	$(CARGO) install --path crates/hcodex --locked
 
 doctor:
-	$(CARGO) xtask doctor
+	$(XTASK) doctor
 
 
 tui:
@@ -40,4 +44,4 @@ status:
 	$(CARGO) run --package hcodex -- status
 
 help:
-	@printf '%s\n' 'make ci       Rust rules + fmt + check + strict Clippy + tests' 'make harness  Rust mechanical contracts' 'make build    release binary' 'make install  install hcodex' 'make tui      interactive workbench'
+	@printf '%s\n' 'make ci       Rust rules + fmt + check + strict Clippy + tests' 'make harness  Portable Rust mechanical contracts' 'make local-harness  Check ignored local Rust/shared materialization' 'make build    release binary' 'make install  install hcodex' 'make tui      interactive workbench'

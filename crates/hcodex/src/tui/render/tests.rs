@@ -7,6 +7,122 @@ use std::fs;
 use std::path::PathBuf;
 
 #[test]
+fn research_and_planning_render_their_own_read_only_workspaces() -> crate::Result<()> {
+    use crate::tui::{TuiAction, WorkspaceArtifactView, WorkspaceUpdate};
+    use crate::workspaces::{WorkspaceKind, WorkspaceRunStatus};
+    for kind in [WorkspaceKind::Research, WorkspaceKind::Planning] {
+        for (width, height) in [(128, 36), (80, 24), (64, 18)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+            let mut app =
+                TuiApp::new_with_motion(PathBuf::from("workspace"), TuiCatalog::default(), false);
+            app.apply_update(TuiUpdate::ActiveModel("direct-building-selection".into()));
+            app.apply_update(TuiUpdate::ValidatedAction(TuiAction::ToggleDag));
+            app.apply_update(TuiUpdate::PermissionMode("auto-edit".into()));
+            app.apply_update(TuiUpdate::ValidatedAction(TuiAction::SelectWorkspace(kind)));
+            terminal.draw(|frame| draw(frame, &app))?;
+            let idle = buffer_text(terminal.backend().buffer());
+            let command = if kind == WorkspaceKind::Research {
+                "/research --"
+            } else {
+                "/planning --"
+            };
+            assert!(idle.contains(command), "{kind:?} {width}x{height}: {idle}");
+            for misleading in [
+                "DAG topology",
+                "No graph loaded",
+                "AST & code stream",
+                "TRI-POLAR",
+                "auto-edit",
+                "accept all",
+                "direct-building-selection",
+            ] {
+                assert!(
+                    !idle.contains(misleading),
+                    "{kind:?} {width}x{height} still shows {misleading}: {idle}"
+                );
+            }
+            assert!(idle.contains("read-only"));
+            assert!(idle.contains("stage models · see receipts"));
+            app.apply_update(TuiUpdate::WorkspaceStarted {
+                run_id: "flow-evidence".into(),
+                selected: vec![kind],
+                objective: "Compare storage contracts".into(),
+            });
+            app.apply_update(TuiUpdate::WorkspaceScoped {
+                run_id: "flow-evidence".into(),
+                workspace: kind,
+                update: WorkspaceUpdate::Status {
+                    status: WorkspaceRunStatus::Running,
+                    detail: "Observed stage work".into(),
+                },
+            });
+            app.apply_update(TuiUpdate::WorkspaceScoped {
+                run_id: "flow-evidence".into(),
+                workspace: kind,
+                update: WorkspaceUpdate::Artifact(WorkspaceArtifactView {
+                    artifact_id: "artifact-original".into(),
+                    digest: "sha256:observed".into(),
+                    label: "Observed artifact".into(),
+                    ready: false,
+                }),
+            });
+            app.handle_paste("workspace draft");
+            terminal.draw(|frame| draw(frame, &app))?;
+            let running = buffer_text(terminal.backend().buffer());
+            assert!(running.contains("Compare storage contracts"));
+            assert!(running.contains("artifact-original"));
+            assert!(running.contains("RUNNING"));
+            assert!(running.contains("workspace draft"));
+            let areas = workbench_areas(Rect::new(0, 0, width, height), 0);
+            let composer = (0..width)
+                .map(|x| terminal.backend().buffer()[(x, areas.composer.y + 1)].symbol())
+                .collect::<String>();
+            assert!(composer.contains("workspace draft"));
+            let handoff = if kind == WorkspaceKind::Research {
+                "/planning --from artifact-original"
+            } else {
+                "/building --plan artifact-original"
+            };
+            assert!(
+                !running.contains(handoff),
+                "running artifact offered handoff"
+            );
+            app.apply_update(TuiUpdate::WorkspaceScoped {
+                run_id: "flow-evidence".into(),
+                workspace: kind,
+                update: WorkspaceUpdate::Artifact(WorkspaceArtifactView {
+                    artifact_id: "artifact-original".into(),
+                    digest: "sha256:observed".into(),
+                    label: "Observed artifact".into(),
+                    ready: kind == WorkspaceKind::Planning,
+                }),
+            });
+            app.apply_update(TuiUpdate::WorkspaceScoped {
+                run_id: "flow-evidence".into(),
+                workspace: kind,
+                update: WorkspaceUpdate::Status {
+                    status: if kind == WorkspaceKind::Research {
+                        WorkspaceRunStatus::IncompleteEvidence
+                    } else {
+                        WorkspaceRunStatus::BuildReady
+                    },
+                    detail: "Observed eligible artifact".into(),
+                },
+            });
+            terminal.draw(|frame| draw(frame, &app))?;
+            if width == 128 {
+                let ready = buffer_text(terminal.backend().buffer());
+                assert!(
+                    ready.contains(handoff),
+                    "{kind:?} eligible handoff missing: {ready}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn a_multiline_provider_reply_taller_than_the_log_still_shows_its_tail() -> crate::Result<()> {
     let mut terminal = Terminal::new(TestBackend::new(80, 24))?;
     let mut app = TuiApp::new_with_motion(PathBuf::from("workspace"), TuiCatalog::default(), false);
@@ -107,6 +223,41 @@ fn context_and_active_skills_remain_visible_at_eighty_columns() -> crate::Result
     assert!(text.contains("Context input 1536/256000 B"));
     assert!(text.contains("model window unreported"));
     assert!(!text.contains("100% left"));
+    Ok(())
+}
+
+#[test]
+fn workflow_rail_remains_visible_and_compact_without_covering_composer() -> crate::Result<()> {
+    for (width, height) in [(128, 36), (80, 24), (48, 16)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+        let mut app =
+            TuiApp::new_with_motion(PathBuf::from("workspace"), TuiCatalog::default(), false);
+        app.apply_update(TuiUpdate::WorkspaceStarted {
+            run_id: "flow-render".to_owned(),
+            selected: vec![
+                crate::workspaces::WorkspaceKind::Research,
+                crate::workspaces::WorkspaceKind::Planning,
+                crate::workspaces::WorkspaceKind::Building,
+            ],
+            objective: "render rail".to_owned(),
+        });
+        app.handle_paste("composer draft");
+        terminal.draw(|frame| draw(frame, &app))?;
+        let text = buffer_text(terminal.backend().buffer());
+        if width >= 72 {
+            assert!(text.contains("Research & Search"));
+            assert!(text.contains("Planning"));
+            assert!(text.contains("Building"));
+        } else {
+            assert!(text.contains("R◐"));
+            assert!(text.contains("P◐"));
+            assert!(text.contains("B◐"));
+        }
+        assert!(text.contains("composer draft"));
+        let areas = workbench_areas(Rect::new(0, 0, width, height), 0);
+        assert_eq!(areas.workspace_rail.y, areas.header.y + 1);
+        assert!(areas.workspace_rail.y < areas.composer.y);
+    }
     Ok(())
 }
 

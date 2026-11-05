@@ -3,6 +3,7 @@
 mod helpers;
 #[cfg(test)]
 mod tests;
+mod workspaces;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -54,6 +55,9 @@ struct HandlerState {
     last_dag_request: Option<Value>,
     last_dag_result: Option<Value>,
     baseline_manifest: Option<WorkspaceManifest>,
+    workspace_runs: BTreeMap<crate::workspaces::WorkspaceKind, String>,
+    workspace_lanes: BTreeMap<String, Vec<crate::tui::DagLaneView>>,
+    workspace_plan_ids: BTreeMap<String, String>,
 }
 
 /// Stateful, concurrency-safe adapter for the terminal action boundary.
@@ -63,6 +67,7 @@ pub struct AppHandler {
     workspace: PathBuf,
     state: Arc<Mutex<HandlerState>>,
     worktree_default: bool,
+    scoped_legacy_projection: bool,
 }
 
 impl AppHandler {
@@ -75,6 +80,7 @@ impl AppHandler {
             gateway,
             workspace,
             worktree_default: false,
+            scoped_legacy_projection: false,
             state: Arc::new(Mutex::new(HandlerState {
                 active_model: "gemini-4-argon-high".to_owned(),
                 effort: "high".to_owned(),
@@ -94,8 +100,16 @@ impl AppHandler {
                 last_dag_request: None,
                 last_dag_result: None,
                 baseline_manifest: None,
+                workspace_runs: BTreeMap::new(),
+                workspace_lanes: BTreeMap::new(),
+                workspace_plan_ids: BTreeMap::new(),
             })),
         })
+    }
+
+    fn with_scoped_legacy_projection(mut self) -> Self {
+        self.scoped_legacy_projection = true;
+        self
     }
 
     fn with_worktree_default(mut self, enabled: bool) -> Self {
@@ -137,106 +151,172 @@ impl AppHandler {
             let Some(action) = handler.registered_skill_action(action, &updates).await? else {
                 return Ok(());
             };
-            match action {
-                TuiAction::SubmitPrompt(prompt) => handler.submit_prompt(prompt, updates).await,
-                TuiAction::RunDag(goal) | TuiAction::AutoDag(goal) => {
-                    handler.plan_dag(goal, true, None, updates).await
-                }
-                TuiAction::PlanDag(goal) => handler.plan_dag(goal, false, None, updates).await,
-                TuiAction::ToggleDag => {
-                    send_transcript(
-                        &updates,
-                        "DAG mode toggled; execution remains receipt-gated",
-                    )
-                    .await
-                }
-                TuiAction::EnterDag(goal) => {
-                    let active = {
-                        let mut state = handler.state.lock().await;
-                        if state.skills.skills().contains_key("codex-heterarchy")
-                            && !state
-                                .skills
-                                .active()
-                                .iter()
-                                .any(|name| name == "codex-heterarchy")
-                        {
-                            let mut selected = state.skills.clone();
-                            selected.activate("codex-heterarchy")?;
-                            let preflight = selected.clone();
-                            let _body = tokio::task::spawn_blocking(move || {
-                                preflight.active_context(32_000)
-                            })
-                            .await??;
-                            state.skills = selected;
-                        }
-                        state.skills.active().to_vec()
-                    };
-                    updates.send(TuiUpdate::ActiveSkills(active)).await?;
-                    send_transcript(&updates, "DAG mode enabled").await?;
-                    if let Some(goal) = goal {
+            let legacy_run = handler.begin_legacy_building(&action, &updates).await?;
+            let final_updates = updates.clone();
+            let final_handler = handler.clone();
+            let (updates, legacy_updates) =
+                if legacy_run.is_some() && handler.scoped_legacy_projection {
+                    let (sender, receiver) = mpsc::channel(32);
+                    (sender, Some(receiver))
+                } else {
+                    (updates, None)
+                };
+            let execution = async move {
+                match action {
+                    TuiAction::SubmitPrompt(prompt) => handler.submit_prompt(prompt, updates).await,
+                    TuiAction::RunDag(goal) | TuiAction::AutoDag(goal) => {
                         handler.plan_dag(goal, true, None, updates).await
-                    } else {
+                    }
+                    TuiAction::PlanDag(goal) => handler.plan_dag(goal, false, None, updates).await,
+                    TuiAction::ToggleDag => {
+                        send_transcript(
+                            &updates,
+                            "DAG mode toggled; execution remains receipt-gated",
+                        )
+                        .await
+                    }
+                    TuiAction::EnterDag(goal) => {
+                        let active = {
+                            let mut state = handler.state.lock().await;
+                            if state.skills.skills().contains_key("codex-heterarchy")
+                                && !state
+                                    .skills
+                                    .active()
+                                    .iter()
+                                    .any(|name| name == "codex-heterarchy")
+                            {
+                                let mut selected = state.skills.clone();
+                                selected.activate("codex-heterarchy")?;
+                                let preflight = selected.clone();
+                                let _body = tokio::task::spawn_blocking(move || {
+                                    preflight.active_context(32_000)
+                                })
+                                .await??;
+                                state.skills = selected;
+                            }
+                            state.skills.active().to_vec()
+                        };
+                        updates.send(TuiUpdate::ActiveSkills(active)).await?;
+                        send_transcript(&updates, "DAG mode enabled").await?;
+                        if let Some(goal) = goal {
+                            handler.plan_dag(goal, true, None, updates).await
+                        } else {
+                            Ok(())
+                        }
+                    }
+                    TuiAction::ExitDag => send_transcript(&updates, "DAG mode exited").await,
+                    TuiAction::ShowOverview => handler.show_overview(updates).await,
+                    TuiAction::ShowWorkBoard(limit) => handler.show_workboard(limit, updates).await,
+                    TuiAction::RunCouncil(proposal) => handler.run_council(proposal, updates).await,
+                    TuiAction::ShowVotes(collaboration_id) => {
+                        handler.show_votes(collaboration_id, updates).await
+                    }
+                    TuiAction::ShowRecovery(job_id) => handler.show_recovery(job_id, updates).await,
+                    TuiAction::SelectWorkspace(_) => Ok(()),
+                    TuiAction::RunPlanning(arguments) => {
+                        handler
+                            .run_workspace_command(
+                                crate::workspace_cli::WorkspaceCommand::Planning,
+                                arguments,
+                                updates,
+                            )
+                            .await
+                    }
+                    TuiAction::RunBuilding(arguments) => {
+                        handler
+                            .run_workspace_command(
+                                crate::workspace_cli::WorkspaceCommand::Building,
+                                arguments,
+                                updates,
+                            )
+                            .await
+                    }
+                    TuiAction::RunWorkflow(arguments) => {
+                        handler
+                            .run_workspace_command(
+                                crate::workspace_cli::WorkspaceCommand::Workflow,
+                                arguments,
+                                updates,
+                            )
+                            .await
+                    }
+                    TuiAction::ShowWorkflowStatus(id) => {
+                        handler.show_workflow_status(id, updates).await
+                    }
+                    TuiAction::CancelWorkflow(id) => handler.cancel_workflow(id, updates).await,
+                    TuiAction::RunResearch(arguments) => {
+                        handler.run_research(arguments, updates).await
+                    }
+                    TuiAction::ShowResearchStatus(request_id) => {
+                        handler.show_research_status(request_id, updates).await
+                    }
+                    TuiAction::ShowPrompts(selector) => {
+                        handler.show_prompts(selector, updates).await
+                    }
+                    TuiAction::Back => Ok(()),
+                    TuiAction::ShowModels => handler.show_models(updates).await,
+                    TuiAction::ShowActiveModel => {
+                        let active = {
+                            let state = handler.state.lock().await;
+                            format!("{}:{}", state.active_model, state.effort)
+                        };
+                        show_static_view(&updates, "Active model", vec![active]).await
+                    }
+                    TuiAction::SelectModel(model) => handler.select_model(model, updates).await,
+                    TuiAction::SelectAndPrompt { model, prompt } => {
+                        handler.select_model(model, updates.clone()).await?;
+                        handler.submit_prompt(prompt, updates).await
+                    }
+                    TuiAction::ShowSkills => handler.show_skills(updates).await,
+                    TuiAction::ToggleSkill(skill) => handler.toggle_skill(skill, updates).await,
+                    TuiAction::SetEffort(effort) => handler.set_effort(effort, updates).await,
+                    TuiAction::ConfigureEffect(effect) => {
+                        handler.configure_effect(effect, updates).await
+                    }
+                    TuiAction::Compact => handler.compact(updates).await,
+                    TuiAction::SetPermissions(mode) => handler.set_permissions(mode, updates).await,
+                    TuiAction::Resume(dag_id) => handler.resume(dag_id, updates).await,
+                    TuiAction::RunTriad(goal) => handler.run_triad(goal, updates).await,
+                    TuiAction::ShowStatus => handler.show_status(updates).await,
+                    TuiAction::ShowInbox => handler.show_inbox(updates).await,
+                    TuiAction::ShowDiff => handler.show_diff(updates).await,
+                    TuiAction::Review(focus) => handler.review(focus, updates).await,
+                    TuiAction::SetTheme(theme) => handler.set_theme(theme, updates).await,
+                    TuiAction::UnknownCommand(command) => {
+                        Err(format!("unknown slash command: {command}").into())
+                    }
+                    TuiAction::Clear => {
+                        let mut state = handler.state.lock().await;
+                        state.history.clear();
+                        state.last_dag_request = None;
+                        state.last_dag_result = None;
+                        state.tokens_in = 0;
+                        state.tokens_out = 0;
+                        state.context_window = None;
+                        state.current_context_tokens = None;
+                        state.seen_usage_requests.clear();
+                        state.usage_known_seen = false;
+                        state.usage_unknown_seen = false;
                         Ok(())
                     }
+                    TuiAction::Help => show_static_view(&updates, "Help", help_lines()).await,
+                    TuiAction::Quit => Ok(()),
                 }
-                TuiAction::ExitDag => send_transcript(&updates, "DAG mode exited").await,
-                TuiAction::ShowOverview => handler.show_overview(updates).await,
-                TuiAction::ShowWorkBoard(limit) => handler.show_workboard(limit, updates).await,
-                TuiAction::RunCouncil(proposal) => handler.run_council(proposal, updates).await,
-                TuiAction::ShowVotes(collaboration_id) => {
-                    handler.show_votes(collaboration_id, updates).await
+            };
+            let result = match (legacy_run.as_deref(), legacy_updates) {
+                (Some(id), Some(receiver)) => {
+                    final_handler
+                        .relay_legacy_action(id, execution, receiver, &final_updates)
+                        .await
                 }
-                TuiAction::ShowRecovery(job_id) => handler.show_recovery(job_id, updates).await,
-                TuiAction::ShowPrompts(selector) => handler.show_prompts(selector, updates).await,
-                TuiAction::Back => Ok(()),
-                TuiAction::ShowModels => handler.show_models(updates).await,
-                TuiAction::ShowActiveModel => {
-                    let active = {
-                        let state = handler.state.lock().await;
-                        format!("{}:{}", state.active_model, state.effort)
-                    };
-                    show_static_view(&updates, "Active model", vec![active]).await
-                }
-                TuiAction::SelectModel(model) => handler.select_model(model, updates).await,
-                TuiAction::SelectAndPrompt { model, prompt } => {
-                    handler.select_model(model, updates.clone()).await?;
-                    handler.submit_prompt(prompt, updates).await
-                }
-                TuiAction::ShowSkills => handler.show_skills(updates).await,
-                TuiAction::ToggleSkill(skill) => handler.toggle_skill(skill, updates).await,
-                TuiAction::SetEffort(effort) => handler.set_effort(effort, updates).await,
-                TuiAction::ConfigureEffect(effect) => {
-                    handler.configure_effect(effect, updates).await
-                }
-                TuiAction::Compact => handler.compact(updates).await,
-                TuiAction::SetPermissions(mode) => handler.set_permissions(mode, updates).await,
-                TuiAction::Resume(dag_id) => handler.resume(dag_id, updates).await,
-                TuiAction::RunTriad(goal) => handler.run_triad(goal, updates).await,
-                TuiAction::ShowStatus => handler.show_status(updates).await,
-                TuiAction::ShowInbox => handler.show_inbox(updates).await,
-                TuiAction::ShowDiff => handler.show_diff(updates).await,
-                TuiAction::Review(focus) => handler.review(focus, updates).await,
-                TuiAction::SetTheme(theme) => handler.set_theme(theme, updates).await,
-                TuiAction::UnknownCommand(command) => {
-                    Err(format!("unknown slash command: {command}").into())
-                }
-                TuiAction::Clear => {
-                    let mut state = handler.state.lock().await;
-                    state.history.clear();
-                    state.last_dag_request = None;
-                    state.last_dag_result = None;
-                    state.tokens_in = 0;
-                    state.tokens_out = 0;
-                    state.context_window = None;
-                    state.current_context_tokens = None;
-                    state.seen_usage_requests.clear();
-                    state.usage_known_seen = false;
-                    state.usage_unknown_seen = false;
-                    Ok(())
-                }
-                TuiAction::Help => show_static_view(&updates, "Help", help_lines()).await,
-                TuiAction::Quit => Ok(()),
+                _ => execution.await,
+            };
+            if let Some(id) = legacy_run {
+                final_handler
+                    .finish_legacy_building(&id, &result, &final_updates)
+                    .await;
             }
+            result
         })
     }
 
@@ -452,7 +532,7 @@ impl AppHandler {
             "nodes": dag_request_nodes(&plan, &skill_context),
             "workspace_dir": self.workspace,
             "plan_only": !execute,
-            "timeout_seconds": 3600.0,
+            "timeout_seconds": 0.0,
             "max_input_bytes": 256000,
             "resume_dag_id": resume_id
         });
@@ -547,6 +627,15 @@ impl AppHandler {
         updates: &mpsc::Sender<TuiUpdate>,
     ) -> Result<()> {
         match event {
+DagExecutionEvent::ProjectionLagged { dropped_events } => {
+    send_transcript(
+        updates,
+        format!(
+            "Live progress lagged: {dropped_events} intermediate updates omitted; refresh from settled/final state."
+        ),
+    )
+    .await
+}
             DagExecutionEvent::WaveStarted {
                 wave_index,
                 node_ids,
@@ -838,6 +927,55 @@ impl AppHandler {
         let value =
             crate::workbench::recovery(&self.gateway.state_root, &self.workspace, job_id).await?;
         show_static_view(&updates, "Recovery observations", recovery_summary(&value)).await
+    }
+
+    async fn run_research(
+        &self,
+        arguments: String,
+        updates: mpsc::Sender<TuiUpdate>,
+    ) -> Result<()> {
+        let request = crate::research_cli::ResearchArgs::parse_tui(&arguments)?
+            .into_request(self.workspace.clone())
+            .await?;
+        if request.plan_only || (request.sources.is_empty() && request.active_discovery().is_none())
+        {
+            return self.show_research_plan(request, updates).await;
+        }
+        let mut workflow = crate::workspaces::WorkflowRequest::new(
+            request.question.clone(),
+            self.workspace.clone(),
+            vec![crate::workspaces::WorkspaceKind::Research],
+        );
+        if let Some(id) = &request.request_id {
+            workflow.request_id = Some(format!(
+                "wfl-{}",
+                crate::routing::digest_output(id)
+                    .trim_start_matches("sha256:")
+                    .get(..32)
+                    .ok_or("research identity digest malformed")?
+            ));
+        }
+        workflow.timeout_seconds = request.budget.timeout_seconds;
+        workflow.research = Some(request);
+        self.run_workspace_request(workflow, updates).await
+    }
+
+    async fn show_research_status(
+        &self,
+        request_id: String,
+        updates: mpsc::Sender<TuiUpdate>,
+    ) -> Result<()> {
+        let request_id = request_id.trim();
+        if request_id.is_empty() || request_id.split_whitespace().count() != 1 {
+            return Err("usage: /research-status <request_id>".into());
+        }
+        let response = crate::research::status(&self.gateway, &self.workspace, request_id).await?;
+        show_static_view(
+            &updates,
+            "Research observation",
+            crate::research_cli::report_lines(&response),
+        )
+        .await
     }
 
     async fn show_prompts(
@@ -1650,8 +1788,10 @@ async fn run_configured(
     let gateway = Gateway::new(state_root);
     let handler_workspace = workspace.clone();
     let handler = tokio::task::spawn_blocking(move || {
-        AppHandler::new(gateway, handler_workspace)
-            .map(|h| h.with_worktree_default(worktree_default))
+        AppHandler::new(gateway, handler_workspace).map(|h| {
+            h.with_worktree_default(worktree_default)
+                .with_scoped_legacy_projection()
+        })
     })
     .await??;
     handler.ensure_baseline_manifest().await;
@@ -1676,7 +1816,10 @@ pub fn initial_existing_session_input(
     input: &str,
 ) -> Result<bool> {
     match resolved_initial_action(workspace, home, input)? {
-        TuiAction::ShowRecovery(_) | TuiAction::Resume(_) => Ok(true),
+        TuiAction::ShowRecovery(_)
+        | TuiAction::Resume(_)
+        | TuiAction::ShowWorkflowStatus(_)
+        | TuiAction::CancelWorkflow(_) => Ok(true),
         TuiAction::RunDag(goal)
         | TuiAction::PlanDag(goal)
         | TuiAction::AutoDag(goal)
@@ -1767,15 +1910,21 @@ async fn command_configured(
         action
     };
     let (updates_tx, mut updates_rx) = mpsc::channel(256);
-    let mut dispatch = handler.dispatch(action, updates_tx);
+    let (cancel, cancellation) = tokio::sync::watch::channel(false);
+    let dispatch =
+        crate::supervisor::scope_cancellation(cancellation, handler.dispatch(action, updates_tx));
+    let signal = tokio::signal::ctrl_c();
+    tokio::pin!(dispatch, signal);
+    let mut signal_result = None;
     let mut updates = Vec::new();
     let dispatch_result = loop {
         tokio::select! {
-            maybe_update = updates_rx.recv() => {
-                if let Some(update) = maybe_update {
-                    updates.push(update);
-                }
+            biased;
+            result = &mut signal, if signal_result.is_none() => {
+                signal_result = Some(result);
+                let _sent = cancel.send(true);
             }
+            Some(update) = updates_rx.recv() => updates.push(update),
             result = &mut dispatch => {
                 while let Ok(update) = updates_rx.try_recv() {
                     updates.push(update);
@@ -1785,5 +1934,8 @@ async fn command_configured(
         }
     };
     let shutdown_result = handler.gateway.shutdown().await;
+    if let Some(result) = signal_result {
+        result?;
+    }
     dispatch_result.and(shutdown_result).map(|()| updates)
 }

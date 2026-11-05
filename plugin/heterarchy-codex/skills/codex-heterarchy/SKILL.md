@@ -1,37 +1,36 @@
 ---
 name: codex-heterarchy
-description: Rust hcodex로 Argon·Claude Medium·Codex의 Tri-Polar 협업, 동적 DAG·노드 인계·조직 작업판·Review Council을 운영하고 실제 모델 영수증·소스 최신성·미확정 결과를 판독한다.
+description: Rust hcodex CLI·TUI와 공통 백엔드로 Argon·Claude Medium·Codex의 Tri-Polar 협업, 동적 DAG·노드 인계·리서치 보고서·조직 작업판·Review Council을 운영하고 실제 모델 영수증·소스 최신성·미확정 결과를 판독한다.
 ---
 
 # Rust Heterarchy Codex
 
-이 스킬은 Rust `hcodex` MCP를 사용해 Argon의 거시 설계, Claude의 정밀 구현, Codex의 적대적 감사를 결합한다. 실제 `receipt`, `evidence_scope`, 역할 상태, 합의 상태만 근거로 판정한다.
+이 스킬은 Rust `hcodex` CLI·TUI가 직접 호출하는 공통 백엔드로 Argon의
+거시 설계, Claude의 정밀 구현, Codex의 적대적 감사를 결합한다. hcodex
+자체 MCP 서버나 별도 네트워크 서비스를 전제로 하지 않는다.
 
 ## 시작 전 확인
 
-1. `codex_bridge_health`에서 실제 routable 모델과 독립 인증 경계를 확인한다.
-2. 대상 workspace와 파일·심볼을 명시한다. 생략 시 Rust relevance/CodeGraph 탐색 결과를 확인한다. CLI 기능은 실제 선택된 `hcodex --help`와 대상 소스로 확인한다. 모델 연결 health만으로 새 CLI 기능까지 설치됐다고 판단하지 않는다.
-3. write 작업은 DAG의 declared `write_files`, preimage SHA-256, 검증 명령을 고정한다.
-4. provider timeout은 같은 ID로 조회한다. 다른 ID로 자동 재시도하지 않는다.
-
-## 16개 MCP 도구
-
-- Codex 실행: `codex_adversarial_audit`, `codex_targeted_synthesize`, `codex_differential_implementations`, `codex_rescue_sandbox`, `codex_git_review`, `codex_session_followup`
-- 작업 상태: `codex_job_status`, `codex_job_list`
-- 핸드오프: `heterarchy_handoff_create`, `heterarchy_handoff_inbox`, `heterarchy_handoff_resolve`
-- 협업: `claude_code_craft`, `heterarchy_triad_orchestrate`, `codex_alexandria_decision_pack`
-- DAG: `heterarchy_dag_ulw`
-- 상태: `codex_bridge_health`
+1. 실제 선택된 `hcodex --version`, `hcodex --help`, `hcodex status`를 확인한다.
+2. 대상 workspace와 파일·심볼을 명시한다. 생략 시 Rust relevance/CodeGraph
+   탐색 결과를 확인한다.
+3. write 작업은 DAG의 declared `write_files`, preimage SHA-256, 검증 명령을
+   고정한다.
+4. provider timeout은 원래 ID로 조회한다. 다른 ID로 자동 재시도하지 않는다.
 
 ## 절대 판정 규칙
 
 - `requested_model != actual_model`이면 성공으로 취급하지 않는다.
 - `rejected_pre_dispatch`는 provider 호출이 발생하지 않은 확정 실패다.
-- `timed_out_unknown`은 성공도 실패도 아니다. `codex_job_status(job_id=...)`로 조회·취소한다.
-- 핸드오프 생성은 `queued`이며 실행 완료나 합의가 아니다.
-- 필수 Argon·Claude·Codex 역할 모두가 `succeeded`, 비어 있지 않은 검토 artifact, 명시적 `PASS|WARN|BLOCK`를 가져야 합의를 계산할 수 있다.
-- `BLOCK`은 red-team block이며 승인으로 바꾸지 않는다. 모든 역할이 `WARN`이어도 `review_approved=false`다.
-- caller가 전달한 테스트 명령은 `caller_reported`이고 `test_execution=not_run`이다. bridge가 직접 실행한 성공 영수증만 verified다.
+- `timed_out_unknown`은 성공도 실패도 아니다. `hcodex jobs`와
+  `hcodex recovery <job_id>` 또는 TUI 대응 명령으로 원래 ID를 조회한다.
+- 핸드오프 `queued`는 실행 완료나 합의가 아니다.
+- 필수 Argon·Claude·Codex 역할 모두가 실제 성공 영수증, 비어 있지 않은
+  검토 artifact, 명시적 `PASS|WARN|BLOCK`를 가져야 합의를 계산한다.
+- `BLOCK`은 승인으로 바꾸지 않는다. 모든 역할이 `WARN`이어도
+  `review_approved=false`다.
+- caller가 전달한 테스트 명령은 실행 증거가 아니다. hcodex가 직접 실행한
+  성공 영수증만 verified다.
 
 ## 권장 라우팅
 
@@ -40,127 +39,207 @@ description: Rust hcodex로 Argon·Claude Medium·Codex의 Tri-Polar 협업, 동
 - 감사·합성: `gpt-6-terra|luna|sol|astra`, `gpt-6.1-terra|sol`
 - Claude low/high tier, GPT 5.x, provider/engine mismatch는 실행 전에 거부한다.
 
-## Triad
+실제 제공 모델은 매번 `hcodex models` 또는 TUI `/models`로 확인한다.
 
-`heterarchy_triad_orchestrate`의 `pipeline`은 Claude → Codex → Argon 순서다. `council`은 역할을 병렬 실행하고 판정 충돌을 별도 상태로 남긴다.
+## 실행 표면
 
-- `max_rounds=1..3`: WARN/BLOCK 수리·재감사를 bounded하게 수행한다.
-- `resume_collaboration_id`: workspace, task digest, 파일 digest, snapshot fence가 일치하는 성공 역할만 재사용한다.
-- `run_verification_gates=true`: repository canonical gate를 bridge가 직접 실행한다.
-- Argon handoff가 pending이거나 어떤 역할이 미확정이면 `partial` + `incomplete_no_consensus`다.
+```bash
+hcodex --workspace /path/to/repo status
+hcodex --workspace /path/to/repo argon "아키텍처 검토"
+hcodex --workspace /path/to/repo sonnet "구현 검토"
+hcodex --workspace /path/to/repo opus "심층 구현 검토"
+hcodex --workspace /path/to/repo dag-ulw --plan-only "목표"
+hcodex --workspace /path/to/repo dag-run "목표"
+```
+
+Codex 기본 모델을 직접 사용할 때는 TUI에서 `/use codex-default` 후 `/ask`를
+사용한다. 설치본의 help에 없는 명령을 추정해서 호출하지 않는다.
 
 ## DAG-ULW++
 
-`heterarchy_dag_ulw`는 목표와 실제 source structure로 4~8 nodes, 2~4 waves를 만든다.
-
 - plan-only로 topology와 WAW/RAW/WAR/cycle/path hazard를 먼저 확인한다.
-- wave/layer는 표시용이다. 검증된 의존성이 충족된 노드를 빈 슬롯에 즉시 배치하며, 공유 workspace의 쓰기는 독점 실행한다.
-- 후속 노드는 선행 노드의 검증 영수증·제한된 결과 요약을 받는다. resume도 같은 영수증을 사용한다.
-- TUI는 실행·STOPPED·검증·경과 시간을 실시간 표시한다. provider 토큰·도구 호출 본문 스트리밍은 아직 제공하지 않는다.
-- interactive 실행은 검증된 spawn plan을 만든 뒤 같은 canonical request path를 사용한다.
-- write lane의 Claude artifact는 `{edits:[{path,preimage_sha256,new_content}]}` closed JSON이어야 한다.
-- traversal, symlink, scope 밖 파일, stale preimage, provider의 선행 mutation을 거부한다.
-- provider 완료는 `STOPPED`일 뿐이다. 실제 gate와 전체 manifest 검증 뒤에만 `SETTLED`다.
-- direct/serial checkpoint resume은 plan/config/source identity가 일치할 때만 settled node를 재사용한다. worktree resume는 영속 소유권과 검증된 frontier가 있는 기존 캠페인에 한정한다.
+- 검증된 의존성이 충족된 노드를 빈 슬롯에 즉시 배치하며 공유 workspace의
+  쓰기는 독점 실행한다.
+- 후속 노드는 선행 노드의 실제 소스 상태, 검증 영수증과 제한된 인계 기록을
+  받는다. 요약문만으로 소스 전달을 대신하지 않는다.
+- TUI는 노드·provider·검증·settlement를 soft-realtime으로 표시한다. SQLite
+  job/checkpoint가 권위이고, 중간 화면 이벤트가 지연되면 `ProjectionLagged`와
+  `live_projection.resync_required`를 확인한 뒤 저장 상태를 다시 읽는다.
+- provider 완료는 `STOPPED`다. 실제 gate와 전체 manifest 검증 뒤에만
+  `SETTLED`다.
+- Argon/Claude가 child-agent 실행을 서술해도 독립 도구 영수증이 없으면
+  별도 에이전트 완료로 세지 않는다.
 
 ## 이름 있는 세션과 노드 worktree
 
-설치본의 `hcodex --help`에 `--worktree-name`이 있는지 먼저 확인한다. 소스에 기능이 있어도 실행 파일·기존 MCP 프로세스가 갱신됐다는 뜻은 아니다. 스킬 갱신과 설치/재시작 결과는 따로 검증한다.
-
 ```bash
 hcodex --worktree-name feature-auth
+hcodex --worktree-name feature-auth dag-ulw --plan-only "목표"
+hcodex dag-run --worktree "목표"
 ```
 
-이 명령은 이름 있는 작업 공간을 생성/다시 열고 TUI에 진입한다. 그 세션에서 `/dag-mode`를 켜거나 DAG를 실행하면 노드별 worktree 모드가 기본 적용된다. 계획만 보려면 `hcodex --worktree-name feature-auth dag-ulw --plan-only "목표"`를 사용한다. 이름은 영문·숫자·`-`·`_` 1~64자이며 원본 저장소와 외부 state root별로 구분한다. 이름은 Git branch 자동 생성 요청이 아니다.
+- 새 session/DAG 생성 전 원본 작업 폴더의 staged·unstaged·untracked 상태가
+  모두 clean해야 한다. stash, reset, 자동 commit이나 dirty 복사로 우회하지
+  않는다.
+- 모든 pending 노드 worktree를 clean 시작점에 미리 생성한다.
+- `1 → 2 → 3`에서는 1의 검증된 수정·새 파일이 2의 baseline에, 2의 변경까지
+  누적된 전체 상태가 3의 baseline에 전달된다.
+- canonical 반영은 직렬화하고 isolated gate와 반영 대상 gate·manifest가 모두
+  통과해야 `SETTLED`다.
+- 체크포인트, 결과 export, 소유 process group 종료와 정확한 작업 공간 증거가
+  확인된 노드만 정리한다. unknown·drift·부분 정리는 경로와 원래 ID를 보존한다.
+- 최종 변경이 모인 이름 있는 session은 자동 삭제하지 않는다.
 
-이름 있는 세션을 사용하지 않을 때는 `/dag-run --worktree <goal>` 또는 `hcodex dag-run --worktree "목표"`로 명시한다. MCP의 `heterarchy_dag_ulw`에는 다음 spawn plan과 `plan_only=false`를 전달한다.
+## 재개와 복구
 
-```json
-{"plan_summary":"검증된 노드별 작업 공간","hazard_acknowledgment":true,"isolation_mode":"worktree","max_parallel_per_wave":3}
+```bash
+hcodex --workspace /path/to/existing/workspace resume cdx-campaign-id
+hcodex --workspace /path/to/repo recovery cdx-job-or-campaign-id
 ```
 
-- 생성 전 **원본 작업 폴더 자체**의 staged·unstaged·untracked 상태가 모두 clean해야 한다. 기준 커밋만 clean한 것으로 대체하거나 dirty 파일 복사·stash·reset·자동 commit으로 우회하지 않는다. 이름 있는 공간을 다시 열 때 원본은 clean이어야 하며, 그 공간의 변경은 그대로 보존한다. 새 DAG 시작 시에는 해당 공간도 clean해야 한다.
-- hcodex가 모든 pending 노드의 worktree를 clean한 시작 시점에 미리 생성하고 에이전트에 배정한다. 에이전트에게 임의 Git 분기·병합·삭제를 맡기지 않는다.
-- `1 → 2 → 3`에서는 1의 검증된 수정·새 파일을 포함한 전체 소스 상태가 2에, 2의 변경까지 누적된 상태가 3에 전달된다. 파일 baseline과 검증 영수증이 함께 필요하며 요약문만으로 상태 전달을 대신하지 않는다. 실패·미확정 선행 결과는 실행 의존성을 충족하지 않는다.
-- 노드 worktree와 빌드 산출물은 분리한다. canonical 반영은 직렬화하며, isolated gate뿐 아니라 반영 대상의 gate와 manifest도 통과해야 SETTLED다. 이름 있는 세션에서는 이 반영 대상이 이름 있는 작업 공간이며 원래 parent checkout은 자동 수정하지 않는다.
-- 체크포인트·전체 결과 export의 저장, 소유 process group 종료, 정확한 작업 공간/등록 identity와 파일 증거가 확인된 노드만 정리한다. `owned_processes_closed`는 해당 소유 그룹의 부재 증거이며 임의로 그룹을 탈출한 자손까지 보장하는 OS sandbox 증거가 아니다.
-- 실패·unknown·예상 밖 변경·저장 오류는 원래 ID와 경로를 보존한다. `cleanup_unknown`은 삭제/보존을 단정하지 말고 DAG 결과와 `worktree_state_path`·lifecycle 보고서로 확인한다. TTL이나 오류 후 강제 삭제로 종료를 꾸미지 않는다.
-- 최종 변경이 모인 이름 있는 세션은 자동 삭제하지 않는다. 다음 실행을 위해 clean 상태가 필요해도 사용자의 commit/정리 권한 범위를 유지한다. 같은 이름으로 재열기는 기존 소스를 초기화하거나 parent HEAD로 갱신하지 않는다.
-- 첫 버전은 Unix와 일반 Git checkout을 대상으로 한다. submodule·sparse·소스 symlink, 원본 내부 state root 등 지원하지 않는 입력은 오류이며 direct로 자동 전환하지 않는다. worktree는 네트워크·인증·공유 Git 저장소의 격리가 아니다.
-- worktree `resume_dag_id`로 미확정 provider를 새 ID에 재전송하지 않는다. 원래 캠페인/provider ID를 조회한다. 동일 worktree 요청 ID는 기존 결과 조회용이며 workspace/config가 달라지면 거절한다.
-
-`hcodex --workspace /path/to/existing/workspace resume <campaign_id>` 또는 TUI `/resume <campaign_id>`는 저장된 정확한 계획·모델·스킬 본문·요청 설정으로 새 continuation을 만든다. `/dag-run --resume <campaign_id>`도 같은 경로이며 새 목표를 덧붙이지 않는다. Named session은 먼저 정상적으로 열어 그 안에서 `/resume`하거나 기존 세션 경로를 `--workspace`로 지정한다. 초기 resume와 `--worktree-name` 조합은 새 공간을 만들기 전에 거절한다.
-
-- 새 worktree를 만들지 않고 원래 미리 생성한 retained 노드를 재연다. HEAD/index와 고정된 최신 소스·private 인벤토리, Git/파일 identity, owner digest 및 frontier를 검증한다. 검증된 자기 변경도 저장값과 전수 일치해야 한다.
-- 준비·admission은 효과 전에 기록한다. 체크포인트 부재만으로 미실행을 추정하지 않으며, 원래 owner에 속한 stable provider ID가 이미 있으면 pending 노드를 다시 보내지 않는다.
-- checkpointed `SETTLED`와 확실히 미착수인 pending만 재개한다. 부분 반영·Preparing/Admitted·유실/모순·부분 cleanup은 보존 후 거절한다. 과거 owner 없는 worktree 기록에 권한을 소급하지 않는다.
-- 원본이 clean해야 하는 새 생성 조건은 유지된다. `ownership.json`의 bounded 인벤토리와 기존 계획 checkpoint의 한 개 request recipe는 재개 증거이며 transcript 저장소가 아니다.
-
-소스가 있는 경우 자세한 계약은 `docs/dag-worktree-mode.md`를 확인한다. 구간 패치와 `.hcodex/changes/` 단일 파일 복구는 별도 라이브러리 실험이다. 실제 DAG의 쓰기 artifact는 위 full-file `edits` 계약이며, 스킬이 자동 파일 적용·복구나 배포 권한을 추가하지 않는다.
+TUI는 `/resume <campaign_id>`, `/recovery <job_id>`를 사용한다. Resume은 저장된
+정확한 계획·모델·스킬 본문·설정과 verified frontier를 사용한다. 미확정 provider를
+새 ID로 보내지 않는다. 준비·admission·부분 반영·소유권 모순이 있으면 보존 후
+거절한다. Recovery는 조회 전용이며 DB 초기화, 모델 호출, 삭제, 재전송이나 재개
+권한을 만들지 않는다.
 
 ## 조직 작업판과 Review Council
-
-작업 진행과 검토를 채팅 transcript에만 의존하지 않는다. CLI 또는 TUI에서 저장된 상태를 조회하고 실제 Review Council 판정을 분리한다.
 
 ```bash
 hcodex --workspace /path/to/repo board --limit 20
 hcodex --workspace /path/to/repo council --file src/lib.rs --file README.md "검토 제안"
 hcodex --workspace /path/to/repo votes cdx-collaboration-id
-hcodex --workspace /path/to/repo recovery cdx-campaign-id
 ```
 
-TUI 명령은 `/board [limit]`, `/council --file relative.rs -- <proposal>`, `/votes <collaboration_id>`다. TUI의 file path에는 공백을 쓸 수 없고 native CLI에서는 인용할 수 있다. 파일 범위 없는 `council <proposal>`은 정책 토론에는 사용할 수 있지만 source freshness가 `unknown`이며 현재 소스 승인 근거가 아니다.
+- `board`와 `votes`는 저장 상태만 읽고 모델을 호출하지 않는다.
+- `council`은 실제 세 역할 검토를 실행한다. queued/running 역할은 투표가 아니다.
+- 파일 범위 없는 council은 정책 토론에는 사용할 수 있지만 source freshness는
+  `unknown`이며 현재 코드 승인 근거가 아니다.
+- `current_scoped`는 열거한 파일의 현재 SHA-256만 판독한다. 전체 workspace,
+  provider E2E, native UI나 배포 검증이 아니다.
 
-- `board`는 현재 workspace의 campaign, checkpoint, node handoff, council 상태를 읽는다. 모델 호출이나 새 plan 생성을 하지 않는다.
-- `council`은 기존 `heterarchy_triad_orchestrate(mode=council)`를 사용한다. queued/running 역할은 투표가 아니다.
-- `votes`는 역할별 실제 job ID, requested/actual model, 구조화 verdict, artifact identity를 확인한다. 같은 실제 실행을 여러 독립 표로 세지 않는다.
-- v1은 `PASS|WARN|BLOCK` **검토 판정**이다. A/B 선택 투표가 아니다. 필수 역할의 quorum이 필요하고 `BLOCK`은 다수결로 덮지 않으며 전원 `WARN`도 승인되지 않는다.
-- `current_scoped|stale|unknown`은 검토가 실제로 열거한 파일 범위의 현재 SHA-256만 판독한다. `current_scoped`도 전체 workspace·provider·GUI·배포 검증이 아니다. stale/unknown 표는 현재 승인 근거가 아니다.
+## TUI 조사·기획·개발 작업 공간
 
-`SETTLED` 노드는 기존 checkpoint 안에 한 개의 hash-bound 인계 기록을 남긴다. verified system facts와 agent-reported decisions/caveats를 구분하고, 직접 부모·필요한 조상은 scoped checkpoint reference로 연결한다. hcodex가 참조를 검증해 모든 provider 프롬프트를 구성한다. 필수 기록이 없거나 입력 예산을 넘으면 `context_not_ready`이며 이력을 조용히 자르지 않는다.
+```text
+/space research
+/space planning
+/space building
+/research -- 조사할 질문
+/planning --from <research_id> -- 기획 목표
+/building --plan <plan_id>
+/workflow --through planning -- 조사하고 기획
+/workflow --stages planning,building -- 기획하고 개발
+/workflow --through building -- 조사·기획·개발
+/workflow-status <flow_id>
+/workflow-cancel <flow_id>
+```
 
-동일 checkpoint의 정확한 재생은 기존 record를 바꾸지 않고, 같은 ID의 다른 내용·범위는 conflict다. 완료·실패·취소·미확정 provider job은 일반 retry 플래그로 다시 실행하지 않고 원래 ID로 조회한다. history record는 읽되 없는 request identity를 소급 생성하지 않는다.
+- 세 공간은 독립 실행하거나 명시한 순서로 연결한다. 기본 `/workflow`는 조사·기획까지며,
+  Building은 명시적으로 포함한 요청에만 실행한다. 기존 `/plan`·`/dag-plan` 의미는 유지한다.
+- `Alt+1/2/3`으로 공간을 바꿀 수 있다. Research·Planning 공간의 일반 입력은 해당 작업으로
+  보내며 DAG mode보다 우선한다. Building의 기존 입력 동작과 숫자 단축키는 유지한다.
+- 선택한 공간은 함께 예약한다. 실행 ID가 다른 늦은 결과가 다른 공간이나 새 작업을 덮지 않는다.
+- 조사·기획 모델 cwd와 상태 저장소는 원본 저장소 밖이다. 출처는 실제 원본 파일에 묶는다.
+- Planning은 실제 모델의 닫힌 proposal을 저장한다. `BuildReady`는 schema·source/reference·path·
+  dependency·지원 gate·DAG 조건을 검사한 상태이며 의미상 승인이나 실행 검증이 아니다.
+- Building은 정확한 저장 plan ID/digest와 원본 source manifest를 다시 확인하고, 원본이 staged·
+  unstaged·untracked 모두 clean일 때 기존 node worktree 경계로 들어간다. 조사/기획을 보존하며
+  dirty를 stash/reset/자동 commit으로 우회하지 않는다. 현재 소스가 달라지면 기획을 다시 만든다.
+- 후속 단계에는 요약만이 아니라 저장된 조사 근거·기획 범위·완료 조건과 실제 source/handoff를
+  전달한다. 알려진 incomplete evidence는 기획에 공백을 남겨 전달하지만 unknown/cancelled는 멈춘다.
+- 동일 flow ID는 재실행하지 않는다. `/workflow-status`는 원래 산출물을 조회·복원하며 초안이나
+  활성 탭의 재시작 복원을 약속하지 않는다. 취소는 현재 소유 Gateway에서만 신호·회수를 수행한다.
 
-현재 Argon/Claude RPC는 `{model,prompt}` 텍스트 호출이며 child-agent 도구 영수증을 노출하지 않는다. 모델이 위임했다고 서술해도 독립 실행 증거로 세지 않는다. DAG 병렬 실행도 현재 최대 6개이므로 8-agent 조직을 제품 보장으로 보고하지 않는다.
+## 리서치 모드
 
-상세 운영 계약은 소스 저장소의 `docs/organization-workbench.md`를 확인한다.
+개발 DAG와 별도로 코드·로컬 기술 문서·공개 HTTPS 자료를 조사한다. 질문만
+주면 한 번의 제한된 native Codex 웹 탐색으로 후보 URL을 찾고, host가 본문을
+직접 수집·검증한 자료만 조사·반론·종합 단계의 근거로 사용한다.
 
-## 복구 상태 조회
+```bash
+hcodex --workspace /path/to/repo research -- "질문만으로 공개 자료 조사"
+hcodex --workspace /path/to/repo research --file src/lib.rs --document docs/spec.md --url https://example.com/spec --request-id research-contracts -- "계약과 한계 비교"
+hcodex --workspace /path/to/repo research --web --file src/lib.rs -- "코드와 최신 공개 자료 비교"
+hcodex --workspace /path/to/repo research --no-web -- "출처 없이 계획만 확인"
+hcodex --workspace /path/to/repo research-status research-contracts
+```
 
-`hcodex recovery <job_id>` 또는 TUI `/recovery <job_id>`는 정확한 기존 작업 ID의 상태와 worktree 관측을 조회한다. `Store::open` 초기화·stale-running 정산, 모델 호출, 삭제·재전송·resume를 수행하지 않는다. 없는 state/DB는 만들지 않으며 `--worktree-name`과의 조합은 거절한다.
+TUI는 `/research [옵션] -- 질문`, `/research-status <request_id>`를 사용한다.
+TUI 경로에 공백이 있으면 native CLI의 인용된 옵션을 사용한다.
+`--plan-only`는 검색 의도를 포함한 계획만 반환하며 source fetch, provider 호출,
+DB 초기화를 하지 않는다. 질문만 있는 요청은 기본 웹 탐색을 사용한다. 명시한
+출처만 사용하려면 `--no-web`을 선택하며, 이때 출처 없는 요청은 누락 입력 계획을
+반환한다. 크롤링·PDF 파싱·과거 시점 증명은 제공하지 않는다.
 
-`present_registered`·`observed_removed`·`unknown`은 현재 관측이며 과거 verified/removed·프로세스 종료 영수증과 구별한다. 관측은 소유권·정리 안전성·재개 승인이 아니다. 행·스키마를 수정하거나 checkpoint를 요청하지 않지만 SQLite의 정상적인 WAL/SHM 잠금 조정은 가능하다. 여러 자원의 원자적 snapshot이나 모든 파일의 바이트 불변을 주장하지 않는다. 자료 누락·변동·모순은 unknown으로 남기고 원래 ID를 유지한다.
+- 웹 탐색은 기본 `gpt-6.1-sol/high`, 관측 가능한 `web_search` 이벤트 최대 3개,
+  후보 URL 6개, host가 받아들인 source 최소 2개, 60초 제한을 사용한다. 하드
+  한도는 이벤트 6개와 후보 12개다. 이벤트 수는 provider 내부 query 확장 수를
+  증명하지 않는다.
+- 명시 출처가 있는 요청은 기본적으로 검색하지 않는다. 같은 요청에서 공개 자료도
+  찾으려면 `--web`을 사용하고, 지원되는 경우 `--search-model`로 탐색 모델을
+  지정한다.
+- 탐색은 빈 임시 디렉터리와 read-only sandbox에서 실행하고 알려진 shell·파일
+  실행·MCP·multi-agent 기능 경로를 끈다. 정확한 native `web_search` 완료 이벤트,
+  실제 모델 identity와 소유 process group 종료를 확인할 수 없으면 분석을 시작하지
+  않는다. 예상하지 않은 tool 이벤트도 원래 탐색 ID 아래 실패로 보존한다.
+- 후보 URL은 완료된 `web_search` 이벤트의 `results[].url`에 실제 포함된 주소와
+  정규화 후 일치해야 한다. 자유 형식 model 출력은 후보를 추가할 수 없다.
+  hcodex DB·보고서는 검색 query·snippet·reasoning을 복사하거나 citation으로
+  사용하지 않는다. native Codex session은 provider 자체 정책에 따라 실행 증거를
+  보존할 수 있다. 후보는 host의 DNS/IP·redirect 검증과 본문 수집을 통과해
+  source/excerpt 영수증이 생긴 뒤에만 evidence가 된다.
+- 발견한 후보의 수집 실패는 optional rejection으로 남는다. 사용자가 명시한 출처의
+  실패는 계속 required failure이며, 설정된 최소 accepted source를 충족하지 못하면
+  investigator를 호출하지 않는다.
+- 탐색 ID는 parent와 versioned effective 설정에 묶이고 완료 영수증과 canonical
+  후보를 fetch 전에 저장한다. 같은 request ID는 검색·수집·분석을 반복하지 않으며
+  timeout/unknown을 새 ID로 자동 재전송하지 않는다.
 
-## 설치와 CLI
+- `--file`·`--document`는 workspace 상대 경로, `--url`은 명시 HTTPS source다.
+- 실제 source 관측 시각·본문 해시·제한된 excerpt와 위치를 host가 기록한다.
+  모델이 말한 URL은 관측 source가 아니다.
+- `--investigator MODEL`은 1~3개 조사 lane을 지정하며, challenger와
+  synthesizer도 선택한다. 같은 모델을 쓰더라도 서로 다른 실제 job ID가 필요하다.
+- 보고서는 source/excerpt ID가 연결된 claim으로 host가 렌더링한다.
+  미확정·반박·상충 근거는 보존하고, 자유 형식 advisory를 검증된 본문으로 바꾸지 않는다.
+- 인용·해시·참조 무결성과 의미상 진실은 별개다. 후자는
+  `NOT_MECHANICALLY_PROVEN`이며 표 수나 agent 동의로 승격하지 않는다.
+- 동일 request ID는 원래 자료·단계 기록 조회용이다. timeout/unknown을 새 ID로
+  자동 재전송하지 않는다. 다른 자료를 조사하려면 새 요청을 만든다.
+- CLI Ctrl-C와 같은 TUI 소유 Gateway의 종료는 admitted work를 회수하고
+  제한된 partial 보고서와 단계 ID를 보존한다. 다른 프로세스의 status 조회는 취소가 아니다.
+- 리서치 완료는 코드 빌드·테스트 증거 또는 개발 DAG `SETTLED`가 아니다.
+  공개 `crates/hcodex/tests/fixtures/research_contract_cases.json` corpus는 runtime과 같은 validator로 검사하며
+  canonical CI에서 웹·모델·사람 평가를 요구하지 않는다.
 
-`status`/`board`의 `runtime_identity`는 소스·설치 파일·현재 프로세스·등록된 MCP 시작 관측을 구별한다. 디스크 파일 교체 후 해시는 실행 중 이미지 증거가 아니고 package version 일치도 코드 일치 증거가 아니다. 과거 필드 부재와 source→binary/CI 영수증 부재는 미검증으로 남긴다. 이 조회로 MCP를 재시작하지 않는다. 새 health 구현의 선택적 `workspace_dir`는 소스 관측 범위를 지정하며 기존 인자 없는 호출도 유지된다.
+## Native Antigravity 경계
+
+신규 Argon/Claude 작업은 Antigravity CLI JSON stream으로 실행한다. 과거 RPC
+기록은 원래 ID로 읽는다. `AGY_CLI_BIN`, PATH의 `agy`, 관리되는 libexec 순으로
+CLI를 찾는다. CLI가 보고한 모델은 설정 관측이며 독립 서버 모델 증명은 아니다.
+
+hcodex는 첫 입력 전에 세션 ID를 SQLite에 확정하고, 실행 중에는 단계와 사용량 등
+제한된 진행 정보만 저장한다. 기본 실행 데드라인은 없고 양수로 지정할 수 있다.
+시작·입출력·정리의 별도 제한은 유지한다. 상태 조회는 읽기만 한다. CLI 대화
+후속 요청은 새 턴이며, 연결을 잃은 실행 중 턴에 재접속하는 기능은 없다.
+
+격리된 디렉터리에서 결과물만 받아 호스트가 검증하고 적용한다. 검증된 CLI의
+strict sandbox 정책으로 파일 쓰기와 셸 명령을 차단한다. 미검증 CLI가 도구를
+노출하면 입력 전에 거절한다. Parent `SUCCESS`를 팀 완료로 세지 않으며 native
+Teamwork 완료나 전체 팀 취소를 현재 기능으로 광고하지 않는다.
+
+## 설치와 검증
 
 ```bash
 cargo install --locked --path crates/hcodex
 hcodex setup
 hcodex status
 hcodex tui
-hcodex restart
 ```
 
-수동 MCP 설정은 `command="hcodex"`, `args=["mcp"]`를 사용한다. Python module이나 `.venv`를 MCP 진입점으로 등록하지 않는다.
+`setup`/`sync`는 launcher와 Gemini/Codex skill을 동기화하고 정확히 식별된 과거
+hcodex MCP 등록만 제거한다. 사용자 정의 설정과 다른 MCP 항목은 보존한다.
+`mcp`, `on`, `off`, `restart`는 제거된 명령이다.
 
-CLI 주요 명령: `mcp`, `tui [-c]`, `status`, `jobs`, `inbox`, `board`, `council`, `votes`, `recovery`, `resume`, `ask`, `sonnet`, `opus`, `argon`, `flash`, `dag-ulw`, `dag-run`, `dag-mode`, `dag-exit`, `models`, `skills`, `on`, `off`, `restart`, `setup`, `sync`, `prune`.
-
-## Rust 개발 규칙
-
-저장소 작업 시 `AGENTS.md`, `.agents/README.md`, `.agents/rust_dev_harness/` 아래의 `PROJECT_PROFILE.md`, `HARNESS.toml`, `HARNESS_MANIFEST.toml`, `rules/README.md`를 먼저 읽는다.
-
-- Rust 2024, repository toolchain, safe-only를 지킨다.
-- 외부 입력은 closed typed serde 경계로 검증한다.
-- task/process는 supervisor가 소유하고 취소·타임아웃 시 kill/reap한다.
-- SQL은 `crates/hcodex/sql/`의 prepared statement만 사용한다.
-- 실행하지 않은 검증은 PASS로 보고하지 않는다.
-
-Canonical 검증:
-
-```bash
-make ci
-```
-
-이 프로젝트의 Python 구현·테스트·가상환경·백업·검증 스크립트는 완전히 제거됐다. Rust 제품·CI는 Python에 의존하지 않는다. 과거 데이터 호환용 SQLite fixture와 JSON/로그 영수증은 보존하며, 외부 Python workspace를 분석·검증하는 기능은 별개로 지원한다.
+Rust 개발은 `AGENTS.md`와 `.agents/rust_dev_harness/`를 따르고 canonical
+`make ci`를 실행한다. 실행하지 않은 검증은 PASS로 보고하지 않는다.

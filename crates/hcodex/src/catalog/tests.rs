@@ -16,8 +16,7 @@ fn referenced_nested_objects_are_closed_and_bounded() -> crate::Result<()> {
 }
 
 #[test]
-fn all_tools_and_closed_input_contract() -> crate::Result<()> {
-    assert_eq!(tools()?.len(), 16);
+fn backend_arguments_remain_closed_and_apply_defaults() -> crate::Result<()> {
     assert!(arguments("codex_job_status", json!({"surprise":true})).is_err());
     assert!(arguments("codex_adversarial_audit", json!({})).is_err());
     assert!(arguments("codex_job_list", json!({"limit":"bad"})).is_err());
